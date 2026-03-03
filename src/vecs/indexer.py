@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+import time
 from pathlib import Path
 
 import chromadb
@@ -69,11 +70,26 @@ def _embed_and_store(
     if not chunks:
         return 0
 
+    batch_size = min(VOYAGE_BATCH_SIZE, 10)
     stored = 0
-    for i in range(0, len(chunks), VOYAGE_BATCH_SIZE):
-        batch = chunks[i : i + VOYAGE_BATCH_SIZE]
+    for i in range(0, len(chunks), batch_size):
+        batch = chunks[i : i + batch_size]
         texts = [c["text"] for c in batch]
-        result = vo.embed(texts, model=model, input_type="document")
+
+        for attempt in range(5):
+            try:
+                result = vo.embed(texts, model=model, input_type="document")
+                break
+            except Exception as e:
+                if "RateLimitError" in type(e).__name__ or "rate" in str(e).lower():
+                    wait = 20 * (attempt + 1)
+                    _log(f"  Rate limited, waiting {wait}s...")
+                    time.sleep(wait)
+                else:
+                    raise
+        else:
+            _log(f"  Failed after 5 retries, skipping batch at {i}")
+            continue
 
         ids = [f"{id_prefix}-{i + j}" for j in range(len(batch))]
         metadatas = [c["metadata"] for c in batch]
@@ -86,6 +102,9 @@ def _embed_and_store(
         )
         stored += len(batch)
         _log(f"  Indexed {stored}/{len(chunks)} chunks")
+
+        if i + batch_size < len(chunks):
+            time.sleep(21)
 
     return stored
 
