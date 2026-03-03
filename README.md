@@ -1,4 +1,4 @@
-# vecs
+# VecS (Vector Search)
 
 Semantic search for your codebase and Claude Code sessions. Indexes code files using AST-aware chunking (tree-sitter) and session transcripts, then lets you search with hybrid vector + keyword matching.
 
