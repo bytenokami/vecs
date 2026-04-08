@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import PurePath
+
 import tree_sitter_c_sharp as ts_cs
 import tree_sitter_typescript as ts_ts
 from tree_sitter import Language, Parser
@@ -50,12 +52,6 @@ CHUNK_NODE_TYPES: dict[str, set[str]] = {
 MIN_CHUNK_LINES = 5
 
 
-def _get_extension(file_path: str) -> str:
-    """Extract file extension from path."""
-    dot = file_path.rfind(".")
-    return file_path[dot:] if dot >= 0 else ""
-
-
 def _extract_declarations(root, node_types: set[str]) -> list[tuple[int, int]]:
     """Walk the AST and return (start_line, end_line) for top-level declarations.
 
@@ -104,7 +100,7 @@ def chunk_code_file_ast(
     if not content.strip():
         return []
 
-    ext = _get_extension(file_path)
+    ext = PurePath(file_path).suffix
     language = LANGUAGE_MAP.get(ext)
 
     if language is None:
