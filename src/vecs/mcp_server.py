@@ -1,7 +1,10 @@
+from pathlib import Path
+
 from mcp.server.fastmcp import FastMCP
 
 from vecs.indexer import run_index, get_status
 from vecs.searcher import search
+from vecs.utils import slugify
 
 mcp = FastMCP("vecs")
 
@@ -18,7 +21,7 @@ def semantic_search(
 
     Args:
         query: Natural language search query.
-        collection: Optional filter — "code" or "sessions". Searches both if omitted.
+        collection: Optional filter — "code", "sessions", or "docs". Searches all if omitted.
         n_results: Number of results to return (default 5).
         path_filter: Filter results to file paths containing this substring (e.g. "Services/Analytics/").
         project: Search a specific project (default: all).
@@ -59,7 +62,7 @@ def reindex(project: str | None = None) -> str:
     try:
         run_index(project_name=project)
         status = get_status(project_name=project)
-        return f"Reindex complete. {status['total_code_chunks']} code chunks, {status['total_session_chunks']} session chunks."
+        return f"Reindex complete. {status['total_code_chunks']} code, {status['total_session_chunks']} session, {status['total_docs_chunks']} doc chunks."
     except Exception as e:
         return f"Reindex failed: {e}"
 
@@ -74,7 +77,47 @@ def index_status(project: str | None = None) -> str:
     status = get_status(project_name=project)
     lines = []
     for name, info in status.get("projects", {}).items():
-        lines.append(f"[{name}] code: {info['code_chunks']} chunks, sessions: {info['session_chunks']} chunks")
-    lines.append(f"Total: {status['total_code_chunks']} code + {status['total_session_chunks']} sessions")
+        lines.append(f"[{name}] code: {info['code_chunks']}, sessions: {info['session_chunks']}, docs: {info['docs_chunks']} chunks")
+    lines.append(f"Total: {status['total_code_chunks']} code + {status['total_session_chunks']} sessions + {status['total_docs_chunks']} docs")
     lines.append(f"Tracked files: {status.get('manifest_entries', 0)}")
     return "\n".join(lines)
+
+
+@mcp.tool()
+def add_document(
+    content: str,
+    title: str,
+    project: str,
+) -> str:
+    """Save and index a document from the current conversation.
+
+    Args:
+        content: The document text to store.
+        title: Document title (used as filename).
+        project: Which project to store this under.
+    """
+    from vecs.config import load_config, VECS_DIR
+    from vecs.indexer import index_single_doc
+
+    config = load_config()
+    if project not in config.projects:
+        return f"Project '{project}' not found. Available: {', '.join(config.projects.keys())}"
+
+    proj = config.projects[project]
+
+    # Auto-configure docs_dir if not set
+    if not proj.docs_dir:
+        proj.docs_dir = VECS_DIR / "docs" / project
+        config.save()
+
+    proj.docs_dir.mkdir(parents=True, exist_ok=True)
+
+    slug = slugify(title)
+    file_path = proj.docs_dir / f"{slug}.md"
+    file_path.write_text(content)
+
+    try:
+        stored = index_single_doc(project, file_path)
+        return f"Saved '{title}' to {file_path} and indexed ({stored} chunks)."
+    except Exception as e:
+        return f"Saved '{title}' to {file_path} but indexing failed: {e}"
