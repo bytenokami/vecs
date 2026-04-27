@@ -206,61 +206,131 @@ def test_bm25_empty_index(tmp_path):
     assert results == []
 
 
-@pytest.mark.xfail(strict=True, reason="get_bm25 implemented in Task 3")
+def test_get_bm25_returns_index_for_existing_db(tmp_path):
+    """get_bm25 opens an existing .db file and returns a usable BM25Index."""
+    db = tmp_path / "test.db"
+    idx = BM25Index(db)
+    idx.build([{"id": "a", "text": "hello world"}])
+    idx.close()
+
+    result = get_bm25(db)
+    assert result is not None
+    hits = result.search("hello", n=1)
+    assert hits[0]["id"] == "a"
+
+
 def test_get_bm25_returns_cached_index(tmp_path):
-    """get_bm25 returns cached BM25Index on second call without re-loading."""
-    pkl = tmp_path / "test.pkl"
-    idx = BM25Index(pkl)
+    """get_bm25 returns the same object on repeated calls when mtime hasn't changed."""
+    db = tmp_path / "test.db"
+    idx = BM25Index(db)
     idx.build([{"id": "a", "text": "hello world"}])
-    idx.save()
+    idx.close()
 
-    result1 = get_bm25(pkl)
-    assert result1 is not None
-    result2 = get_bm25(pkl)
-    assert result2 is result1  # same object — cache hit
+    r1 = get_bm25(db)
+    r2 = get_bm25(db)
+    assert r1 is r2
 
 
-@pytest.mark.xfail(strict=True, reason="get_bm25 implemented in Task 3")
 def test_get_bm25_invalidates_on_mtime_change(tmp_path):
-    """get_bm25 reloads when file mtime changes."""
-    pkl = tmp_path / "test.pkl"
-    idx = BM25Index(pkl)
+    """get_bm25 reloads when the .db file mtime changes."""
+    db = tmp_path / "test.db"
+    idx = BM25Index(db)
     idx.build([{"id": "a", "text": "hello world"}])
-    idx.save()
+    idx.close()
 
-    result1 = get_bm25(pkl)
-    assert result1 is not None
+    r1 = get_bm25(db)
+    assert r1 is not None
 
-    # Rebuild with different data and save (changes mtime)
-    time.sleep(0.05)  # ensure mtime differs
-    idx2 = BM25Index(pkl)
-    idx2.build([{"id": "b", "text": "goodbye world"}])
-    idx2.save()
+    time.sleep(0.05)
+    idx2 = BM25Index(db)
+    idx2.upsert([{"id": "b", "text": "goodbye world"}])
+    idx2.close()
+    db.touch()  # belt-and-suspenders mtime bump for low-resolution filesystems
 
-    result2 = get_bm25(pkl)
-    assert result2 is not None
-    assert result2 is not result1  # cache invalidated
+    r2 = get_bm25(db)
+    assert r2 is not None
+    assert r2 is not r1
 
 
 def test_get_bm25_missing_file(tmp_path):
-    """get_bm25 returns None for nonexistent file."""
-    result = get_bm25(tmp_path / "nonexistent.pkl")
-    assert result is None
+    """get_bm25 returns None for a nonexistent .db file."""
+    assert get_bm25(tmp_path / "nope.db") is None
 
 
 def test_get_bm25_corrupted_file(tmp_path):
-    """get_bm25 returns None for corrupted pickle (graceful degradation)."""
-    pkl = tmp_path / "bad.pkl"
-    pkl.write_bytes(b"not a valid pickle at all")
-
-    result = get_bm25(pkl)
-    assert result is None  # no crash, graceful degradation
+    """get_bm25 returns None when the file exists but isn't a valid SQLite DB (graceful degradation)."""
+    db = tmp_path / "bad.db"
+    db.write_bytes(b"this is not a sqlite database")
+    assert get_bm25(db) is None
 
 
 def test_get_bm25_cache_cleared_between_tests():
     """Verify _bm25_cache is accessible for test cleanup."""
     _bm25_cache.clear()
     assert len(_bm25_cache) == 0
+
+
+def test_upsert_inserts_new_and_updates_existing(tmp_path):
+    """upsert() adds new doc_ids and overwrites existing ones."""
+    idx = BM25Index(tmp_path / "test.db")
+    idx.upsert([
+        {"id": "a", "text": "alpha quick brown fox"},
+        {"id": "b", "text": "beta lazy dog"},
+    ])
+    assert idx.all_ids() == {"a", "b"}
+
+    # Update 'a', insert 'c'
+    idx.upsert([
+        {"id": "a", "text": "alpha completely different content"},
+        {"id": "c", "text": "gamma new entry"},
+    ])
+    assert idx.all_ids() == {"a", "b", "c"}
+
+    # Old text for 'a' should no longer match
+    results = idx.search("quick brown", n=5)
+    assert all(r["id"] != "a" for r in results)
+    # New text for 'a' should match
+    results = idx.search("completely different", n=5)
+    assert any(r["id"] == "a" for r in results)
+
+
+def test_delete_removes_rows(tmp_path):
+    """delete() removes the listed doc_ids from both the base table and FTS."""
+    idx = BM25Index(tmp_path / "test.db")
+    idx.upsert([
+        {"id": "a", "text": "alpha quick brown fox"},
+        {"id": "b", "text": "beta lazy dog"},
+        {"id": "c", "text": "gamma jumps over"},
+    ])
+    idx.delete(["a", "c"])
+    assert idx.all_ids() == {"b"}
+
+    results = idx.search("alpha gamma", n=5)
+    assert all(r["id"] not in {"a", "c"} for r in results)
+
+
+def test_delete_empty_list_is_noop(tmp_path):
+    """delete([]) is a safe no-op."""
+    idx = BM25Index(tmp_path / "test.db")
+    idx.upsert([{"id": "a", "text": "hello"}])
+    idx.delete([])
+    assert idx.all_ids() == {"a"}
+
+
+def test_upsert_empty_list_is_noop(tmp_path):
+    """upsert([]) is a safe no-op."""
+    idx = BM25Index(tmp_path / "test.db")
+    idx.upsert([])
+    assert idx.all_ids() == set()
+
+
+def test_delete_large_id_list_paginates(tmp_path):
+    """delete() handles >5000 ids without hitting SQLITE_MAX_VARIABLE_NUMBER."""
+    idx = BM25Index(tmp_path / "test.db")
+    docs = [{"id": f"id_{i}", "text": f"text {i}"} for i in range(6000)]
+    idx.upsert(docs)
+    idx.delete([f"id_{i}" for i in range(6000)])
+    assert idx.all_ids() == set()
 
 
 def test_bm25_build_with_metadata(tmp_path):

@@ -292,11 +292,57 @@ class BM25Index:
         return existed
 
 
-# --- Module-level mtime cache (filled in Task 3) ---
+# --- Module-level mtime cache ---
 
-_bm25_cache: dict = {}
+_bm25_cache: dict[str, tuple[float, "BM25Index"]] = {}
 
 
-def get_bm25(path: Path):
-    """Stub — implemented in Task 3."""
-    return None
+def get_bm25(path: Path) -> "BM25Index | None":
+    """Return a (cached) BM25Index for `path`, or None if the file is missing or unreadable.
+
+    Caches by (path, mtime). On corruption (not a valid SQLite db) returns None
+    so callers can degrade gracefully to vector-only search.
+    """
+    key = str(path)
+
+    if not path.exists():
+        cached = _bm25_cache.pop(key, None)
+        if cached:
+            try:
+                cached[1].close()
+            except Exception:
+                pass
+        return None
+
+    mtime = path.stat().st_mtime
+    if key in _bm25_cache and _bm25_cache[key][0] == mtime:
+        return _bm25_cache[key][1]
+
+    # Old cached entry is stale — close it
+    if key in _bm25_cache:
+        try:
+            _bm25_cache[key][1].close()
+        except Exception:
+            pass
+        _bm25_cache.pop(key, None)
+
+    idx = BM25Index(path)
+    try:
+        idx.load()
+        # Smoke-check: if the file is corrupt, this raises DatabaseError
+        idx._ensure_conn().execute("SELECT 1 FROM docs LIMIT 1").fetchone()
+    except sqlite3.DatabaseError:
+        try:
+            idx.close()
+        except Exception:
+            pass
+        return None
+    except Exception:
+        try:
+            idx.close()
+        except Exception:
+            pass
+        return None
+
+    _bm25_cache[key] = (mtime, idx)
+    return idx
