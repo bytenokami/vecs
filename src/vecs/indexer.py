@@ -495,9 +495,11 @@ def _sync_bm25(collection: chromadb.Collection, project_name: str, suffix: str) 
       3. Delete BM25 rows whose ids are no longer in chromadb.
       4. Upsert all chromadb-resident chunks (insert new + overwrite existing).
 
-    For per-tick incremental updates this is O(diff size) for the SQL writes;
-    the chromadb scan is O(N) but only reads ids+docs+metas (cheap relative
-    to the prior full rebuild + tokenize + repickle).
+    Performance: deletes are O(diff size); upserts are O(N) since every
+    chromadb-resident chunk is upserted unconditionally (no content-addressable
+    diffing). The win over the previous _rebuild_bm25 is eliminating the
+    in-memory BM25Okapi rebuild and the full pickle write — tokenization
+    still runs for every chunk, but FTS5's incremental writes amortize.
 
     Migrates transparently: when no .db exists yet, step 4 simply inserts
     everything (equivalent to a fresh build). Old `.pkl` files (if any) are

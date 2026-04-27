@@ -1139,6 +1139,14 @@ def test_sync_bm25_paginates_through_all_chunks(tmp_path, monkeypatch):
     collection = MagicMock()
     collection.get.side_effect = fake_get
 
+    # Force small batch size so pagination is actually exercised
+    original_paginated_get = indexer._paginated_get
+    monkeypatch.setattr(
+        indexer,
+        "_paginated_get",
+        lambda col, **kw: original_paginated_get(col, batch_size=5, **{k: v for k, v in kw.items() if k != 'batch_size'}),
+    )
+
     indexer._sync_bm25(collection, "test", "code")
 
     db = tmp_path / "bm25" / "test_code.db"
@@ -1146,6 +1154,10 @@ def test_sync_bm25_paginates_through_all_chunks(tmp_path, monkeypatch):
     bm25.load()
     assert bm25.all_ids() == set(all_ids)
     bm25.close()
+
+    assert collection.get.call_count >= 2, (
+        f"expected pagination to make multiple get() calls, got {collection.get.call_count}"
+    )
 
 
 # --- _sweep_excluded_chunks tests (Problem 2: orphan chunks for excluded files) ---
