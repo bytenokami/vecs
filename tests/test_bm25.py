@@ -150,8 +150,8 @@ def test_tokenize_mixed_sentence():
 # ---------------------------------------------------------------------------
 
 def test_bm25_build_and_search(tmp_path):
-    """BM25 index returns results ranked by keyword relevance."""
-    idx = BM25Index(tmp_path / "test.pkl")
+    """BM25 index returns results ranked by keyword relevance (FTS5 backend)."""
+    idx = BM25Index(tmp_path / "test.db")
     docs = [
         {"id": "a", "text": "the player takes damage and health decreases"},
         {"id": "b", "text": "the enemy attacks the player with a sword"},
@@ -160,12 +160,13 @@ def test_bm25_build_and_search(tmp_path):
     idx.build(docs)
     results = idx.search("player damage", n=2)
     assert len(results) == 2
-    assert results[0]["id"] == "a"  # most relevant
+    assert results[0]["id"] == "a"  # most relevant — has both "player" AND "damage"
+    assert results[0]["score"] > 0  # score is positive (we negate sqlite's bm25)
 
 
 def test_bm25_save_and_load(tmp_path):
-    """BM25 index can be saved and loaded."""
-    idx = BM25Index(tmp_path / "test.pkl")
+    """BM25 index can be saved and loaded across instances (FTS5: load just reopens)."""
+    idx = BM25Index(tmp_path / "test.db")
     docs = [
         {"id": "a", "text": "hello world greeting"},
         {"id": "b", "text": "goodbye world farewell"},
@@ -173,16 +174,18 @@ def test_bm25_save_and_load(tmp_path):
     ]
     idx.build(docs)
     idx.save()
+    idx.close()
 
-    idx2 = BM25Index(tmp_path / "test.pkl")
-    idx2.load()
+    idx2 = BM25Index(tmp_path / "test.db")
+    assert idx2.load() is True
     results = idx2.search("hello", n=1)
     assert results[0]["id"] == "a"
+    idx2.close()
 
 
 def test_bm25_empty_index(tmp_path):
     """Empty index returns no results."""
-    idx = BM25Index(tmp_path / "test.pkl")
+    idx = BM25Index(tmp_path / "test.db")
     idx.build([])
     results = idx.search("anything", n=5)
     assert results == []
@@ -245,7 +248,7 @@ def test_get_bm25_cache_cleared_between_tests():
 
 def test_bm25_build_with_metadata(tmp_path):
     """BM25 index stores and returns metadata."""
-    idx = BM25Index(tmp_path / "test.pkl")
+    idx = BM25Index(tmp_path / "test.db")
     docs = [
         {"id": "a", "text": "user authentication login", "metadata": {"file_path": "auth/login.ts"}},
         {"id": "b", "text": "database connection pool", "metadata": {"file_path": "db/pool.ts"}},
@@ -259,43 +262,70 @@ def test_bm25_build_with_metadata(tmp_path):
 
 
 def test_bm25_save_load_with_metadata(tmp_path):
-    """Metadata survives save/load cycle."""
-    idx = BM25Index(tmp_path / "test.pkl")
+    """Metadata survives across instances."""
+    idx = BM25Index(tmp_path / "test.db")
     docs = [
-        {"id": "a", "text": "hello world greeting", "metadata": {"file_path": "hello.ts", "chunk_index": 0}},
-        {"id": "b", "text": "goodbye farewell parting", "metadata": {"file_path": "bye.ts", "chunk_index": 1}},
-        {"id": "c", "text": "something else entirely", "metadata": {"file_path": "other.ts", "chunk_index": 2}},
+        {"id": "a", "text": "hello world greeting",
+         "metadata": {"file_path": "hello.ts", "chunk_index": 0}},
+        {"id": "b", "text": "goodbye farewell parting",
+         "metadata": {"file_path": "bye.ts", "chunk_index": 1}},
+        {"id": "c", "text": "something else entirely",
+         "metadata": {"file_path": "other.ts", "chunk_index": 2}},
     ]
     idx.build(docs)
-    idx.save()
+    idx.close()
 
-    idx2 = BM25Index(tmp_path / "test.pkl")
+    idx2 = BM25Index(tmp_path / "test.db")
     idx2.load()
     results = idx2.search("hello", n=1)
     assert results[0]["metadata"] == {"file_path": "hello.ts", "chunk_index": 0}
+    idx2.close()
 
 
-def test_bm25_backward_compat_no_metadata(tmp_path):
-    """Loading a pickle without doc_metadatas still works (empty dicts)."""
-    # Simulate old-format pickle (no doc_metadatas key)
-    import pickle
-    pkl = tmp_path / "old.pkl"
-    with open(pkl, "wb") as f:
-        pickle.dump({
-            "doc_ids": ["a", "b", "c"],
-            "doc_texts": ["hello world greeting", "goodbye farewell parting", "something else entirely"],
-        }, f)
+def test_bm25_search_with_path_filter(tmp_path):
+    """BM25 search filters results by path_filter substring on file_path metadata."""
+    idx = BM25Index(tmp_path / "test.db")
+    docs = [
+        {"id": "a", "text": "user login authentication",
+         "metadata": {"file_path": "auth/login.ts"}},
+        {"id": "b", "text": "user profile settings authentication",
+         "metadata": {"file_path": "settings/profile.ts"}},
+        {"id": "c", "text": "user session token authentication",
+         "metadata": {"file_path": "auth/session.ts"}},
+        {"id": "d", "text": "render graphics engine frame",
+         "metadata": {"file_path": "gfx/render.ts"}},
+    ]
+    idx.build(docs)
 
-    idx = BM25Index(pkl)
-    assert idx.load() is True
-    results = idx.search("hello", n=1)
-    assert results[0]["id"] == "a"
-    assert results[0]["metadata"] == {}
+    results_all = idx.search("authentication", n=5)
+    assert len(results_all) == 3
+
+    results_filtered = idx.search("authentication", n=5, path_filter="auth/")
+    assert len(results_filtered) == 2
+    assert all("auth/" in r["metadata"]["file_path"] for r in results_filtered)
+
+
+def test_bm25_search_path_filter_in_sql(tmp_path):
+    """Path filter is applied in SQL (not post-filter): n results returned even when most rows match path."""
+    idx = BM25Index(tmp_path / "test.db")
+    docs = []
+    for i in range(50):
+        path = "target/file.ts" if i < 30 else f"other/file{i}.ts"
+        docs.append({
+            "id": str(i),
+            "text": f"common keyword number {i}",
+            "metadata": {"file_path": path},
+        })
+    idx.build(docs)
+
+    results = idx.search("common keyword", n=10, path_filter="target/")
+    assert len(results) == 10
+    assert all("target/" in r["metadata"]["file_path"] for r in results)
 
 
 def test_bm25_build_without_metadata_key(tmp_path):
     """Docs without 'metadata' key get empty dict metadata."""
-    idx = BM25Index(tmp_path / "test.pkl")
+    idx = BM25Index(tmp_path / "test.db")
     docs = [
         {"id": "a", "text": "hello world greeting"},
         {"id": "b", "text": "goodbye farewell parting"},
@@ -306,30 +336,36 @@ def test_bm25_build_without_metadata_key(tmp_path):
     assert results[0]["metadata"] == {}
 
 
-def test_bm25_search_with_path_filter(tmp_path):
-    """BM25 search filters results by path_filter substring on file_path metadata."""
-    idx = BM25Index(tmp_path / "test.pkl")
-    docs = [
-        {"id": "a", "text": "user login authentication", "metadata": {"file_path": "auth/login.ts"}},
-        {"id": "b", "text": "user profile settings authentication", "metadata": {"file_path": "settings/profile.ts"}},
-        {"id": "c", "text": "user session token authentication", "metadata": {"file_path": "auth/session.ts"}},
-        {"id": "d", "text": "render graphics engine frame", "metadata": {"file_path": "gfx/render.ts"}},
-    ]
-    idx.build(docs)
+def test_bm25_empty_docs(tmp_path):
+    """Building with no docs leaves an empty queryable index."""
+    idx = BM25Index(tmp_path / "test.db")
+    idx.build([])
+    assert idx.search("anything", n=5) == []
 
-    # Without filter: 3 match "authentication"
-    results_all = idx.search("authentication", n=5)
-    assert len(results_all) == 3
 
-    # With path_filter: only auth/ files
-    results_filtered = idx.search("authentication", n=5, path_filter="auth/")
-    assert len(results_filtered) == 2
-    assert all("auth/" in r["metadata"]["file_path"] for r in results_filtered)
+def test_bm25_empty_query(tmp_path):
+    """A query that tokenizes to nothing returns []."""
+    idx = BM25Index(tmp_path / "test.db")
+    idx.build([{"id": "a", "text": "hello world"}])
+    assert idx.search("", n=5) == []
+    assert idx.search("!!!", n=5) == []
+
+
+def test_bm25_punctuation_in_query_does_not_crash(tmp_path):
+    """FTS5-syntax characters in user input are escaped."""
+    idx = BM25Index(tmp_path / "test.db")
+    idx.build([
+        {"id": "a", "text": "foo bar baz quux"},
+        {"id": "b", "text": "totally unrelated"},
+    ])
+    for q in ["foo-bar", 'foo "bar"', "foo:bar", "foo*", "foo AND bar"]:
+        results = idx.search(q, n=5)
+        assert isinstance(results, list)
 
 
 def test_bm25_search_path_filter_no_matches(tmp_path):
     """BM25 path_filter that matches nothing returns empty."""
-    idx = BM25Index(tmp_path / "test.pkl")
+    idx = BM25Index(tmp_path / "test.db")
     docs = [
         {"id": "a", "text": "hello world greeting", "metadata": {"file_path": "src/hello.ts"}},
         {"id": "b", "text": "goodbye farewell parting", "metadata": {"file_path": "src/bye.ts"}},
@@ -340,28 +376,9 @@ def test_bm25_search_path_filter_no_matches(tmp_path):
     assert results == []
 
 
-def test_bm25_search_path_filter_fetches_extra(tmp_path):
-    """With path_filter, BM25 fetches extra results to compensate for filtering."""
-    idx = BM25Index(tmp_path / "test.pkl")
-    # Create 10 docs, only 2 in target path
-    docs = []
-    for i in range(10):
-        path = "target/file.ts" if i < 2 else f"other/file{i}.ts"
-        docs.append({
-            "id": str(i),
-            "text": f"common keyword number {i}",
-            "metadata": {"file_path": path},
-        })
-    idx.build(docs)
-
-    results = idx.search("common keyword", n=5, path_filter="target/")
-    assert len(results) == 2
-    assert all("target/" in r["metadata"]["file_path"] for r in results)
-
-
 def test_bm25_search_path_filter_no_metadata(tmp_path):
     """Path filter skips docs with no file_path in metadata."""
-    idx = BM25Index(tmp_path / "test.pkl")
+    idx = BM25Index(tmp_path / "test.db")
     docs = [
         {"id": "a", "text": "hello world greeting", "metadata": {"session_id": "abc"}},
         {"id": "b", "text": "hello earth planet", "metadata": {"file_path": "src/hello.ts"}},

@@ -104,13 +104,192 @@ def _connect(path: Path) -> sqlite3.Connection:
     return conn
 
 
-# --- BM25Index (filled in Task 2) ---
+# --- BM25Index ---
 
 class BM25Index:
-    """Stub — implemented in Task 2."""
+    """BM25 keyword search index backed by SQLite FTS5.
+
+    Public API preserved from the rank_bm25 implementation:
+      build(docs)   — bulk replace contents
+      search(...)   — query with optional path filter
+      save()        — no-op (writes are durable on commit)
+      load()        — open the database; returns True if it exists
+      path          — file path (a `.db` file)
+    Plus new methods used by the indexer for incremental sync:
+      upsert(docs)  — insert-or-update by doc_id
+      delete(ids)   — delete by doc_id
+      all_ids()     — set of currently indexed doc_ids
+      close()       — close the underlying connection
+    """
 
     def __init__(self, path: Path):
         self.path = path
+        self._conn: sqlite3.Connection | None = None
+
+    # --- connection management ---
+
+    def _ensure_conn(self) -> sqlite3.Connection:
+        if self._conn is None:
+            self._conn = _connect(self.path)
+        return self._conn
+
+    def close(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            finally:
+                self._conn = None
+
+    # --- bulk build (used for first-time / forced rebuild) ---
+
+    def build(self, docs: list[dict]) -> None:
+        """Replace all contents with the given documents.
+
+        Wraps the operation in a single transaction. On failure the
+        database is unchanged.
+        """
+        conn = self._ensure_conn()
+        rows = [
+            (
+                d["id"],
+                d["text"],
+                " ".join(_tokenize(d["text"])),
+                (d.get("metadata") or {}).get("file_path"),
+                json.dumps(d.get("metadata") or {}),
+            )
+            for d in docs
+        ]
+        conn.execute("BEGIN")
+        try:
+            conn.execute("DELETE FROM docs")
+            if rows:
+                conn.executemany(
+                    "INSERT INTO docs(doc_id, text, tokens, file_path, metadata_json) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    rows,
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    # --- incremental mutations ---
+
+    def upsert(self, docs: list[dict]) -> None:
+        """Insert or update by `doc_id` (atomic, single transaction)."""
+        if not docs:
+            return
+        conn = self._ensure_conn()
+        rows = [
+            (
+                d["id"],
+                d["text"],
+                " ".join(_tokenize(d["text"])),
+                (d.get("metadata") or {}).get("file_path"),
+                json.dumps(d.get("metadata") or {}),
+            )
+            for d in docs
+        ]
+        conn.execute("BEGIN")
+        try:
+            conn.executemany(
+                """
+                INSERT INTO docs(doc_id, text, tokens, file_path, metadata_json)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(doc_id) DO UPDATE SET
+                  text          = excluded.text,
+                  tokens        = excluded.tokens,
+                  file_path     = excluded.file_path,
+                  metadata_json = excluded.metadata_json
+                """,
+                rows,
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    def delete(self, ids: list[str]) -> None:
+        """Delete rows by `doc_id`. Batches to stay under SQLITE_MAX_VARIABLE_NUMBER."""
+        if not ids:
+            return
+        conn = self._ensure_conn()
+        BATCH = 5000
+        conn.execute("BEGIN")
+        try:
+            for i in range(0, len(ids), BATCH):
+                chunk = ids[i:i + BATCH]
+                placeholders = ",".join("?" * len(chunk))
+                conn.execute(f"DELETE FROM docs WHERE doc_id IN ({placeholders})", chunk)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    def all_ids(self) -> set[str]:
+        """Return the set of all currently indexed `doc_id` values."""
+        conn = self._ensure_conn()
+        return {row[0] for row in conn.execute("SELECT doc_id FROM docs")}
+
+    # --- search ---
+
+    def search(self, query: str, n: int = 5, path_filter: str | None = None) -> list[dict]:
+        """Search the index. Returns list of {"id", "text", "score", "metadata"}.
+
+        Args:
+            query: Search query string.
+            n: Number of results to return.
+            path_filter: If set, only return rows whose `file_path` contains this
+                substring (translated to a SQL LIKE so it runs inside the database
+                rather than as a Python post-filter on a small candidate set).
+        """
+        if not self.path.exists():
+            return []
+
+        match_expr = _build_match_query(query)
+        if match_expr is None:
+            return []
+
+        conn = self._ensure_conn()
+        sql = (
+            "SELECT d.doc_id, d.text, d.metadata_json, -bm25(docs_fts) AS score "
+            "FROM docs_fts JOIN docs d ON d.rowid = docs_fts.rowid "
+            "WHERE docs_fts MATCH ? "
+        )
+        params: list = [match_expr]
+        if path_filter:
+            sql += "AND d.file_path LIKE ? "
+            params.append(f"%{path_filter}%")
+        sql += "ORDER BY bm25(docs_fts) LIMIT ?"
+        params.append(n)
+
+        results: list[dict] = []
+        for doc_id, text, meta_json, score in conn.execute(sql, params):
+            try:
+                meta = json.loads(meta_json) if meta_json else {}
+            except (TypeError, ValueError):
+                meta = {}
+            results.append(
+                {
+                    "id": doc_id,
+                    "text": text,
+                    "score": float(score),
+                    "metadata": meta,
+                }
+            )
+        return results
+
+    # --- legacy persistence shims ---
+
+    def save(self) -> None:
+        """No-op: SQLite writes are durable on commit. Kept for backward API compatibility."""
+        return
+
+    def load(self) -> bool:
+        """Open the database. Returns True if the file already exists, False if it had to be created."""
+        existed = self.path.exists()
+        self._ensure_conn()
+        return existed
 
 
 # --- Module-level mtime cache (filled in Task 3) ---
