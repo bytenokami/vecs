@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import pickle
+import json
 import re
+import sqlite3
 from pathlib import Path
 
-from rank_bm25 import BM25Okapi
 
+# --- Tokenizer (preserved from previous implementation) ---
 
 def _tokenize(text: str) -> list[str]:
     """Code-aware tokenizer that splits camelCase, PascalCase, ACRONYMS, and snake_case.
@@ -18,7 +19,7 @@ def _tokenize(text: str) -> list[str]:
         snake_case   -> [snake, case]
     """
     words = re.findall(r"\w+", text)
-    tokens = []
+    tokens: list[str] = []
     for word in words:
         parts = re.findall(
             r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+", word
@@ -30,129 +31,94 @@ def _tokenize(text: str) -> list[str]:
     return tokens
 
 
+# --- FTS5 query escaping ---
+
+def _build_match_query(query: str) -> str | None:
+    """Build a safe FTS5 MATCH expression from a free-form query.
+
+    Tokenizes with the same code-aware tokenizer used at index time,
+    wraps each token in double quotes (which neutralizes FTS5 syntax
+    chars like `-`, `+`, `:`, `*`, `(`, `)`, `"`), and joins with OR
+    so that any-term-matches contributes to the BM25 score, matching
+    the prior BM25Okapi.get_scores semantics.
+
+    Returns None for queries that produce zero tokens (caller should
+    short-circuit to empty results).
+    """
+    tokens = _tokenize(query)
+    if not tokens:
+        return None
+    quoted = [f'"{t.replace(chr(34), chr(34) * 2)}"' for t in tokens]
+    return " OR ".join(quoted)
+
+
+# --- Schema ---
+
+SCHEMA_DDL = """
+CREATE TABLE IF NOT EXISTS docs (
+  rowid          INTEGER PRIMARY KEY AUTOINCREMENT,
+  doc_id         TEXT UNIQUE NOT NULL,
+  text           TEXT NOT NULL,
+  tokens         TEXT NOT NULL,
+  file_path      TEXT,
+  metadata_json  TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_docs_doc_id    ON docs(doc_id);
+CREATE INDEX IF NOT EXISTS idx_docs_file_path ON docs(file_path);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(
+  tokens,
+  content='docs',
+  content_rowid='rowid',
+  tokenize='unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS docs_ai AFTER INSERT ON docs BEGIN
+  INSERT INTO docs_fts(rowid, tokens) VALUES (new.rowid, new.tokens);
+END;
+
+CREATE TRIGGER IF NOT EXISTS docs_ad AFTER DELETE ON docs BEGIN
+  INSERT INTO docs_fts(docs_fts, rowid, tokens) VALUES('delete', old.rowid, old.tokens);
+END;
+
+CREATE TRIGGER IF NOT EXISTS docs_au AFTER UPDATE ON docs BEGIN
+  INSERT INTO docs_fts(docs_fts, rowid, tokens) VALUES('delete', old.rowid, old.tokens);
+  INSERT INTO docs_fts(rowid, tokens) VALUES (new.rowid, new.tokens);
+END;
+"""
+
+
+def _connect(path: Path) -> sqlite3.Connection:
+    """Open (or create) a BM25 FTS5 SQLite database at `path`.
+
+    Sets WAL mode, NORMAL synchronous, 5s busy timeout, and applies
+    the schema DDL idempotently. Returns an open connection — caller
+    closes it.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path), isolation_level=None)  # autocommit; we manage txns explicitly
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.executescript(SCHEMA_DDL)
+    return conn
+
+
+# --- BM25Index (filled in Task 2) ---
+
 class BM25Index:
-    """BM25 keyword search index with persistence."""
+    """Stub — implemented in Task 2."""
 
     def __init__(self, path: Path):
         self.path = path
-        self.bm25: BM25Okapi | None = None
-        self.doc_ids: list[str] = []
-        self.doc_texts: list[str] = []
-        self.doc_metadatas: list[dict] = []
-
-    def build(self, docs: list[dict]) -> None:
-        """Build index from list of {"id", "text", optional "metadata"} dicts."""
-        self.doc_ids = [d["id"] for d in docs]
-        self.doc_texts = [d["text"] for d in docs]
-        self.doc_metadatas = [d.get("metadata", {}) for d in docs]
-        tokenized = [_tokenize(d["text"]) for d in docs]
-        if tokenized:
-            self.bm25 = BM25Okapi(tokenized)
-        else:
-            self.bm25 = None
-
-    def search(self, query: str, n: int = 5, path_filter: str | None = None) -> list[dict]:
-        """Search the index. Returns list of {"id", "text", "score", "metadata"}.
-
-        Args:
-            query: Search query string.
-            n: Number of results to return.
-            path_filter: If set, only return results whose file_path metadata
-                         contains this substring. Fetches n*5 internally to
-                         compensate for post-filter loss.
-        """
-        if self.bm25 is None or not self.doc_ids:
-            return []
-
-        tokens = _tokenize(query)
-        scores = self.bm25.get_scores(tokens)
-
-        # Fetch more candidates when filtering to compensate for post-filter loss
-        fetch_n = n * 5 if path_filter else n
-
-        ranked = sorted(
-            enumerate(scores), key=lambda x: x[1], reverse=True
-        )[:fetch_n]
-
-        results = [
-            {
-                "id": self.doc_ids[i],
-                "text": self.doc_texts[i],
-                "score": float(score),
-                "metadata": self.doc_metadatas[i] if i < len(self.doc_metadatas) else {},
-            }
-            for i, score in ranked
-            if score > 0
-        ]
-
-        if path_filter:
-            results = [
-                r for r in results
-                if path_filter in r["metadata"].get("file_path", "")
-            ]
-
-        return results[:n]
-
-    def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.path, "wb") as f:
-            pickle.dump(
-                {
-                    "doc_ids": self.doc_ids,
-                    "doc_texts": self.doc_texts,
-                    "doc_metadatas": self.doc_metadatas,
-                },
-                f,
-            )
-
-    def load(self) -> bool:
-        """Load from disk. Returns True if loaded, False if file missing."""
-        if not self.path.exists():
-            return False
-        with open(self.path, "rb") as f:
-            data = pickle.load(f)
-        self.doc_ids = data["doc_ids"]
-        self.doc_texts = data["doc_texts"]
-        # Backward compat: old pickles may not have doc_metadatas
-        self.doc_metadatas = data.get("doc_metadatas", [{} for _ in self.doc_ids])
-        # Rebuild BM25 from tokenized texts (BM25Okapi doesn't pickle well)
-        tokenized = [_tokenize(text) for text in self.doc_texts]
-        if tokenized:
-            self.bm25 = BM25Okapi(tokenized)
-        else:
-            self.bm25 = None
-        return True
 
 
-# --- Module-level BM25 cache (H5 + H8) ---
+# --- Module-level mtime cache (filled in Task 3) ---
 
-_bm25_cache: dict[str, tuple[float, BM25Index]] = {}
+_bm25_cache: dict = {}
 
 
-def get_bm25(path: Path) -> BM25Index | None:
-    """Load a BM25 index with mtime-based caching.
-
-    Returns cached index if file hasn't changed. On load failure
-    (corrupted pickle, missing keys, etc.), returns None for graceful
-    degradation to vector-only search.
-    """
-    key = str(path)
-
-    if not path.exists():
-        _bm25_cache.pop(key, None)
-        return None
-
-    mtime = path.stat().st_mtime
-
-    if key in _bm25_cache and _bm25_cache[key][0] == mtime:
-        return _bm25_cache[key][1]
-
-    bm25 = BM25Index(path)
-    try:
-        if bm25.load():
-            _bm25_cache[key] = (mtime, bm25)
-            return bm25
-    except Exception:
-        return None
-
+def get_bm25(path: Path):
+    """Stub — implemented in Task 3."""
     return None

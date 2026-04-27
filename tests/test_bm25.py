@@ -1,9 +1,19 @@
+from __future__ import annotations
+
+import sqlite3
 import time
-from pathlib import Path
 
 import pytest
 
-from vecs.bm25_index import BM25Index, get_bm25, _bm25_cache, _tokenize
+from vecs.bm25_index import (
+    BM25Index,
+    _tokenize,
+    _build_match_query,
+    _bm25_cache,
+    get_bm25,
+    _connect,
+    SCHEMA_DDL,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -13,6 +23,133 @@ def clear_bm25_cache():
     yield
     _bm25_cache.clear()
 
+
+def test_connect_creates_schema(tmp_path):
+    """_connect creates the docs table, FTS5 vtable, and triggers on first call."""
+    db_path = tmp_path / "test.db"
+    conn = _connect(db_path)
+    try:
+        names = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table', 'trigger', 'index')"
+            )
+        }
+        assert "docs" in names
+        assert "docs_fts" in names
+        assert "docs_ai" in names  # AFTER INSERT trigger
+        assert "docs_ad" in names  # AFTER DELETE trigger
+        assert "docs_au" in names  # AFTER UPDATE trigger
+        assert "idx_docs_doc_id" in names
+        assert "idx_docs_file_path" in names
+
+        # WAL mode is set
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        assert mode.lower() == "wal"
+    finally:
+        conn.close()
+
+
+def test_build_match_query_basic():
+    """Tokenizes and ORs query terms, each quoted."""
+    assert _build_match_query("getUserById") == '"get" OR "user" OR "by" OR "id"'
+
+
+def test_build_match_query_empty():
+    """Empty / whitespace-only query returns None."""
+    assert _build_match_query("") is None
+    assert _build_match_query("   ") is None
+    assert _build_match_query("!@#$%^&*()") is None  # no word chars
+
+
+def test_build_match_query_escapes_quotes():
+    """Embedded double quotes in tokens are doubled (FTS5 escaping convention)."""
+    from vecs.bm25_index import _build_match_query
+    result = _build_match_query('hello world')
+    assert '"hello"' in result and '"world"' in result
+
+
+def test_build_match_query_punctuation_safe():
+    """FTS5-syntax punctuation in input does not produce a syntactically invalid query."""
+    q = _build_match_query("foo-bar baz")
+    assert q is not None
+    import sqlite3
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE VIRTUAL TABLE t USING fts5(x)")
+    conn.execute("INSERT INTO t(x) VALUES ('foo bar baz')")
+    rows = list(conn.execute("SELECT rowid FROM t WHERE t MATCH ?", (q,)))
+    assert len(rows) == 1
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Tokenizer tests (preserved from original implementation)
+# ---------------------------------------------------------------------------
+
+def test_tokenize_camel_case():
+    """camelCase identifiers are split into subwords."""
+    assert _tokenize("getUserById") == ["get", "user", "by", "id"]
+
+
+def test_tokenize_pascal_case():
+    """PascalCase identifiers are split into subwords."""
+    assert _tokenize("XMLParser") == ["xml", "parser"]
+
+
+def test_tokenize_acronym_connection():
+    """ACRONYM followed by PascalCase word splits correctly."""
+    assert _tokenize("HTTPSConnection") == ["https", "connection"]
+
+
+def test_tokenize_all_caps():
+    """ALL_CAPS identifiers split on underscore, each word separate."""
+    assert _tokenize("ALL_CAPS") == ["all", "caps"]
+
+
+def test_tokenize_mixed():
+    """Mixed camelCase identifier splits correctly."""
+    assert _tokenize("parseJSON") == ["parse", "json"]
+
+
+def test_tokenize_short_acronym():
+    """Short all-caps like ID are preserved as a single token."""
+    assert _tokenize("ID") == ["id"]
+
+
+def test_tokenize_trailing_url():
+    """Trailing acronym in camelCase splits correctly."""
+    assert _tokenize("getURL") == ["get", "url"]
+
+
+def test_tokenize_snake_case():
+    """snake_case names split into subwords."""
+    assert _tokenize("snake_case_name") == ["snake", "case", "name"]
+
+
+def test_tokenize_dunder():
+    """Dunder methods split correctly (underscores removed by \\w+)."""
+    assert _tokenize("__init__") == ["init"]
+
+
+def test_tokenize_plain_words():
+    """Plain lowercase words pass through unchanged."""
+    assert _tokenize("hello world") == ["hello", "world"]
+
+
+def test_tokenize_numbers():
+    """Numbers are preserved as tokens."""
+    assert _tokenize("item42count") == ["item", "42", "count"]
+
+
+def test_tokenize_mixed_sentence():
+    """Realistic code line with mixed identifiers."""
+    tokens = _tokenize("getUserById returns HTTPResponse")
+    assert tokens == ["get", "user", "by", "id", "returns", "http", "response"]
+
+
+# ---------------------------------------------------------------------------
+# Legacy BM25Index tests (will be rewritten in Task 2 — kept for reference)
+# ---------------------------------------------------------------------------
 
 def test_bm25_build_and_search(tmp_path):
     """BM25 index returns results ranked by keyword relevance."""
@@ -106,67 +243,6 @@ def test_get_bm25_cache_cleared_between_tests():
     """Verify _bm25_cache is accessible for test cleanup."""
     _bm25_cache.clear()
     assert len(_bm25_cache) == 0
-
-
-def test_tokenize_camel_case():
-    """camelCase identifiers are split into subwords."""
-    assert _tokenize("getUserById") == ["get", "user", "by", "id"]
-
-
-def test_tokenize_pascal_case():
-    """PascalCase identifiers are split into subwords."""
-    assert _tokenize("XMLParser") == ["xml", "parser"]
-
-
-def test_tokenize_acronym_connection():
-    """ACRONYM followed by PascalCase word splits correctly."""
-    assert _tokenize("HTTPSConnection") == ["https", "connection"]
-
-
-def test_tokenize_all_caps():
-    """ALL_CAPS identifiers split on underscore, each word separate."""
-    assert _tokenize("ALL_CAPS") == ["all", "caps"]
-
-
-def test_tokenize_mixed():
-    """Mixed camelCase identifier splits correctly."""
-    assert _tokenize("parseJSON") == ["parse", "json"]
-
-
-def test_tokenize_short_acronym():
-    """Short all-caps like ID are preserved as a single token."""
-    assert _tokenize("ID") == ["id"]
-
-
-def test_tokenize_trailing_url():
-    """Trailing acronym in camelCase splits correctly."""
-    assert _tokenize("getURL") == ["get", "url"]
-
-
-def test_tokenize_snake_case():
-    """snake_case names split into subwords."""
-    assert _tokenize("snake_case_name") == ["snake", "case", "name"]
-
-
-def test_tokenize_dunder():
-    """Dunder methods split correctly (underscores removed by \\w+)."""
-    assert _tokenize("__init__") == ["init"]
-
-
-def test_tokenize_plain_words():
-    """Plain lowercase words pass through unchanged."""
-    assert _tokenize("hello world") == ["hello", "world"]
-
-
-def test_tokenize_numbers():
-    """Numbers are preserved as tokens."""
-    assert _tokenize("item42count") == ["item", "42", "count"]
-
-
-def test_tokenize_mixed_sentence():
-    """Realistic code line with mixed identifiers."""
-    tokens = _tokenize("getUserById returns HTTPResponse")
-    assert tokens == ["get", "user", "by", "id", "returns", "http", "response"]
 
 
 def test_bm25_build_with_metadata(tmp_path):
