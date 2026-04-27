@@ -486,22 +486,57 @@ def _paginated_get(
         offset += len(ids)
 
 
-def _rebuild_bm25(collection: chromadb.Collection, project_name: str, suffix: str) -> None:
-    """Rebuild BM25 keyword index from a ChromaDB collection."""
+def _sync_bm25(collection: chromadb.Collection, project_name: str, suffix: str) -> None:
+    """Incrementally sync the BM25 FTS5 index with the given ChromaDB collection.
+
+    Diff strategy:
+      1. Fetch all chunk ids + documents + metadatas from chromadb (paginated).
+      2. Compare ids against the existing BM25 index's id set.
+      3. Delete BM25 rows whose ids are no longer in chromadb.
+      4. Upsert all chromadb-resident chunks (insert new + overwrite existing).
+
+    For per-tick incremental updates this is O(diff size) for the SQL writes;
+    the chromadb scan is O(N) but only reads ids+docs+metas (cheap relative
+    to the prior full rebuild + tokenize + repickle).
+
+    Migrates transparently: when no .db exists yet, step 4 simply inserts
+    everything (equivalent to a fresh build). Old `.pkl` files (if any) are
+    deleted on first successful sync.
+    """
     bm25_dir = VECS_DIR / "bm25"
     bm25_dir.mkdir(parents=True, exist_ok=True)
+    db_path = bm25_dir / f"{project_name}_{suffix}.db"
+    legacy_pkl = bm25_dir / f"{project_name}_{suffix}.pkl"
+
+    bm25 = BM25Index(db_path)
     try:
-        bm25_docs: list[dict] = []
+        bm25.load()
+        chroma_docs: list[dict] = []
+        chroma_ids: set[str] = set()
         for page in _paginated_get(collection, include=["documents", "metadatas"]):
             for id_, text, meta in zip(
                 page["ids"], page["documents"], page["metadatas"]
             ):
-                bm25_docs.append({"id": id_, "text": text, "metadata": meta or {}})
-        bm25 = BM25Index(bm25_dir / f"{project_name}_{suffix}.pkl")
-        bm25.build(bm25_docs)
-        bm25.save()
+                chroma_ids.add(id_)
+                chroma_docs.append({"id": id_, "text": text, "metadata": meta or {}})
+
+        existing_ids = bm25.all_ids()
+        to_delete = sorted(existing_ids - chroma_ids)
+        if to_delete:
+            bm25.delete(to_delete)
+        if chroma_docs:
+            bm25.upsert(chroma_docs)
+
+        # One-shot cleanup of the obsolete pickle, if it exists
+        if legacy_pkl.exists():
+            try:
+                legacy_pkl.unlink()
+            except OSError:
+                pass
     except Exception as e:
-        _log(f"  Warning: BM25 rebuild failed for {project_name}_{suffix}: {e}")
+        _log(f"  Warning: BM25 sync failed for {project_name}_{suffix}: {e}")
+    finally:
+        bm25.close()
 
 
 def _sweep_excluded_chunks(
@@ -766,7 +801,7 @@ def index_code(project: ProjectConfig, vo: voyageai.Client, db: chromadb.ClientA
     )
 
     if total_stored > 0:
-        _rebuild_bm25(collection, project.name, "code")
+        _sync_bm25(collection, project.name, "code")
 
     return total_stored
 
@@ -899,7 +934,7 @@ def index_sessions(project: ProjectConfig, vo: voyageai.Client, db: chromadb.Cli
     manifest.save()
 
     if len(succeeded_ids) > 0:
-        _rebuild_bm25(collection, project.name, "sessions")
+        _sync_bm25(collection, project.name, "sessions")
 
     return len(succeeded_ids)
 
@@ -971,7 +1006,7 @@ def index_docs(project: ProjectConfig, vo: voyageai.Client, db: chromadb.ClientA
     )
 
     if total_stored > 0:
-        _rebuild_bm25(collection, project.name, "docs")
+        _sync_bm25(collection, project.name, "docs")
 
     return total_stored
 
@@ -1023,7 +1058,7 @@ def index_single_doc(project_name: str, file_path: Path) -> int:
     )
 
     if total_stored > 0:
-        _rebuild_bm25(collection, project_name, "docs")
+        _sync_bm25(collection, project_name, "docs")
 
     return total_stored
 

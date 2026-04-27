@@ -14,7 +14,7 @@ from vecs.indexer import (
     _index_collection,
     _make_batches,
     _paginated_get,
-    _rebuild_bm25,
+    _sync_bm25,
     _sweep_excluded_chunks,
     _track_embed_success,
     index_code,
@@ -750,70 +750,106 @@ def test_manifest_prune_nothing_to_prune(tmp_path):
     assert pruned == 0
 
 
-# --- _rebuild_bm25 tests (P0 bug fix: metadata must be passed through) ---
+# --- _sync_bm25 tests ---
 
-def test_rebuild_bm25_includes_metadata(tmp_path, monkeypatch):
-    """_rebuild_bm25 fetches metadatas from ChromaDB and passes them to BM25."""
+def test_sync_bm25_inserts_new_chunks(tmp_path, monkeypatch):
+    """_sync_bm25 inserts chunks that exist in chromadb but not yet in BM25."""
+    from vecs import indexer
+    from vecs.bm25_index import BM25Index
+
+    monkeypatch.setattr(indexer, "VECS_DIR", tmp_path)
+    collection = MagicMock()
+    collection.get.return_value = {
+        "ids": ["a", "b", "c"],
+        "documents": ["alpha text", "beta text", "gamma text"],
+        "metadatas": [{"file_path": "a.ts"}, {"file_path": "b.ts"}, {"file_path": "c.ts"}],
+    }
+
+    indexer._sync_bm25(collection, "test", "code")
+
+    db = tmp_path / "bm25" / "test_code.db"
+    assert db.exists()
+    bm25 = BM25Index(db)
+    bm25.load()
+    assert bm25.all_ids() == {"a", "b", "c"}
+    bm25.close()
+
+
+def test_sync_bm25_deletes_removed_chunks(tmp_path, monkeypatch):
+    """_sync_bm25 removes BM25 docs that are no longer in chromadb."""
     from vecs import indexer
     from vecs.bm25_index import BM25Index
 
     monkeypatch.setattr(indexer, "VECS_DIR", tmp_path)
 
+    db = tmp_path / "bm25" / "test_code.db"
+    pre = BM25Index(db)
+    pre.upsert([
+        {"id": "a", "text": "alpha", "metadata": {"file_path": "a.ts"}},
+        {"id": "b", "text": "beta", "metadata": {"file_path": "b.ts"}},
+        {"id": "c", "text": "gamma", "metadata": {"file_path": "c.ts"}},
+    ])
+    pre.close()
+
     collection = MagicMock()
     collection.get.return_value = {
-        "ids": ["code:a.ts:0", "code:b.ts:0", "code:c.ts:0", "code:d.ts:0"],
-        "documents": [
-            "function greet(name) { return name; }",
-            "class UserService { getUser() {} }",
-            "interface Config { debug: boolean; }",
-            "export const API_URL = 'https://api.example.com';",
-        ],
-        "metadatas": [
-            {"file_path": "a.ts"},
-            {"file_path": "b.ts"},
-            {"file_path": "c.ts"},
-            {"file_path": "d.ts"},
-        ],
+        "ids": ["a"],
+        "documents": ["alpha text"],
+        "metadatas": [{"file_path": "a.ts"}],
     }
 
-    _rebuild_bm25(collection, "test", "code")
+    indexer._sync_bm25(collection, "test", "code")
 
-    # Verify metadatas were requested from ChromaDB (paginated -> limit + offset)
-    assert collection.get.called
-    first_call_kwargs = collection.get.call_args_list[0].kwargs
-    assert first_call_kwargs.get("include") == ["documents", "metadatas"]
-    assert isinstance(first_call_kwargs.get("limit"), int)
-    assert first_call_kwargs.get("offset") == 0
-
-    # Verify BM25 index was built with metadata
-    pkl_path = tmp_path / "bm25" / "test_code.pkl"
-    assert pkl_path.exists()
-
-    bm25 = BM25Index(pkl_path)
-    assert bm25.load() is True
-    results = bm25.search("greet name", n=1)
-    assert len(results) >= 1
-    assert results[0]["metadata"] == {"file_path": "a.ts"}
-
-    # Path filter works with the rebuilt metadata
-    filtered = bm25.search("greet name", n=5, path_filter="a.ts")
-    assert len(filtered) == 1
-    assert filtered[0]["id"] == "code:a.ts:0"
+    bm25 = BM25Index(db)
+    bm25.load()
+    assert bm25.all_ids() == {"a"}
+    bm25.close()
 
 
-def test_rebuild_bm25_logs_on_failure(tmp_path, monkeypatch, capsys):
-    """_rebuild_bm25 logs errors instead of silently swallowing them."""
+def test_sync_bm25_updates_changed_chunks(tmp_path, monkeypatch):
+    """_sync_bm25 updates content for existing chunk ids when the chromadb text changes."""
     from vecs import indexer
+    from vecs.bm25_index import BM25Index
 
     monkeypatch.setattr(indexer, "VECS_DIR", tmp_path)
 
+    db = tmp_path / "bm25" / "test_code.db"
+    pre = BM25Index(db)
+    pre.upsert([{"id": "a", "text": "old text alpha", "metadata": {"file_path": "a.ts"}}])
+    pre.close()
+
+    collection = MagicMock()
+    collection.get.return_value = {
+        "ids": ["a"],
+        "documents": ["new text completely different"],
+        "metadatas": [{"file_path": "a.ts"}],
+    }
+
+    indexer._sync_bm25(collection, "test", "code")
+
+    bm25 = BM25Index(db)
+    bm25.load()
+    # Old-unique term "alpha" should no longer match document "a"
+    old_results = bm25.search("alpha", n=5)
+    assert all(r["id"] != "a" for r in old_results)
+    # New text should match
+    new_results = bm25.search("completely different", n=5)
+    assert any(r["id"] == "a" for r in new_results)
+    bm25.close()
+
+
+def test_sync_bm25_logs_on_failure(tmp_path, monkeypatch, capsys):
+    """_sync_bm25 logs errors instead of swallowing them."""
+    from vecs import indexer
+
+    monkeypatch.setattr(indexer, "VECS_DIR", tmp_path)
     collection = MagicMock()
     collection.get.side_effect = RuntimeError("ChromaDB unavailable")
 
-    _rebuild_bm25(collection, "test", "code")
+    indexer._sync_bm25(collection, "test", "code")
 
     captured = capsys.readouterr()
-    assert "BM25 rebuild failed" in captured.err
+    assert "BM25 sync failed" in captured.err
     assert "ChromaDB unavailable" in captured.err
 
 
@@ -896,7 +932,7 @@ def _capture_files(monkeypatch):
         return len(files_to_process)
 
     monkeypatch.setattr("vecs.indexer._index_collection", fake_index_collection)
-    monkeypatch.setattr("vecs.indexer._rebuild_bm25", lambda *a, **kw: None)
+    monkeypatch.setattr("vecs.indexer._sync_bm25", lambda *a, **kw: None)
     return captured
 
 
@@ -1082,14 +1118,12 @@ def test_paginated_get_stops_on_empty_page():
     assert collection.get.call_count == 1
 
 
-def test_rebuild_bm25_paginates_through_all_chunks(tmp_path, monkeypatch):
-    """_rebuild_bm25 indexes ALL chunks across multiple pages, not just the first."""
+def test_sync_bm25_paginates_through_all_chunks(tmp_path, monkeypatch):
+    """_sync_bm25 walks all chromadb pages, not just the first."""
     from vecs import indexer
     from vecs.bm25_index import BM25Index
 
     monkeypatch.setattr(indexer, "VECS_DIR", tmp_path)
-
-    # Force a tiny page size so we exercise pagination on a small fixture
     total_chunks = 12
     all_ids = [f"code:f{i}.ts:0" for i in range(total_chunks)]
     all_docs = [f"function f{i}() {{ return {i}; }}" for i in range(total_chunks)]
@@ -1105,21 +1139,13 @@ def test_rebuild_bm25_paginates_through_all_chunks(tmp_path, monkeypatch):
     collection = MagicMock()
     collection.get.side_effect = fake_get
 
-    # Patch the helper to use a small page size so this test stays fast
-    monkeypatch.setattr(indexer, "_paginated_get",
-                        lambda col, batch_size=5, **kw: _paginated_get(col, batch_size=5, **kw))
+    indexer._sync_bm25(collection, "test", "code")
 
-    _rebuild_bm25(collection, "test", "code")
-
-    pkl_path = tmp_path / "bm25" / "test_code.pkl"
-    assert pkl_path.exists()
-    bm25 = BM25Index(pkl_path)
-    assert bm25.load() is True
-    # Every file must be searchable -- proves pagination collected ALL pages
-    for i in range(total_chunks):
-        results = bm25.search(f"f{i}", n=5, path_filter=f"f{i}.ts")
-        assert len(results) == 1
-        assert results[0]["id"] == f"code:f{i}.ts:0"
+    db = tmp_path / "bm25" / "test_code.db"
+    bm25 = BM25Index(db)
+    bm25.load()
+    assert bm25.all_ids() == set(all_ids)
+    bm25.close()
 
 
 # --- _sweep_excluded_chunks tests (Problem 2: orphan chunks for excluded files) ---
