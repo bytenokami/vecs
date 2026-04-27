@@ -64,7 +64,6 @@ CREATE TABLE IF NOT EXISTS docs (
   metadata_json  TEXT NOT NULL DEFAULT '{}'
 );
 
-CREATE INDEX IF NOT EXISTS idx_docs_doc_id    ON docs(doc_id);
 CREATE INDEX IF NOT EXISTS idx_docs_file_path ON docs(file_path);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(

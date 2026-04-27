@@ -40,7 +40,6 @@ def test_connect_creates_schema(tmp_path):
         assert "docs_ai" in names  # AFTER INSERT trigger
         assert "docs_ad" in names  # AFTER DELETE trigger
         assert "docs_au" in names  # AFTER UPDATE trigger
-        assert "idx_docs_doc_id" in names
         assert "idx_docs_file_path" in names
 
         # WAL mode is set
@@ -64,7 +63,6 @@ def test_build_match_query_empty():
 
 def test_build_match_query_escapes_quotes():
     """Embedded double quotes in tokens are doubled (FTS5 escaping convention)."""
-    from vecs.bm25_index import _build_match_query
     result = _build_match_query('hello world')
     assert '"hello"' in result and '"world"' in result
 
