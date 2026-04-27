@@ -181,7 +181,7 @@ Logs carry ISO timestamps, per-project durations, and chunk-id context on trunca
    - Sessions: append-only JSONL chunked into 10-message windows with 2-message overlap; `byte_offset` stored so subsequent runs only read new bytes.
    - Docs: Markdown and PDF split at heading boundaries; plain text falls back to size-based chunks.
 3. **Embedding** — Voyage AI (`voyage-code-3` for code, `voyage-3` for sessions and docs) via an adaptive batcher that calibrates the char-to-token ratio from API responses. Transient errors (timeout, rate limit, 5xx) retry with backoff; permanent errors fail fast.
-4. **Storage** — vectors + metadata go into ChromaDB; a parallel BM25 sidecar (`~/.vecs/bm25/{project}_{collection}.pkl`) is rebuilt when chunks change.
+4. **Storage** — vectors + metadata go into ChromaDB; a parallel SQLite FTS5 BM25 sidecar (`~/.vecs/bm25/{project}_{collection}.db`) is incrementally upserted as chunks change.
 5. **Cleanup** — files removed from disk are pruned from the manifest; files now under `exclude_dirs` are pruned and their chromadb chunks swept (catches orphans from prior partially-completed runs too).
 6. **Search** — query embedded once (cached, 5-min TTL), runs against vectors and BM25, results merged via Reciprocal Rank Fusion, deduplicated, returned.
 
