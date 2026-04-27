@@ -35,7 +35,7 @@ Restart Claude Code. The `vecs` MCP tools (`semantic_search`, `reindex`, `index_
 
 ## Let Claude do the rest
 
-Everything below — registering projects, choosing extensions, excluding noisy directories, pruning, reclaiming disk space, troubleshooting — is documented in the **AI Guide** section so Claude Code can drive it for you. Try:
+Everything else — registering projects, choosing extensions, excluding noisy directories, pruning, reclaiming disk space, troubleshooting — lives in the [**AI Guide**](#ai-guide) below. It's written so Claude Code (or any MCP-aware agent) can read it and drive vecs for you end-to-end. Try:
 
 > *"Set up vecs for my livly project at `~/Repositories/livly`. It's a Unity client + Go server monorepo. Exclude `Library/`, `.venv/`, `node_modules/`, and any generated `proto/` dirs."*
 
