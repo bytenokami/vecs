@@ -13,8 +13,11 @@ from vecs.indexer import (
     _get_session_new_content,
     _index_collection,
     _make_batches,
+    _paginated_get,
     _rebuild_bm25,
+    _sweep_excluded_chunks,
     _track_embed_success,
+    index_code,
     migrate_global_manifest,
 )
 from vecs.config import VecsConfig, ProjectConfig, CodeDir
@@ -334,6 +337,43 @@ def test_embed_and_store_empty_returns_empty_list():
     vo = MagicMock()
     result = _embed_and_store([], collection, "voyage-code-3", vo)
     assert result == []
+
+
+def test_embed_and_store_treats_voyage_timeout_as_transient():
+    """voyageai.error.Timeout (class name 'Timeout') must be retried, not raised.
+
+    Regression: substring check `"TimeoutError" in "Timeout"` is False, so prior
+    code raised on Voyage timeouts and aborted the run before manifest.save(),
+    causing the next cron tick to redo the same work — a doom loop.
+    """
+    import voyageai
+    batch1_chunks = [
+        {"id": f"code:a.cs:{i}", "text": "x" * 10, "metadata": {"file_path": "a.cs", "chunk_index": i}}
+        for i in range(2)
+    ]
+    batch2_chunks = [
+        {"id": f"code:b.cs:{i}", "text": "x" * 10, "metadata": {"file_path": "b.cs", "chunk_index": i}}
+        for i in range(2)
+    ]
+    all_chunks = batch1_chunks + batch2_chunks
+
+    collection = MagicMock()
+    vo = MagicMock()
+    vo.embed.side_effect = [
+        FakeEmbedResult(2),
+        voyageai.error.Timeout("Request timed out"),
+        voyageai.error.Timeout("Request timed out"),
+        voyageai.error.Timeout("Request timed out"),
+        voyageai.error.Timeout("Request timed out"),
+        voyageai.error.Timeout("Request timed out"),
+    ]
+
+    with patch("vecs.indexer._make_batches") as mock_batches, \
+         patch("vecs.indexer.time.sleep"):
+        mock_batches.return_value = iter([batch1_chunks, batch2_chunks])
+        result = _embed_and_store(all_chunks, collection, "voyage-code-3", vo)
+
+    assert set(result) == {"code:a.cs:0", "code:a.cs:1"}
 
 
 def test_embed_and_store_handles_large_input_internally():
@@ -738,8 +778,12 @@ def test_rebuild_bm25_includes_metadata(tmp_path, monkeypatch):
 
     _rebuild_bm25(collection, "test", "code")
 
-    # Verify metadatas were requested from ChromaDB
-    collection.get.assert_called_once_with(include=["documents", "metadatas"])
+    # Verify metadatas were requested from ChromaDB (paginated -> limit + offset)
+    assert collection.get.called
+    first_call_kwargs = collection.get.call_args_list[0].kwargs
+    assert first_call_kwargs.get("include") == ["documents", "metadatas"]
+    assert isinstance(first_call_kwargs.get("limit"), int)
+    assert first_call_kwargs.get("offset") == 0
 
     # Verify BM25 index was built with metadata
     pkl_path = tmp_path / "bm25" / "test_code.pkl"
@@ -824,3 +868,493 @@ def test_track_embed_success_cleans_up_orphans(tmp_path):
     # Verify orphan chunk was deleted
     collection.get.assert_called_once_with(where={"file_path": "a.cs"})
     collection.delete.assert_called_once_with(ids=["code:a.cs:2"])
+
+
+# --- exclude_dirs filtering on index_code ---
+
+
+def _make_index_db(tmp_path):
+    """Build a chromadb-like mock that records upserted ids per file_path metadata."""
+    collection = MagicMock()
+    collection.get.return_value = {"ids": []}
+    db = MagicMock()
+    db.get_or_create_collection.return_value = collection
+    return db, collection
+
+
+def _capture_files(monkeypatch):
+    """Patch _index_collection to capture files_to_process and skip embed work."""
+    captured: dict = {}
+
+    def fake_index_collection(*, files_to_process, file_hashes, manifest, **kw):
+        captured["files"] = list(files_to_process)
+        captured["file_hashes"] = dict(file_hashes)
+        # Mark all files as indexed so manifest persists -- mirrors successful path
+        for f in files_to_process:
+            manifest.mark_indexed(f, file_hashes[f])
+        manifest.save()
+        return len(files_to_process)
+
+    monkeypatch.setattr("vecs.indexer._index_collection", fake_index_collection)
+    monkeypatch.setattr("vecs.indexer._rebuild_bm25", lambda *a, **kw: None)
+    return captured
+
+
+def test_index_code_exclude_dirs_drops_files(tmp_path, monkeypatch):
+    """Files under exclude_dirs are not indexed."""
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+
+    code_root = tmp_path / "repo"
+    (code_root / "Scripts").mkdir(parents=True)
+    (code_root / "Library").mkdir(parents=True)
+    keep = code_root / "Scripts" / "keep.cs"
+    keep.write_text("public class K {}")
+    drop = code_root / "Library" / "drop.cs"
+    drop.write_text("public class D {}")
+
+    project = ProjectConfig(
+        name="exclproj",
+        code_dirs=[CodeDir(
+            path=code_root,
+            extensions={".cs"},
+            exclude_dirs=["Library"],
+        )],
+    )
+
+    captured = _capture_files(monkeypatch)
+    db, _collection = _make_index_db(tmp_path)
+    index_code(project, vo=MagicMock(), db=db)
+
+    assert keep in captured["files"]
+    assert drop not in captured["files"]
+
+
+def test_index_code_exclude_wins_over_include(tmp_path, monkeypatch):
+    """When include_dirs and exclude_dirs overlap, exclude wins."""
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+
+    code_root = tmp_path / "repo"
+    (code_root / "Scripts" / "Editor").mkdir(parents=True)
+    (code_root / "Scripts" / "Runtime").mkdir(parents=True)
+    editor_file = code_root / "Scripts" / "Editor" / "e.cs"
+    editor_file.write_text("// editor")
+    runtime_file = code_root / "Scripts" / "Runtime" / "r.cs"
+    runtime_file.write_text("// runtime")
+
+    project = ProjectConfig(
+        name="overlapproj",
+        code_dirs=[CodeDir(
+            path=code_root,
+            extensions={".cs"},
+            include_dirs=["Scripts"],
+            exclude_dirs=["Scripts/Editor"],
+        )],
+    )
+
+    captured = _capture_files(monkeypatch)
+    db, _collection = _make_index_db(tmp_path)
+    index_code(project, vo=MagicMock(), db=db)
+
+    assert runtime_file in captured["files"]
+    assert editor_file not in captured["files"]
+
+
+def test_index_code_empty_exclude_dirs_is_noop(tmp_path, monkeypatch):
+    """Empty exclude_dirs walks the full tree just like before."""
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+
+    code_root = tmp_path / "repo"
+    (code_root / "Scripts").mkdir(parents=True)
+    (code_root / "UI").mkdir(parents=True)
+    a = code_root / "Scripts" / "a.cs"
+    a.write_text("// a")
+    b = code_root / "UI" / "b.cs"
+    b.write_text("// b")
+
+    project = ProjectConfig(
+        name="noexclproj",
+        code_dirs=[CodeDir(
+            path=code_root,
+            extensions={".cs"},
+            exclude_dirs=[],
+        )],
+    )
+
+    captured = _capture_files(monkeypatch)
+    db, _collection = _make_index_db(tmp_path)
+    index_code(project, vo=MagicMock(), db=db)
+
+    assert a in captured["files"]
+    assert b in captured["files"]
+
+
+def test_index_code_prunes_manifest_for_now_excluded_files(tmp_path, monkeypatch):
+    """Files previously indexed but now under exclude_dirs are pruned from the manifest."""
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+
+    code_root = tmp_path / "repo"
+    (code_root / "Scripts").mkdir(parents=True)
+    (code_root / "Library").mkdir(parents=True)
+    keep = code_root / "Scripts" / "keep.cs"
+    keep.write_text("// keep")
+    stale = code_root / "Library" / "stale.cs"
+    stale.write_text("// stale")
+
+    # Pre-populate the manifest as if both files were previously indexed
+    manifest = Manifest("pruneproj", manifests_dir=tmp_path / "manifests")
+    manifest.mark_indexed(keep, hashlib.sha256(keep.read_bytes()).hexdigest())
+    manifest.mark_indexed(stale, hashlib.sha256(stale.read_bytes()).hexdigest())
+    manifest.save()
+
+    project = ProjectConfig(
+        name="pruneproj",
+        code_dirs=[CodeDir(
+            path=code_root,
+            extensions={".cs"},
+            exclude_dirs=["Library"],
+        )],
+    )
+
+    _capture_files(monkeypatch)
+    db, _collection = _make_index_db(tmp_path)
+    index_code(project, vo=MagicMock(), db=db)
+
+    reloaded = Manifest("pruneproj", manifests_dir=tmp_path / "manifests")
+    assert str(keep) in reloaded.data
+    assert str(stale) not in reloaded.data
+
+
+# --- _paginated_get tests (Problem 1: SQLite IN-clause limit) ---
+
+
+def test_paginated_get_passes_limit_and_offset():
+    """_paginated_get always passes a bounded limit and a starting offset.
+
+    Without limit, chromadb constructs an internal SQL query whose IN-clause
+    can exceed SQLITE_MAX_VARIABLE_NUMBER (32766 on modern SQLite).
+    """
+    collection = MagicMock()
+    collection.get.return_value = {"ids": [], "documents": [], "metadatas": []}
+
+    list(_paginated_get(collection, batch_size=5000, include=["documents"]))
+
+    assert collection.get.called
+    first_kwargs = collection.get.call_args_list[0].kwargs
+    assert first_kwargs.get("limit") == 5000
+    assert first_kwargs.get("offset") == 0
+    # Defensive: limit must stay well under SQLite's IN-clause cap
+    assert first_kwargs["limit"] <= 5000
+
+
+def test_paginated_get_walks_multiple_pages():
+    """_paginated_get advances offset until the collection is exhausted."""
+    collection = MagicMock()
+
+    def fake_get(*, limit, offset, **kw):
+        # Simulate 12 total ids spread across pages of 5
+        all_ids = [f"id_{i}" for i in range(12)]
+        page_ids = all_ids[offset:offset + limit]
+        return {
+            "ids": page_ids,
+            "documents": [f"doc_{i.split('_')[1]}" for i in page_ids],
+            "metadatas": [{"i": i} for i in page_ids],
+        }
+
+    collection.get.side_effect = fake_get
+
+    pages = list(_paginated_get(collection, batch_size=5, include=["documents", "metadatas"]))
+
+    # Three pages: 5, 5, 2
+    assert [len(p["ids"]) for p in pages] == [5, 5, 2]
+    flat = [i for p in pages for i in p["ids"]]
+    assert flat == [f"id_{i}" for i in range(12)]
+
+
+def test_paginated_get_stops_on_empty_page():
+    """_paginated_get does not infinite-loop when the collection returns no ids."""
+    collection = MagicMock()
+    collection.get.return_value = {"ids": [], "documents": [], "metadatas": []}
+
+    pages = list(_paginated_get(collection, batch_size=5000))
+
+    # One probe call, no iterations yielded
+    assert pages == []
+    assert collection.get.call_count == 1
+
+
+def test_rebuild_bm25_paginates_through_all_chunks(tmp_path, monkeypatch):
+    """_rebuild_bm25 indexes ALL chunks across multiple pages, not just the first."""
+    from vecs import indexer
+    from vecs.bm25_index import BM25Index
+
+    monkeypatch.setattr(indexer, "VECS_DIR", tmp_path)
+
+    # Force a tiny page size so we exercise pagination on a small fixture
+    total_chunks = 12
+    all_ids = [f"code:f{i}.ts:0" for i in range(total_chunks)]
+    all_docs = [f"function f{i}() {{ return {i}; }}" for i in range(total_chunks)]
+    all_metas = [{"file_path": f"f{i}.ts"} for i in range(total_chunks)]
+
+    def fake_get(*, limit, offset, include):
+        return {
+            "ids": all_ids[offset:offset + limit],
+            "documents": all_docs[offset:offset + limit],
+            "metadatas": all_metas[offset:offset + limit],
+        }
+
+    collection = MagicMock()
+    collection.get.side_effect = fake_get
+
+    # Patch the helper to use a small page size so this test stays fast
+    monkeypatch.setattr(indexer, "_paginated_get",
+                        lambda col, batch_size=5, **kw: _paginated_get(col, batch_size=5, **kw))
+
+    _rebuild_bm25(collection, "test", "code")
+
+    pkl_path = tmp_path / "bm25" / "test_code.pkl"
+    assert pkl_path.exists()
+    bm25 = BM25Index(pkl_path)
+    assert bm25.load() is True
+    # Every file must be searchable -- proves pagination collected ALL pages
+    for i in range(total_chunks):
+        results = bm25.search(f"f{i}", n=5, path_filter=f"f{i}.ts")
+        assert len(results) == 1
+        assert results[0]["id"] == f"code:f{i}.ts:0"
+
+
+# --- _sweep_excluded_chunks tests (Problem 2: orphan chunks for excluded files) ---
+
+
+def test_sweep_excluded_chunks_deletes_orphans_under_excluded_subdirs(tmp_path):
+    """Chunks whose file_path is under an excluded subdir are deleted."""
+    from vecs.config import CodeDir
+
+    code_root = tmp_path / "client-uk"
+    code_root.mkdir()
+    code_dir = CodeDir(
+        path=code_root,
+        extensions={".cs"},
+        exclude_dirs=["Library"],
+    )
+
+    collection = MagicMock()
+    # Single page is fine for this case
+    collection.get.return_value = {
+        "ids": [
+            "code:client-uk/Library/PackageCache/foo.cs:0",
+            "code:client-uk/Assets/Scripts/Player.cs:0",
+            "code:client-uk/Library/Cached.cs:1",
+        ],
+        "documents": ["", "", ""],
+        "metadatas": [
+            {"file_path": "client-uk/Library/PackageCache/foo.cs"},
+            {"file_path": "client-uk/Assets/Scripts/Player.cs"},
+            {"file_path": "client-uk/Library/Cached.cs"},
+        ],
+    }
+
+    swept = _sweep_excluded_chunks(collection, code_dir)
+
+    assert swept == 2
+    collection.delete.assert_called_once()
+    deleted_ids = collection.delete.call_args.kwargs.get("ids") or collection.delete.call_args.args[0]
+    assert set(deleted_ids) == {
+        "code:client-uk/Library/PackageCache/foo.cs:0",
+        "code:client-uk/Library/Cached.cs:1",
+    }
+
+
+def test_sweep_excluded_chunks_skips_chunks_outside_excluded_subdirs(tmp_path):
+    """Chunks whose file_path is NOT under an excluded subdir stay put."""
+    from vecs.config import CodeDir
+
+    code_root = tmp_path / "client-uk"
+    code_root.mkdir()
+    code_dir = CodeDir(
+        path=code_root,
+        extensions={".cs"},
+        exclude_dirs=["Library"],
+    )
+
+    collection = MagicMock()
+    collection.get.return_value = {
+        "ids": [
+            "code:client-uk/Assets/Scripts/A.cs:0",
+            "code:client-uk/Assets/Scripts/B.cs:0",
+        ],
+        "documents": ["", ""],
+        "metadatas": [
+            {"file_path": "client-uk/Assets/Scripts/A.cs"},
+            {"file_path": "client-uk/Assets/Scripts/B.cs"},
+        ],
+    }
+
+    swept = _sweep_excluded_chunks(collection, code_dir)
+
+    assert swept == 0
+    collection.delete.assert_not_called()
+
+
+def test_sweep_excluded_chunks_noop_with_empty_exclude_dirs(tmp_path):
+    """When exclude_dirs is empty, the helper does nothing -- no get, no delete."""
+    from vecs.config import CodeDir
+
+    code_root = tmp_path / "client-uk"
+    code_root.mkdir()
+    code_dir = CodeDir(
+        path=code_root,
+        extensions={".cs"},
+        exclude_dirs=[],
+    )
+
+    collection = MagicMock()
+
+    swept = _sweep_excluded_chunks(collection, code_dir)
+
+    assert swept == 0
+    collection.get.assert_not_called()
+    collection.delete.assert_not_called()
+
+
+def test_sweep_excluded_chunks_paginates_delete_for_huge_orphan_sets(tmp_path):
+    """When orphan count exceeds the SQLite IN-clause cap, delete must be batched.
+
+    Same SQL-variable bug that hit collection.get() rebirths on collection.delete()
+    if we hand it a single list of 10K+ ids. Must chunk into batches <= 5000.
+    """
+    from vecs.config import CodeDir
+
+    code_root = tmp_path / "client-uk"
+    code_root.mkdir()
+    code_dir = CodeDir(
+        path=code_root,
+        extensions={".cs"},
+        exclude_dirs=["Library"],
+    )
+
+    n_orphans = 12000
+    ids = [f"code:client-uk/Library/file{i}.cs:0" for i in range(n_orphans)]
+    metadatas = [{"file_path": f"client-uk/Library/file{i}.cs"} for i in range(n_orphans)]
+
+    collection = MagicMock()
+    collection.get.side_effect = [
+        {"ids": ids, "documents": [""] * n_orphans, "metadatas": metadatas},
+        {"ids": [], "documents": [], "metadatas": []},
+    ]
+
+    swept = _sweep_excluded_chunks(collection, code_dir)
+
+    assert swept == n_orphans
+    assert collection.delete.call_count >= 2, (
+        f"delete called {collection.delete.call_count} times for {n_orphans} orphans "
+        "— must batch to avoid SQL variable limit"
+    )
+    all_deleted: list[str] = []
+    for call in collection.delete.call_args_list:
+        batch = call.kwargs.get("ids") or call.args[0]
+        assert len(batch) <= 5000, f"batch size {len(batch)} exceeds safe SQLite limit"
+        all_deleted.extend(batch)
+    assert set(all_deleted) == set(ids)
+
+
+def test_sweep_excluded_chunks_does_not_match_path_prefix_collisions(tmp_path):
+    """Excluding 'Lib' must not match 'Library/' -- match on path component boundary."""
+    from vecs.config import CodeDir
+
+    code_root = tmp_path / "client-uk"
+    code_root.mkdir()
+    code_dir = CodeDir(
+        path=code_root,
+        extensions={".cs"},
+        exclude_dirs=["Lib"],
+    )
+
+    collection = MagicMock()
+    collection.get.return_value = {
+        "ids": [
+            "code:client-uk/Library/foo.cs:0",  # NOT under "Lib/"
+            "code:client-uk/Lib/bar.cs:0",      # IS  under "Lib/"
+        ],
+        "documents": ["", ""],
+        "metadatas": [
+            {"file_path": "client-uk/Library/foo.cs"},
+            {"file_path": "client-uk/Lib/bar.cs"},
+        ],
+    }
+
+    swept = _sweep_excluded_chunks(collection, code_dir)
+
+    assert swept == 1
+    collection.delete.assert_called_once()
+    deleted_ids = collection.delete.call_args.kwargs.get("ids") or collection.delete.call_args.args[0]
+    assert deleted_ids == ["code:client-uk/Lib/bar.cs:0"]
+
+
+def test_index_code_sweeps_orphan_chunks_for_excluded_dirs(tmp_path, monkeypatch):
+    """index_code sweeps chromadb for orphan chunks under exclude_dirs.
+
+    Regression: prune_out_of_scope only removes manifest-tracked entries. If a
+    file was upserted to chromadb but the run died before manifest.save(),
+    chunks remain. After exclude_dirs is configured, those chunks must be
+    deleted regardless of manifest state.
+    """
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+
+    code_root = tmp_path / "client-uk"
+    (code_root / "Assets").mkdir(parents=True)
+    (code_root / "Library").mkdir(parents=True)
+    keep = code_root / "Assets" / "keep.cs"
+    keep.write_text("public class K {}")
+
+    project = ProjectConfig(
+        name="sweepproj",
+        code_dirs=[CodeDir(
+            path=code_root,
+            extensions={".cs"},
+            exclude_dirs=["Library"],
+        )],
+    )
+
+    # Simulate orphan chunks living in chromadb under Library/
+    orphan_ids = [
+        "code:client-uk/Library/PackageCache/orphan_a.cs:0",
+        "code:client-uk/Library/orphan_b.cs:0",
+    ]
+
+    collection = MagicMock()
+
+    def fake_get(*args, **kwargs):
+        # First call: paginate ALL chunks for the sweep
+        # Subsequent calls (from _delete_stale_chunks_after_embed via _track_embed_success
+        # or other paths) get an empty result -- not under test here.
+        if "where" in kwargs:
+            return {"ids": []}
+        offset = kwargs.get("offset", 0)
+        if offset == 0:
+            return {
+                "ids": orphan_ids + ["code:client-uk/Assets/keep.cs:0"],
+                "documents": ["", "", ""],
+                "metadatas": [
+                    {"file_path": "client-uk/Library/PackageCache/orphan_a.cs"},
+                    {"file_path": "client-uk/Library/orphan_b.cs"},
+                    {"file_path": "client-uk/Assets/keep.cs"},
+                ],
+            }
+        return {"ids": [], "documents": [], "metadatas": []}
+
+    collection.get.side_effect = fake_get
+    db = MagicMock()
+    db.get_or_create_collection.return_value = collection
+
+    _capture_files(monkeypatch)
+    index_code(project, vo=MagicMock(), db=db)
+
+    # Find the sweep-driven delete call (by orphan ids), tolerating other delete calls
+    sweep_calls = [
+        c for c in collection.delete.call_args_list
+        if set(c.kwargs.get("ids") or (c.args[0] if c.args else [])) == set(orphan_ids)
+    ]
+    assert len(sweep_calls) == 1, (
+        f"Expected exactly one sweep delete with orphan ids, "
+        f"got delete calls: {collection.delete.call_args_list}"
+    )

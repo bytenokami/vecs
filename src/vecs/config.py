@@ -29,6 +29,7 @@ class CodeDir:
     path: Path
     extensions: set[str] = field(default_factory=set)
     include_dirs: list[str] = field(default_factory=list)
+    exclude_dirs: list[str] = field(default_factory=list)
 
     def __post_init__(self):
         if not self.extensions:
@@ -111,6 +112,8 @@ class VecsConfig:
                     }
                     if cd.include_dirs:
                         cd_dict["include_dirs"] = list(cd.include_dirs)
+                    if cd.exclude_dirs:
+                        cd_dict["exclude_dirs"] = list(cd.exclude_dirs)
                     proj["code_dirs"].append(cd_dict)
             if p.sessions_dirs:
                 proj["sessions_dirs"] = [str(d) for d in p.sessions_dirs]
@@ -162,6 +165,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> VecsConfig:
                 path=Path(cd_raw["path"]),
                 extensions=set(raw_extensions),
                 include_dirs=list(cd_raw.get("include_dirs", [])),
+                exclude_dirs=list(cd_raw.get("exclude_dirs", [])),
             ))
 
         # Backward compat: migrate legacy single code_dir
@@ -176,6 +180,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> VecsConfig:
                 path=Path(proj["code_dir"]),
                 extensions=set(raw_extensions),
                 include_dirs=list(proj.get("include_dirs", [])),
+                exclude_dirs=list(proj.get("exclude_dirs", [])),
             )]
 
         # Support both plural sessions_dirs (list) and legacy singular sessions_dir

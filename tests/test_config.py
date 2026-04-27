@@ -119,6 +119,47 @@ def test_include_dirs_on_code_dir(tmp_path):
     assert config.projects["proj"].code_dirs[0].include_dirs == ["Scripts", "UI"]
 
 
+def test_exclude_dirs_default_empty():
+    """CodeDir.exclude_dirs defaults to an empty list."""
+    cd = CodeDir(path=Path("/tmp/code"), extensions={".cs"})
+    assert cd.exclude_dirs == []
+
+
+def test_exclude_dirs_on_code_dir(tmp_path):
+    """exclude_dirs is parsed from YAML alongside include_dirs."""
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump({
+        "projects": {
+            "proj": {
+                "code_dirs": [{
+                    "path": "/tmp/code",
+                    "extensions": [".cs"],
+                    "exclude_dirs": ["Library", "Temp", "obj"],
+                }],
+            }
+        }
+    }))
+    config = load_config(config_file)
+    assert config.projects["proj"].code_dirs[0].exclude_dirs == ["Library", "Temp", "obj"]
+
+
+def test_exclude_dirs_save_and_reload(tmp_path):
+    """exclude_dirs survives save/reload roundtrip."""
+    config_file = tmp_path / "config.yaml"
+    config = load_config(config_file)
+    config.add_project(
+        "proj",
+        code_dirs=[CodeDir(
+            path=Path("/tmp/code"),
+            extensions={".cs"},
+            exclude_dirs=["Library", "Temp"],
+        )],
+    )
+    config.save()
+    reloaded = load_config(config_file)
+    assert reloaded.projects["proj"].code_dirs[0].exclude_dirs == ["Library", "Temp"]
+
+
 def test_find_project_by_path(tmp_path):
     config_file = tmp_path / "config.yaml"
     config = load_config(config_file)

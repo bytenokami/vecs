@@ -97,6 +97,17 @@ def test_oversized_chunk_logs_warning(capsys):
     assert "truncat" in captured.err.lower()
 
 
+def test_oversized_chunk_warning_includes_chunk_id(capsys):
+    """Truncation warning must name the offending chunk so the file is identifiable."""
+    from vecs.indexer import MAX_BATCH_TOKENS
+    oversized_text = "x" * (MAX_BATCH_TOKENS * 2 + 1000)
+    chunk_id = "code:client-uk/Assets/Foo/Generated/Big.cs:7"
+    chunks = [{"id": chunk_id, "text": oversized_text}]
+    list(_make_batches(chunks))
+    captured = capsys.readouterr()
+    assert chunk_id in captured.err
+
+
 def test_normal_chunks_not_affected_by_truncation():
     """Chunks within budget are not truncated."""
     original_text = "hello world this is normal text"

@@ -10,6 +10,7 @@ from pathlib import Path
 
 import chromadb
 import voyageai
+import voyageai.error
 
 from vecs.ast_chunker import chunk_code_file_ast
 from vecs.bm25_index import BM25Index
@@ -20,6 +21,7 @@ from vecs.config import (
     CODE_CHUNK_LINES,
     CODE_CHUNK_OVERLAP,
     CODE_MODEL,
+    CodeDir,
     DOCS_MODEL,
     MANIFESTS_DIR,
     MANIFEST_PATH,
@@ -82,8 +84,9 @@ def _make_batches(chunks: list[dict], batcher: AdaptiveBatcher | None = None) ->
         # Truncate oversized single chunks to fit the token budget
         if tokens > MAX_BATCH_TOKENS:
             max_chars = MAX_BATCH_TOKENS * 2
+            chunk_id = chunk.get("id", "<unknown>")
             _log(f"  WARNING: chunk truncated from {len(chunk['text'])} to {max_chars} chars "
-                 f"(exceeded {MAX_BATCH_TOKENS} token budget)")
+                 f"(exceeded {MAX_BATCH_TOKENS} token budget) [chunk_id={chunk_id}]")
             chunk = {**chunk, "text": chunk["text"][:max_chars]}
             tokens = max_chars // 2
         if batch and (batch_tokens + tokens > MAX_BATCH_TOKENS or len(batch) >= MAX_BATCH_SIZE):
@@ -176,6 +179,46 @@ class Manifest:
             del self.data[key]
         return len(stale)
 
+    def prune_out_of_scope(self, in_scope: set[Path], roots: list[Path]) -> list[str]:
+        """Remove code-file entries that are under any of `roots` but not in `in_scope`.
+
+        Used after exclude_dirs filtering: a file may still exist on disk but be
+        out of scope for indexing. Only entries beneath one of the supplied
+        `roots` are considered -- code files for unrelated projects/code_dirs
+        sharing this manifest must be left alone.
+
+        Returns the list of removed manifest keys (string paths) so callers can
+        delete the corresponding chunks from chromadb.
+
+        NOT SAFE under concurrent runs: state read in __init__ is mutated here
+        and persisted in save() under LOCK_EX, but the read is unlocked. A
+        concurrent run that writes a hash for a file this run has decided to
+        prune will lose that hash on rename. Cron serializes runs in practice;
+        prune sets are tiny; no operational impact observed.
+        """
+        resolved_roots = [r.resolve() for r in roots]
+        in_scope_str = {str(p) for p in in_scope}
+        stale: list[str] = []
+        for key in list(self.data):
+            if key.startswith("session:"):
+                continue
+            if key in in_scope_str:
+                continue
+            try:
+                key_resolved = Path(key).resolve()
+            except OSError:
+                continue
+            for root in resolved_roots:
+                try:
+                    key_resolved.relative_to(root)
+                except ValueError:
+                    continue
+                stale.append(key)
+                break
+        for key in stale:
+            del self.data[key]
+        return stale
+
     def save(self) -> None:
         import os
         import tempfile
@@ -216,7 +259,8 @@ class Manifest:
 
 
 def _log(msg: str) -> None:
-    print(msg, file=sys.stderr)
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+    print(f"{ts} {msg}", file=sys.stderr)
 
 
 def migrate_global_manifest(
@@ -359,24 +403,33 @@ def _embed_and_store(
                 result = vo.embed(texts, model=model, input_type="document")
                 break
             except Exception as e:
-                error_type = type(e).__name__
                 error_msg = str(e).lower()
                 is_transient = (
-                    "RateLimitError" in error_type
-                    or "ConnectionError" in error_type
-                    or "TimeoutError" in error_type
+                    isinstance(e, (
+                        voyageai.error.Timeout,
+                        voyageai.error.APIConnectionError,
+                        voyageai.error.RateLimitError,
+                        voyageai.error.ServiceUnavailableError,
+                        voyageai.error.ServerError,
+                        voyageai.error.TryAgain,
+                        voyageai.error.APIError,
+                    ))
+                    or isinstance(e, (TimeoutError, ConnectionError))
                     or ("rate" in error_msg and "limit" in error_msg)
                 )
                 if is_transient:
                     wait = 20 * (attempt + 1)
-                    _log(f"  {type(e).__name__}, waiting {wait}s...")
+                    err_excerpt = str(e).splitlines()[0][:160] if str(e) else ""
+                    _log(f"  {type(e).__name__} (attempt {attempt + 1}/5), waiting {wait}s: {err_excerpt}")
                     time.sleep(wait)
                 else:
                     # H2: try to parse token count from error for calibration
                     _calibrate_from_error(batcher, batch_chars, str(e))
                     raise
         else:
-            _log(f"  Failed after 5 retries, skipping batch ({len(succeeded_ids)} stored so far)")
+            sample_id = batch[0].get("id", "<unknown>") if batch else "<empty>"
+            _log(f"  Failed after 5 retries, skipping batch of {len(batch)} chunks "
+                 f"(sample chunk_id={sample_id}, {len(succeeded_ids)} stored so far)")
             continue
 
         # H2: calibrate from successful response
@@ -398,23 +451,94 @@ def _embed_and_store(
     return succeeded_ids
 
 
+def _paginated_delete(
+    collection: chromadb.Collection,
+    ids: list[str],
+    batch_size: int = 5000,
+) -> None:
+    """Delete chunks in batches to stay under SQLITE_MAX_VARIABLE_NUMBER."""
+    for i in range(0, len(ids), batch_size):
+        collection.delete(ids=ids[i:i + batch_size])
+
+
+def _paginated_get(
+    collection: chromadb.Collection,
+    batch_size: int = 5000,
+    **kwargs,
+) -> Iterator[dict]:
+    """Yield pages of `collection.get()` results, paginating by limit/offset.
+
+    chromadb's unbounded `collection.get()` builds an internal SQL query whose
+    IN-clause can blow past SQLITE_MAX_VARIABLE_NUMBER (32766 modern, 999 old).
+    Paginating with limit=5000 stays safely under both caps.
+
+    Stops as soon as a page returns zero ids.
+    """
+    offset = 0
+    while True:
+        page = collection.get(limit=batch_size, offset=offset, **kwargs)
+        ids = page.get("ids") or []
+        if not ids:
+            return
+        yield page
+        if len(ids) < batch_size:
+            return
+        offset += len(ids)
+
+
 def _rebuild_bm25(collection: chromadb.Collection, project_name: str, suffix: str) -> None:
     """Rebuild BM25 keyword index from a ChromaDB collection."""
     bm25_dir = VECS_DIR / "bm25"
     bm25_dir.mkdir(parents=True, exist_ok=True)
     try:
-        all_docs = collection.get(include=["documents", "metadatas"])
-        bm25_docs = [
-            {"id": id_, "text": text, "metadata": meta or {}}
+        bm25_docs: list[dict] = []
+        for page in _paginated_get(collection, include=["documents", "metadatas"]):
             for id_, text, meta in zip(
-                all_docs["ids"], all_docs["documents"], all_docs["metadatas"]
-            )
-        ]
+                page["ids"], page["documents"], page["metadatas"]
+            ):
+                bm25_docs.append({"id": id_, "text": text, "metadata": meta or {}})
         bm25 = BM25Index(bm25_dir / f"{project_name}_{suffix}.pkl")
         bm25.build(bm25_docs)
         bm25.save()
     except Exception as e:
         _log(f"  Warning: BM25 rebuild failed for {project_name}_{suffix}: {e}")
+
+
+def _sweep_excluded_chunks(
+    collection: chromadb.Collection,
+    code_dir: CodeDir,
+) -> int:
+    """Delete chromadb chunks whose file_path is under any of code_dir.exclude_dirs.
+
+    Manifest-driven cleanup misses orphan chunks for files that were embedded
+    mid-batch in a prior run that died before manifest.save(). This sweep is
+    metadata-only -- it scans every chunk in the collection and drops any whose
+    `file_path` starts with `{code_dir.path.name}/{excluded_subdir}/`.
+
+    Returns the number of chunks deleted. Failures are logged and swallowed.
+    """
+    if not code_dir.exclude_dirs:
+        return 0
+
+    dir_prefix = code_dir.path.name
+    excluded_prefixes = tuple(
+        f"{dir_prefix}/{sub.rstrip('/')}/" for sub in code_dir.exclude_dirs
+    )
+
+    orphan_ids: list[str] = []
+    try:
+        for page in _paginated_get(collection, include=["metadatas"]):
+            for cid, meta in zip(page["ids"], page["metadatas"]):
+                fp = (meta or {}).get("file_path")
+                if isinstance(fp, str) and fp.startswith(excluded_prefixes):
+                    orphan_ids.append(cid)
+        if orphan_ids:
+            _paginated_delete(collection, orphan_ids)
+    except Exception as e:
+        _log(f"  Warning: orphan-chunk sweep failed for {dir_prefix}: {e}")
+        return 0
+
+    return len(orphan_ids)
 
 
 def _track_embed_success(
@@ -506,6 +630,10 @@ def index_code(project: ProjectConfig, vo: voyageai.Client, db: chromadb.ClientA
     file_cleanup: dict[Path, tuple[str, str, set[str]]] = {}
     file_hashes: dict[Path, str] = {}
 
+    # Track in-scope files per code_dir so we can compute proper chromadb
+    # rel_paths when pruning out-of-scope manifest entries.
+    in_scope_by_root: list[tuple[Path, set[Path]]] = []
+
     for code_dir in project.code_dirs:
         if not code_dir.path.exists():
             _log(f"[{project.name}] {code_dir.path}: directory not found, skipping.")
@@ -525,6 +653,29 @@ def index_code(project: ProjectConfig, vo: voyageai.Client, db: chromadb.ClientA
                 f for f in code_dir.path.rglob("*")
                 if f.suffix in code_dir.extensions and f.is_file()
             ]
+
+        # exclude_dirs: drop files whose path is under any excluded subdir.
+        # Excludes apply on top of includes -- exclude wins on overlap.
+        if code_dir.exclude_dirs:
+            excluded_roots = [
+                (code_dir.path / sub).resolve() for sub in code_dir.exclude_dirs
+            ]
+            kept: list[Path] = []
+            for f in files:
+                f_resolved = f.resolve()
+                drop = False
+                for ex in excluded_roots:
+                    try:
+                        f_resolved.relative_to(ex)
+                        drop = True
+                        break
+                    except ValueError:
+                        continue
+                if not drop:
+                    kept.append(f)
+            files = kept
+
+        in_scope_by_root.append((code_dir.path, set(files)))
 
         # H6: needs_indexing returns (bool, hash) -- hash computed once
         to_index: list[Path] = []
@@ -556,6 +707,47 @@ def index_code(project: ProjectConfig, vo: voyageai.Client, db: chromadb.ClientA
             file_cleanup[f] = ("file_path", rel_path, chunk_ids_for_file)
             all_chunks.extend(chunks)
             files_to_process.append(f)
+
+    # Prune manifest entries now out of scope (e.g. newly excluded subdirs).
+    # We iterate per code_dir so we can compute the same rel_path that was
+    # used as chromadb metadata, enabling targeted chunk deletion.
+    total_pruned = 0
+    for root, in_scope in in_scope_by_root:
+        stale_keys = manifest.prune_out_of_scope(in_scope, [root])
+        if not stale_keys:
+            continue
+        total_pruned += len(stale_keys)
+        dir_prefix = root.name
+        root_resolved = root.resolve()
+        for key in stale_keys:
+            try:
+                rel = Path(key).resolve().relative_to(root_resolved)
+                rel_path = f"{dir_prefix}/{rel}"
+                _delete_stale_chunks_after_embed(
+                    collection, "file_path", rel_path, set()
+                )
+            except Exception as e:
+                _log(f"  Warning: chromadb cleanup for {key} failed: {e}")
+    if total_pruned:
+        _log(
+            f"[{project.name}] pruned {total_pruned} manifest entries "
+            f"now out of scope (excluded subdirs)."
+        )
+        manifest.save()
+
+    # Sweep chromadb for orphan chunks under exclude_dirs that the manifest
+    # never knew about (e.g. files embedded mid-batch in a prior failed run).
+    # Manifest-driven prune above only touches tracked entries -- this is the
+    # belt-and-suspenders pass that catches everything else.
+    for code_dir in project.code_dirs:
+        if not code_dir.exclude_dirs or not code_dir.path.exists():
+            continue
+        swept = _sweep_excluded_chunks(collection, code_dir)
+        if swept:
+            _log(
+                f"[{project.name}] swept {swept} orphan chromadb chunks "
+                f"under excluded subdirs of {code_dir.path}."
+            )
 
     if not all_chunks:
         return 0
@@ -926,15 +1118,18 @@ def run_index(project_name: str | None = None) -> None:
         else config.projects
     )
 
-    _log("Starting index...")
+    run_start = time.monotonic()
+    _log(f"Starting index... ({len(projects)} project(s): {', '.join(projects)})")
     total_code = 0
     total_sessions = 0
     total_docs = 0
     for name, project in projects.items():
-        _log(f"\nProject: {name}")
+        proj_start = time.monotonic()
+        _log(f"Project: {name}")
         total_code += index_code(project, vo, db)
         total_sessions += index_sessions(project, vo, db)
         total_docs += index_docs(project, vo, db)
+        _log(f"[{name}] project finished in {time.monotonic() - proj_start:.1f}s")
 
     # Prune manifest entries for deleted files
     for proj_name in projects:
@@ -944,4 +1139,6 @@ def run_index(project_name: str | None = None) -> None:
             manifest.save()
             _log(f"Pruned {pruned} stale manifest entries for {proj_name}.")
 
-    _log(f"\nDone. Indexed {total_code} code chunks, {total_sessions} session chunks, {total_docs} doc chunks.")
+    duration = time.monotonic() - run_start
+    _log(f"Done. Indexed {total_code} code chunks, {total_sessions} session chunks, "
+         f"{total_docs} doc chunks in {duration:.1f}s.")
