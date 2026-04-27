@@ -17,7 +17,7 @@ uv tool install --from . vecs
 echo 'export VOYAGE_API_KEY="your-key-here"' >> ~/.zshrc && source ~/.zshrc
 ```
 
-3. Register the MCP server in `~/.claude/settings.json`:
+3. Register the MCP server with your agent. The JSON shape is the same for most clients — only the config file location differs:
 
 ```json
 {
@@ -31,11 +31,18 @@ echo 'export VOYAGE_API_KEY="your-key-here"' >> ~/.zshrc && source ~/.zshrc
 }
 ```
 
-Restart Claude Code. The `vecs` MCP tools (`semantic_search`, `reindex`, `index_status`, `add_document`) are now available.
+| Agent           | Config file                                                          |
+|-----------------|----------------------------------------------------------------------|
+| Claude Code     | `~/.claude/settings.json`                                            |
+| Codex CLI       | `~/.codex/config.toml` — convert the JSON to the equivalent TOML block |
+| Cursor          | Settings → MCP → Add server                                          |
+| Other           | See your agent's MCP docs — `command` / `args` / `env` map directly  |
 
-## Let Claude do the rest
+Restart your agent. The `vecs` tools (`semantic_search`, `reindex`, `index_status`, `add_document`) are now available.
 
-Everything else — registering projects, choosing extensions, excluding noisy directories, pruning, reclaiming disk space, troubleshooting — lives in the [**AI Guide**](#ai-guide) below. It's written so Claude Code (or any MCP-aware agent) can read it and drive vecs for you end-to-end. Try:
+## Let your agent do the rest
+
+Everything else — registering projects, choosing extensions, excluding noisy directories, pruning, reclaiming disk space, troubleshooting — is in the AI Guide section below. It's written so any MCP-aware agent (Claude Code, Codex, Cursor, …) can read it and drive vecs for you end-to-end. Try:
 
 > *"Set up vecs for my livly project at `~/Repositories/livly`. It's a Unity client + Go server monorepo. Exclude `Library/`, `.venv/`, `node_modules/`, and any generated `proto/` dirs."*
 
@@ -43,7 +50,7 @@ Everything else — registering projects, choosing extensions, excluding noisy d
 
 > *"Re-index just my server repo and tell me how many new chunks were added."*
 
-Claude reads the AI Guide, runs the right `vecs ...` commands and SQLite queries, and reports back. You don't need to memorize the CLI.
+The agent reads the AI Guide, runs the right `vecs ...` commands and SQLite queries, and reports back. You don't need to memorize the CLI.
 
 If you'd rather drive it yourself, the AI Guide is also a complete human reference — start at "Setup".
 
@@ -51,7 +58,7 @@ If you'd rather drive it yourself, the AI Guide is also a complete human referen
 
 # AI Guide
 
-> This section is written for AI agents that drive vecs on a user's behalf — Claude Code, Cursor, etc. Every recipe is copy-pasteable. Humans benefit too.
+> This section is written for any MCP-aware AI agent that drives vecs on a user's behalf (Claude Code, Codex, Cursor, …). Every recipe is copy-pasteable. Humans benefit too.
 
 ## Setup (end-to-end, first time)
 
