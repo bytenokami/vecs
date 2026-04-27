@@ -337,11 +337,13 @@ def get_bm25(path: Path) -> "BM25Index | None":
         except Exception:
             pass
         return None
-    except Exception:
+    except Exception as exc:
         try:
             idx.close()
         except Exception:
             pass
+        import sys
+        print(f"  Warning: unexpected error loading BM25 index {path}: {exc}", file=sys.stderr)
         return None
 
     _bm25_cache[key] = (mtime, idx)
