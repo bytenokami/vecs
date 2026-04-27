@@ -196,7 +196,7 @@ def search(
                 suffix = "sessions"
             else:
                 suffix = "docs"
-            bm25_path = bm25_dir / f"{proj_name}_{suffix}.pkl"
+            bm25_path = bm25_dir / f"{proj_name}_{suffix}.db"
             bm25 = get_bm25(bm25_path)
             if bm25 is not None:
                 hits = bm25.search(query, n=fetch_n, path_filter=path_filter)
