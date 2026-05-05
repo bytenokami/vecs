@@ -392,3 +392,78 @@ def test_load_config_missing_extensions_raises(tmp_path):
     }))
     with pytest.raises(ValueError, match="extensions"):
         load_config(config_file)
+
+
+# --- Codex env-var escape hatch ---
+
+def test_codex_disabled_env_var_forces_off(tmp_path, monkeypatch):
+    """VECS_CODEX_DISABLED=1 in the environment forces codex_disabled = True."""
+    from vecs.config import _clear_config_cache, load_config
+
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text("projects: {}\n")
+    _clear_config_cache()
+    monkeypatch.setenv("VECS_CODEX_DISABLED", "1")
+    config = load_config(cfg_file)
+    assert config.codex_disabled is True
+
+
+def test_codex_disabled_env_var_truey_values_accepted(tmp_path, monkeypatch):
+    from vecs.config import _clear_config_cache, load_config
+
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text("projects: {}\n")
+
+    for value in ("1", "true", "TRUE", "yes"):
+        _clear_config_cache()
+        monkeypatch.setenv("VECS_CODEX_DISABLED", value)
+        config = load_config(cfg_file)
+        assert config.codex_disabled is True, f"value={value!r} should disable"
+
+
+def test_codex_disabled_env_var_falsey_values_ignored(tmp_path, monkeypatch):
+    from vecs.config import _clear_config_cache, load_config
+
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text("projects: {}\n")
+
+    for value in ("", "0", "false", "no"):
+        _clear_config_cache()
+        monkeypatch.setenv("VECS_CODEX_DISABLED", value)
+        config = load_config(cfg_file)
+        assert config.codex_disabled is False, f"value={value!r} should not disable"
+
+
+def test_codex_cwds_per_project_save_and_reload(tmp_path):
+    from vecs.config import VecsConfig, ProjectConfig, _clear_config_cache, load_config
+
+    cfg_file = tmp_path / "config.yaml"
+    config = VecsConfig(path=cfg_file)
+    proj = ProjectConfig(name="p1")
+    proj.codex_cwds = [Path("/Users/x/repos/p1"), Path("/tmp/scratch")]
+    config.projects["p1"] = proj
+    config.save()
+
+    _clear_config_cache()
+    reloaded = load_config(cfg_file)
+    assert reloaded.projects["p1"].codex_cwds == [
+        Path("/Users/x/repos/p1"),
+        Path("/tmp/scratch"),
+    ]
+
+
+def test_codex_top_level_settings_save_and_reload(tmp_path):
+    from vecs.config import VecsConfig, _clear_config_cache, load_config
+
+    cfg_file = tmp_path / "config.yaml"
+    config = VecsConfig(path=cfg_file)
+    config.codex_sessions_root = tmp_path / "custom" / "codex"
+    config.codex_disabled = True
+    config.codex_ignore_cwds = [Path("/tmp/scratch"), Path("/etc")]
+    config.save()
+
+    _clear_config_cache()
+    reloaded = load_config(cfg_file)
+    assert reloaded.codex_sessions_root == tmp_path / "custom" / "codex"
+    assert reloaded.codex_disabled is True
+    assert reloaded.codex_ignore_cwds == [Path("/tmp/scratch"), Path("/etc")]

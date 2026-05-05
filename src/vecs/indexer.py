@@ -16,6 +16,8 @@ from vecs.ast_chunker import chunk_code_file_ast
 from vecs.bm25_index import BM25Index
 from vecs.chunkers import preprocess_session, chunk_session
 from vecs.clients import get_voyage_client, get_chromadb_client
+from vecs.codex_chunker import preprocess_codex_session
+from vecs.codex_routing import CodexRoutingState, discover_codex_sessions
 from vecs.config import (
     CHROMADB_DIR,
     CODE_CHUNK_LINES,
@@ -34,6 +36,11 @@ from vecs.config import (
     load_config,
 )
 from vecs.doc_chunker import chunk_doc, extract_pdf_text
+
+
+# Module-level set: payload types we logged-once-per-run as unrecognized.
+# Reset at the top of run_index so each indexer invocation gets fresh telemetry.
+_codex_unknown_payload_seen: set[str] = set()
 
 
 MAX_BATCH_TOKENS = 80_000  # Voyage limit is 120K; char-based estimation is unreliable, so leave wide margin
@@ -845,79 +852,100 @@ def _get_session_new_content(
     return content, file_size, False
 
 
-def index_sessions(project: ProjectConfig, vo: voyageai.Client, db: chromadb.ClientAPI) -> int:
-    """Index Claude Code session transcripts for a project.
+def _index_session_files(
+    project: ProjectConfig,
+    files: list[Path],
+    parser_fn,
+    agent_tag: str,
+    vo: voyageai.Client,
+    db: chromadb.ClientAPI,
+    *,
+    log_label: str,
+    manifest: Manifest | None = None,
+) -> int:
+    """Shared session indexing pipeline.
 
-    Uses incremental byte-offset tracking: only new bytes from append-only
-    JSONL files are read and embedded. Full re-index on identity mismatch
-    (file rewritten/compacted).
+    Both the Claude Code (`index_sessions`) and Codex (`index_codex_sessions`)
+    code paths call this with their respective parser_fn and agent_tag. The
+    embedding model, BM25 sidecar suffix, and chunking parameters are constant
+    across agents; only parsing differs.
+
+    Args:
+        project: Target project. Output goes to project.sessions_collection.
+        files: Session files to consider (already routed and filtered).
+        parser_fn: Callable[[str], list[dict]] mapping raw JSONL to messages
+            in the shared `{role, text, timestamp}` shape.
+        agent_tag: "claude_code" | "codex". Stamped onto every chunk's
+            metadata so search results can distinguish sources.
+        vo: Voyage client.
+        db: Chromadb client.
+        log_label: Human-readable label for log lines.
+        manifest: Optional pre-built Manifest. Pass when caller already opened
+            one to avoid double-loading.
+
+    Returns:
+        Number of successfully embedded+stored chunks.
     """
-    if not project.sessions_dirs:
+    if not files:
         return 0
 
-    manifest = Manifest(project.name)
+    if manifest is None:
+        manifest = Manifest(project.name)
     collection = db.get_or_create_collection(project.sessions_collection)
 
     all_chunks: list[dict] = []
     chunk_to_file: dict[str, Path] = {}
     file_expected_count: dict[Path, int] = {}
     file_cleanup: dict[Path, tuple[str, str, set[str]]] = {}
-    # Track per-file: (new_byte_offset, total_chunk_count, is_full_reindex)
+    # Per-file: (new_byte_offset, total_chunk_count, is_full_reindex)
     file_session_meta: dict[Path, tuple[int, int, bool]] = {}
 
-    for sessions_dir in project.sessions_dirs:
-        if not sessions_dir.exists():
-            _log(f"[{project.name}] Sessions dir not found: {sessions_dir}")
+    indexed_count = 0
+    for f in files:
+        content, new_offset, is_full = _get_session_new_content(f, manifest)
+        if not content:
             continue
 
-        files = sorted(sessions_dir.glob("*.jsonl"))
-        indexed_count = 0
+        indexed_count += 1
+        session_id = f.stem
 
-        for f in files:
-            content, new_offset, is_full = _get_session_new_content(f, manifest)
-            if not content:
-                continue
+        messages = parser_fn(content)
+        if not messages:
+            # Mark indexed anyway so byte_offset advances; otherwise we re-read
+            # the same uninteresting bytes every run.
+            manifest.mark_session_indexed(f, byte_offset=new_offset)
+            continue
 
-            indexed_count += 1
-            session_id = f.stem
+        chunk_index_offset = 0
+        if not is_full:
+            info = manifest.get_session_info(f)
+            if info and "chunk_count" in info:
+                chunk_index_offset = info["chunk_count"]
 
-            messages = preprocess_session(content)
-            if not messages:
-                # Mark as indexed even if no extractable messages, to record the offset
-                manifest.mark_session_indexed(f, byte_offset=new_offset)
-                continue
+        chunks = chunk_session(
+            messages, session_id, SESSION_CHUNK_MESSAGES, overlap=SESSION_CHUNK_OVERLAP
+        )
+        chunk_ids_for_file: set[str] = set()
+        for c in chunks:
+            c["metadata"]["chunk_index"] += chunk_index_offset
+            c["metadata"]["agent"] = agent_tag
+            c["id"] = _make_chunk_id(f"session:{session_id}", c["metadata"]["chunk_index"])
+            chunk_to_file[c["id"]] = f
+            chunk_ids_for_file.add(c["id"])
 
-            # For incremental appends, offset chunk_index to avoid ID collision
-            chunk_index_offset = 0
-            if not is_full:
-                info = manifest.get_session_info(f)
-                if info and "chunk_count" in info:
-                    chunk_index_offset = info["chunk_count"]
+        file_expected_count[f] = len(chunks)
+        total_chunk_count = chunk_index_offset + len(chunks)
+        file_session_meta[f] = (new_offset, total_chunk_count, is_full)
 
-            chunks = chunk_session(
-                messages, session_id, SESSION_CHUNK_MESSAGES, overlap=SESSION_CHUNK_OVERLAP
-            )
-            chunk_ids_for_file: set[str] = set()
-            for c in chunks:
-                c["metadata"]["chunk_index"] += chunk_index_offset
-                c["id"] = _make_chunk_id(f"session:{session_id}", c["metadata"]["chunk_index"])
-                chunk_to_file[c["id"]] = f
-                chunk_ids_for_file.add(c["id"])
+        if is_full:
+            file_cleanup[f] = ("session_id", session_id, chunk_ids_for_file)
 
-            file_expected_count[f] = len(chunks)
-            total_chunk_count = chunk_index_offset + len(chunks)
-            file_session_meta[f] = (new_offset, total_chunk_count, is_full)
+        all_chunks.extend(chunks)
 
-            # Only clean up stale chunks on full re-index
-            if is_full:
-                file_cleanup[f] = ("session_id", session_id, chunk_ids_for_file)
-
-            all_chunks.extend(chunks)
-
-        if indexed_count == 0:
-            _log(f"[{project.name}] Sessions ({sessions_dir}): nothing new to index.")
-        else:
-            _log(f"[{project.name}] Sessions ({sessions_dir}): {indexed_count} files to index ({len(files)} total)")
+    if indexed_count == 0:
+        _log(f"[{project.name}] {log_label}: nothing new to index.")
+    else:
+        _log(f"[{project.name}] {log_label}: {indexed_count} files to index ({len(files)} total)")
 
     if not all_chunks:
         manifest.save()
@@ -939,6 +967,67 @@ def index_sessions(project: ProjectConfig, vo: voyageai.Client, db: chromadb.Cli
         _sync_bm25(collection, project.name, "sessions")
 
     return len(succeeded_ids)
+
+
+def index_sessions(project: ProjectConfig, vo: voyageai.Client, db: chromadb.ClientAPI) -> int:
+    """Index Claude Code session transcripts for a project.
+
+    Thin wrapper around `_index_session_files` for backward-compat.
+    """
+    if not project.sessions_dirs:
+        return 0
+
+    manifest = Manifest(project.name)
+    total = 0
+    for sessions_dir in project.sessions_dirs:
+        if not sessions_dir.exists():
+            _log(f"[{project.name}] Sessions dir not found: {sessions_dir}")
+            continue
+        files = sorted(sessions_dir.glob("*.jsonl"))
+        total += _index_session_files(
+            project,
+            files,
+            preprocess_session,
+            agent_tag="claude_code",
+            vo=vo,
+            db=db,
+            log_label=f"Sessions ({sessions_dir})",
+            manifest=manifest,
+        )
+    return total
+
+
+def _make_codex_parser(unknown_seen: set[str]):
+    """Bind the per-run `unknown_payload_seen` set onto preprocess_codex_session.
+
+    The shared `_index_session_files` expects parser_fn(content) -> messages.
+    Codex parser also accepts an optional set arg; we close over the run-level
+    set so unknown payload types are deduplicated across all files.
+    """
+    def parse(content: str) -> list[dict]:
+        return preprocess_codex_session(content, unknown_payload_seen=unknown_seen)
+    return parse
+
+
+def index_codex_sessions(
+    project: ProjectConfig,
+    files: list[Path],
+    vo: voyageai.Client,
+    db: chromadb.ClientAPI,
+) -> int:
+    """Index Codex CLI session transcripts already routed to this project."""
+    if not files:
+        return 0
+    parser = _make_codex_parser(_codex_unknown_payload_seen)
+    return _index_session_files(
+        project,
+        files,
+        parser,
+        agent_tag="codex",
+        vo=vo,
+        db=db,
+        log_label="Codex sessions",
+    )
 
 
 def index_docs(project: ProjectConfig, vo: voyageai.Client, db: chromadb.ClientAPI) -> int:
@@ -1011,6 +1100,82 @@ def index_docs(project: ProjectConfig, vo: voyageai.Client, db: chromadb.ClientA
         _sync_bm25(collection, project.name, "docs")
 
     return total_stored
+
+
+def purge_session_files_from_project(
+    project_name: str,
+    file_paths: list[Path],
+    session_ids: list[str],
+    db: chromadb.ClientAPI | None = None,
+) -> dict:
+    """Drop manifest entries + sweep chunks for a set of session files in a project.
+
+    Used by `codex_assign` / `codex_ignore` to invalidate previous routing so a
+    subsequent `vecs index` re-emits sessions into the correct project (or skips
+    them, in the ignore case).
+
+    Args:
+        project_name: Project whose `sessions_collection` and manifest are touched.
+        file_paths: Absolute paths whose `session:{path}` manifest entries are
+            dropped. Empty list is a no-op.
+        session_ids: Session ids whose chunks are deleted from the project's
+            sessions collection (chroma) AND BM25 sidecar. Empty list skips the
+            chunk sweep but still drops manifest entries.
+        db: Chromadb client. If None, opened lazily.
+
+    Returns:
+        {
+            "manifest_entries_dropped": int,
+            "chunks_deleted": int,
+            "session_ids_swept": int,
+        }
+    """
+    result = {"manifest_entries_dropped": 0, "chunks_deleted": 0, "session_ids_swept": 0}
+
+    # 1. Drop manifest entries (no chromadb needed if list empty).
+    if file_paths:
+        manifest = Manifest(project_name)
+        for fp in file_paths:
+            key = f"session:{fp}"
+            if key in manifest.data:
+                del manifest.data[key]
+                result["manifest_entries_dropped"] += 1
+        if result["manifest_entries_dropped"]:
+            manifest.save()
+
+    if not session_ids:
+        return result
+
+    # 2. Sweep chunks from chroma collection by session_id metadata.
+    if db is None:
+        db = get_chromadb_client()
+    config = load_config()
+    if project_name not in config.projects:
+        return result
+    project = config.projects[project_name]
+    try:
+        collection = db.get_collection(project.sessions_collection)
+    except Exception:
+        return result
+
+    deleted = 0
+    for sid in session_ids:
+        try:
+            existing = collection.get(where={"session_id": sid})
+            ids = existing.get("ids") or []
+            if ids:
+                _paginated_delete(collection, ids)
+                deleted += len(ids)
+                result["session_ids_swept"] += 1
+        except Exception as e:
+            _log(f"  Warning: chunk sweep failed for session_id={sid}: {e}")
+    result["chunks_deleted"] = deleted
+
+    if deleted:
+        # Keep BM25 sidecar in sync with the now-shorter chroma collection.
+        _sync_bm25(collection, project_name, "sessions")
+
+    return result
 
 
 def index_single_doc(project_name: str, file_path: Path) -> int:
@@ -1155,6 +1320,21 @@ def run_index(project_name: str | None = None) -> None:
         else config.projects
     )
 
+    # Reset run-level Codex telemetry.
+    _codex_unknown_payload_seen.clear()
+
+    # Codex discovery is global (one walk of codex_sessions_root) so we route
+    # ALL codex files here, then hand each project its own slice. Cheaper than
+    # rerouting per project, and orphan tracking lives in one place.
+    codex_routing: dict[str, list[Path]] = {}
+    codex_state: CodexRoutingState | None = None
+    if not config.codex_disabled:
+        try:
+            codex_routing, codex_state = discover_codex_sessions(config)
+        except Exception as e:
+            _log(f"  Warning: codex discovery failed: {e}")
+            codex_routing, codex_state = {}, None
+
     run_start = time.monotonic()
     _log(f"Starting index... ({len(projects)} project(s): {', '.join(projects)})")
     total_code = 0
@@ -1165,8 +1345,24 @@ def run_index(project_name: str | None = None) -> None:
         _log(f"Project: {name}")
         total_code += index_code(project, vo, db)
         total_sessions += index_sessions(project, vo, db)
+        codex_files = codex_routing.get(name, [])
+        if codex_files:
+            total_sessions += index_codex_sessions(project, codex_files, vo, db)
         total_docs += index_docs(project, vo, db)
         _log(f"[{name}] project finished in {time.monotonic() - proj_start:.1f}s")
+
+    if _codex_unknown_payload_seen:
+        _log(
+            "  Codex parser saw unknown payload types this run: "
+            + ", ".join(sorted(_codex_unknown_payload_seen))
+        )
+
+    if codex_state is not None and codex_state.orphans:
+        _log(
+            f"  Codex orphans: {codex_state.total_orphan_sessions()} sessions across "
+            f"{len(codex_state.orphans)} cwd(s). Triage with `vecs codex orphans` "
+            f"or the codex_orphans MCP tool."
+        )
 
     # Prune manifest entries for deleted files
     for proj_name in projects:

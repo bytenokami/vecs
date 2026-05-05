@@ -1396,3 +1396,203 @@ def test_index_code_sweeps_orphan_chunks_for_excluded_dirs(tmp_path, monkeypatch
         f"Expected exactly one sweep delete with orphan ids, "
         f"got delete calls: {collection.delete.call_args_list}"
     )
+
+
+# --- _index_session_files: shared core for Claude Code + Codex ---
+
+def test_index_session_files_stamps_agent_metadata(tmp_path, monkeypatch):
+    """Both pipelines must tag chunks with metadata.agent before embed."""
+    from vecs.indexer import _index_session_files
+
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+    monkeypatch.setattr("vecs.indexer._sync_bm25", lambda *a, **kw: None)
+
+    raw = (
+        '{"type": "user", "message": {"role": "user", "content": "hello"}}\n'
+        '{"type": "assistant", "message": {"role": "assistant", "content": "hi"}}\n'
+    )
+    sess_file = tmp_path / "rollout-x.jsonl"
+    sess_file.write_text(raw)
+
+    project = ProjectConfig(name="p1")
+    project.sessions_dirs = []  # not relevant; we call _index_session_files directly
+
+    captured: dict = {}
+
+    def fake_embed(chunks, collection, model, vo, batcher=None):
+        captured["chunks"] = chunks
+        return [c["id"] for c in chunks]
+
+    monkeypatch.setattr("vecs.indexer._embed_and_store", fake_embed)
+
+    db = MagicMock()
+    db.get_or_create_collection.return_value = MagicMock()
+
+    from vecs.chunkers import preprocess_session
+    stored = _index_session_files(
+        project,
+        files=[sess_file],
+        parser_fn=preprocess_session,
+        agent_tag="claude_code",
+        vo=MagicMock(),
+        db=db,
+        log_label="test",
+    )
+
+    assert stored >= 1
+    for c in captured["chunks"]:
+        assert c["metadata"]["agent"] == "claude_code"
+
+
+def test_index_session_files_codex_path_tags_codex(tmp_path, monkeypatch):
+    """Same shared core, different parser+tag: chunks tagged 'codex'."""
+    import json as _json
+    from vecs.indexer import _index_session_files
+    from vecs.codex_chunker import preprocess_codex_session
+
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+    monkeypatch.setattr("vecs.indexer._sync_bm25", lambda *a, **kw: None)
+
+    raw = "\n".join([
+        _json.dumps({"type": "session_meta", "payload": {"cwd": "/x", "id": "s"}}),
+        _json.dumps({"type": "response_item", "payload": {
+            "type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": "ping"}],
+        }}),
+        _json.dumps({"type": "response_item", "payload": {
+            "type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": "pong"}],
+        }}),
+    ])
+    sess_file = tmp_path / "rollout-c.jsonl"
+    sess_file.write_text(raw)
+
+    project = ProjectConfig(name="p2")
+
+    captured: dict = {}
+
+    def fake_embed(chunks, collection, model, vo, batcher=None):
+        captured["chunks"] = chunks
+        return [c["id"] for c in chunks]
+
+    monkeypatch.setattr("vecs.indexer._embed_and_store", fake_embed)
+
+    db = MagicMock()
+    db.get_or_create_collection.return_value = MagicMock()
+
+    stored = _index_session_files(
+        project,
+        files=[sess_file],
+        parser_fn=preprocess_codex_session,
+        agent_tag="codex",
+        vo=MagicMock(),
+        db=db,
+        log_label="codex test",
+    )
+
+    assert stored >= 1
+    assert all(c["metadata"]["agent"] == "codex" for c in captured["chunks"])
+
+
+def test_index_session_files_empty_input_returns_zero(tmp_path, monkeypatch):
+    from vecs.indexer import _index_session_files
+
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+    project = ProjectConfig(name="p3")
+    db = MagicMock()
+    stored = _index_session_files(
+        project,
+        files=[],
+        parser_fn=lambda raw: [],
+        agent_tag="claude_code",
+        vo=MagicMock(),
+        db=db,
+        log_label="empty",
+    )
+    assert stored == 0
+
+
+# --- purge_session_files_from_project: codex_assign / codex_ignore cleanup ---
+
+def test_purge_session_drops_manifest_entries(tmp_path, monkeypatch):
+    """Manifest's session:{path} entries are removed, but only the listed ones."""
+    from vecs.indexer import purge_session_files_from_project
+
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+
+    sess_a = tmp_path / "rollout-a.jsonl"
+    sess_a.write_text("{}")
+    sess_b = tmp_path / "rollout-b.jsonl"
+    sess_b.write_text("{}")
+
+    manifest = Manifest("p1", manifests_dir=tmp_path / "manifests")
+    manifest.mark_session_indexed(sess_a, byte_offset=2, chunk_count=3)
+    manifest.mark_session_indexed(sess_b, byte_offset=2, chunk_count=3)
+    manifest.save()
+
+    # Patch get_chromadb_client + load_config so the chromadb branch is a no-op.
+    monkeypatch.setattr("vecs.indexer.get_chromadb_client", lambda: MagicMock())
+    monkeypatch.setattr(
+        "vecs.indexer.load_config",
+        lambda: VecsConfig(path=tmp_path / "config.yaml", projects={}),
+    )
+
+    result = purge_session_files_from_project(
+        project_name="p1",
+        file_paths=[sess_a],
+        session_ids=[],
+    )
+    assert result["manifest_entries_dropped"] == 1
+    # Reload to confirm persistence.
+    reloaded = Manifest("p1", manifests_dir=tmp_path / "manifests")
+    assert reloaded.get_session_info(sess_a) is None
+    assert reloaded.get_session_info(sess_b) is not None
+
+
+def test_purge_session_sweeps_chunks_by_session_id(tmp_path, monkeypatch):
+    """Chunks whose metadata.session_id matches are deleted via paginated_delete."""
+    from vecs.indexer import purge_session_files_from_project
+
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+    monkeypatch.setattr("vecs.indexer._sync_bm25", lambda *a, **kw: None)
+
+    project = ProjectConfig(name="p1")
+    cfg = VecsConfig(path=tmp_path / "config.yaml", projects={"p1": project})
+    monkeypatch.setattr("vecs.indexer.load_config", lambda: cfg)
+
+    collection = MagicMock()
+    collection.get.return_value = {"ids": ["session:abc:0", "session:abc:1"]}
+    db = MagicMock()
+    db.get_collection.return_value = collection
+    monkeypatch.setattr("vecs.indexer.get_chromadb_client", lambda: db)
+
+    result = purge_session_files_from_project(
+        project_name="p1",
+        file_paths=[],
+        session_ids=["abc"],
+    )
+    assert result["chunks_deleted"] == 2
+    assert result["session_ids_swept"] == 1
+    collection.delete.assert_called_once()
+
+
+def test_purge_session_handles_missing_collection_gracefully(tmp_path, monkeypatch):
+    """A missing chromadb collection is not fatal."""
+    from vecs.indexer import purge_session_files_from_project
+
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+
+    project = ProjectConfig(name="p1")
+    cfg = VecsConfig(path=tmp_path / "config.yaml", projects={"p1": project})
+    monkeypatch.setattr("vecs.indexer.load_config", lambda: cfg)
+
+    db = MagicMock()
+    db.get_collection.side_effect = Exception("collection missing")
+    monkeypatch.setattr("vecs.indexer.get_chromadb_client", lambda: db)
+
+    result = purge_session_files_from_project(
+        project_name="p1",
+        file_paths=[],
+        session_ids=["nonexistent"],
+    )
+    assert result["chunks_deleted"] == 0

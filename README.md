@@ -1,23 +1,23 @@
 # VecS (Vector Search)
 
-Semantic search for your codebase, Claude Code session transcripts, and documentation. AST-aware chunking via tree-sitter, hybrid Voyage AI vectors + SQLite FTS5 BM25, exposed to Claude Code as an MCP server.
+Hybrid search for codebase, AI agent session transcripts (Claude Code + Codex CLI), and docs. Voyage AI **embeddings** power **semantic** **vector** recall (catch meaning, not keywords); SQLite FTS5 **BM25** sidecar pins exact symbols and rare terms; results fused via Reciprocal Rank Fusion. AST-aware chunking via tree-sitter splits code at real class/method boundaries, not random line windows. Codex sessions auto-route to projects by `cwd`, so one query searches every transcript from every agent, per project. Result: agent finds the right function by intent ("auth retry logic") AND by exact name (`refreshSessionToken`), in one query, across every repo + transcript + doc you point at it. Wired to Claude Code, Codex, Cursor (and any MCP agent) as drop-in tool.
 
 ---
 
 ## Install (MCP)
 
-Most users run vecs as an MCP server inside Claude Code. Three steps:
+Most users run vecs as MCP server inside Claude Code. Three steps:
 
 ```bash
-# 1. Clone and install the CLI (needs Python 3.12+ and uv: https://docs.astral.sh/uv/)
+# 1. Clone + install CLI (need Python 3.12+ and uv: https://docs.astral.sh/uv/)
 git clone <repo-url> ~/Repositories/vecs && cd ~/Repositories/vecs
 uv tool install --from . vecs
 
-# 2. Set your Voyage API key — get one at https://www.voyageai.com
+# 2. Set Voyage API key — grab one at https://www.voyageai.com
 echo 'export VOYAGE_API_KEY="your-key-here"' >> ~/.zshrc && source ~/.zshrc
 ```
 
-3. Register the MCP server with your agent. The JSON shape is the same for most clients — only the config file location differs:
+3. Register MCP server with agent. JSON shape same for most clients — only config path differs:
 
 ```json
 {
@@ -34,40 +34,40 @@ echo 'export VOYAGE_API_KEY="your-key-here"' >> ~/.zshrc && source ~/.zshrc
 | Agent           | Config file                                                          |
 |-----------------|----------------------------------------------------------------------|
 | Claude Code     | `~/.claude/settings.json`                                            |
-| Codex CLI       | `~/.codex/config.toml` — convert the JSON to the equivalent TOML block |
+| Codex CLI       | `~/.codex/config.toml` — convert JSON to equivalent TOML block       |
 | Cursor          | Settings → MCP → Add server                                          |
-| Other           | See your agent's MCP docs — `command` / `args` / `env` map directly  |
+| Other           | See agent's MCP docs — `command` / `args` / `env` map directly       |
 
-Restart your agent. The `vecs` tools (`semantic_search`, `reindex`, `index_status`, `add_document`) are now available.
+Restart agent. Tools `semantic_search`, `reindex`, `index_status`, `add_document` now live.
 
-## Let your agent do the rest
+## Let agent do rest
 
-Everything else — registering projects, choosing extensions, excluding noisy directories, pruning, reclaiming disk space, troubleshooting — is in the AI Guide section below. It's written so any MCP-aware agent (Claude Code, Codex, Cursor, …) can read it and drive vecs for you end-to-end. Try:
+Everything else — register projects, pick extensions, exclude noisy dirs, prune, reclaim disk, troubleshoot — lives in AI Guide below. Written so any MCP-aware agent (Claude Code, Codex, Cursor, …) reads it and drives vecs end-to-end. Try:
 
-> *"Set up vecs for my livly project at `~/Repositories/livly`. It's a Unity client + Go server monorepo. Exclude `Library/`, `.venv/`, `node_modules/`, and any generated `proto/` dirs."*
+> *"Set up vecs for my livly project at `~/Repositories/livly`. Unity client + Go server monorepo. Exclude `Library/`, `.venv/`, `node_modules/`, generated `proto/` dirs."*
 
-> *"My `~/.vecs/` is huge. Find the inflators and prune them."*
+> *"My `~/.vecs/` huge. Find inflators and prune."*
 
-> *"Re-index just my server repo and tell me how many new chunks were added."*
+> *"Re-index just server repo. Tell me how many new chunks added."*
 
-The agent reads the AI Guide, runs the right `vecs ...` commands and SQLite queries, and reports back. You don't need to memorize the CLI.
+Agent reads AI Guide, runs `vecs ...` commands + SQLite queries, reports back. No CLI memorization needed.
 
-If you'd rather drive it yourself, the AI Guide is also a complete human reference — start at "Setup".
+Prefer hands-on? AI Guide doubles as full human reference — start at "Setup".
 
 ---
 
 # AI Guide
 
-> This section is written for any MCP-aware AI agent that drives vecs on a user's behalf (Claude Code, Codex, Cursor, …). Every recipe is copy-pasteable. Humans benefit too.
+> Section written for any MCP-aware AI agent driving vecs on user's behalf (Claude Code, Codex, Cursor, …). Every recipe copy-pasteable. Humans benefit too.
 
 ## Setup (end-to-end, first time)
 
 ```bash
-# Already done above if you followed the MCP install:
+# Already done above if you followed MCP install:
 #   git clone <repo> && cd vecs && uv tool install --from . vecs
 #   export VOYAGE_API_KEY="..."
 
-# Register a project:
+# Register project:
 vecs project add myproject \
   --code-dir ~/Repositories/MyProject:.py,.md
 
@@ -78,11 +78,43 @@ vecs index -p myproject
 vecs search "your query" -p myproject
 ```
 
-That's the minimum. For multi-repo projects, sessions, docs, and exclusions, see the recipes below.
+Minimum done. Multi-repo projects, sessions, docs, exclusions — see recipes below.
 
 ## Recipes
 
-### Add a project that spans multiple repos
+### Codex CLI sessions (auto-routed by `cwd`)
+
+Codex stores sessions globally at `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, not per-project. vecs walks that tree, reads `session_meta.payload.cwd` from each file, and routes the session to the project whose `code_dirs` match (bidirectional resolved-path containment). No per-project config needed — sessions land in the right project automatically the first time you run `vecs index`.
+
+```yaml
+# Optional top-level overrides in ~/.vecs/config.yaml
+codex_sessions_root: ~/.codex/sessions    # default; rarely changed
+codex_disabled: false                     # or set VECS_CODEX_DISABLED=1
+codex_ignore_cwds:                        # never index sessions from these
+  - /tmp/scratch
+projects:
+  livly:
+    codex_cwds:                           # explicit routing overrides cwd matching
+      - /Users/you/Repositories/livly-old-path
+```
+
+Sessions whose `cwd` matches no project (e.g. `cwd=/Users/you/Repositories`, ancestor of multiple projects → ambiguous → orphan) get tracked, not silently dropped. Triage with the agent or CLI:
+
+```bash
+vecs codex orphans                                  # list unmapped cwds + suggested projects
+vecs codex assign /Users/you/Repositories/foo -p livly   # route + invalidate, re-index next run
+vecs codex ignore /tmp/scratch                      # never index sessions from this cwd
+```
+
+The same operations are exposed as MCP tools (`codex_orphans`, `codex_assign`, `codex_ignore`); your agent surfaces them when `index_status` or `semantic_search` notice orphans.
+
+Both Claude Code and Codex transcripts share one `sessions` collection per project. Each chunk carries `agent ∈ {claude_code, codex}` metadata so search results display the source. Search both with one query:
+
+```bash
+vecs search "auth retry discussion" -c sessions
+```
+
+### Add project spanning multiple repos
 
 `--code-dir` repeats. Each takes `path:ext1,ext2,...`.
 
@@ -94,7 +126,7 @@ vecs project add livly \
   --docs-dir ~/Repositories/livly/docs
 ```
 
-`--sessions-dir` is repeatable. `--docs-dir` is single (one docs root per project).
+`--sessions-dir` repeatable. `--docs-dir` single (one docs root per project).
 
 ### Index everything
 
@@ -104,7 +136,7 @@ vecs index -p myproject             # one project
 vecs index --detect-project ~/Repositories/MyProject   # auto-detect by path
 ```
 
-Subsequent runs are incremental — only files whose content hash changed are re-embedded.
+Subsequent runs incremental — only files with changed content hash re-embed.
 
 ### Search
 
@@ -120,7 +152,7 @@ vecs search "fork plan" -c docs                  # docs only
 
 ### Whitelist subdirs (include_dirs)
 
-Restrict a `code_dir` to specific subpaths. Edit `~/.vecs/config.yaml` directly:
+Restrict `code_dir` to specific subpaths. Edit `~/.vecs/config.yaml` directly:
 
 ```yaml
 projects:
@@ -134,7 +166,7 @@ projects:
       - Assets/Editor
 ```
 
-After saving, run `vecs index -p myproject`. Anything outside `include_dirs` is treated as out-of-scope — existing chunks under non-allowed paths are swept from chromadb automatically.
+After save, run `vecs index -p myproject`. Anything outside `include_dirs` treated out-of-scope — existing chunks under non-allowed paths swept from chromadb automatically.
 
 ### Blacklist subdirs (exclude_dirs)
 
@@ -146,7 +178,7 @@ projects:
     code_dirs:
     - path: /abs/path/to/python-repo
       extensions: [.py, .md]
-      exclude_dirs:               # any path under these is dropped
+      exclude_dirs:               # any path under these dropped
       - .venv
       - node_modules
       - dist
@@ -164,31 +196,31 @@ projects:
       - Assets/App/Scripts/p2-proto          # protobuf-generated
 ```
 
-`exclude_dirs` wins over `include_dirs` when a path matches both. Each entry is a path **relative to the `code_dir.path`** — not a glob.
+`exclude_dirs` wins over `include_dirs` when path matches both. Each entry is path **relative to `code_dir.path`** — not glob.
 
-### Prune chunks for paths you just excluded
+### Prune chunks for paths just excluded
 
 ```bash
 vecs index -p myproject
 ```
 
-The next index run sweeps any existing chromadb chunks whose `file_path` is under a newly-excluded subdir. You'll see a log line like `pruned 4156 manifest entries now out of scope (excluded subdirs).` followed by the chunk deletion. The BM25 sidecar is synced in the same pass.
+Next index run sweeps existing chromadb chunks whose `file_path` under newly-excluded subdir. Log line: `pruned 4156 manifest entries now out of scope (excluded subdirs).` followed by chunk deletion. BM25 sidecar synced same pass.
 
-### Remove a project entirely
+### Remove project entirely
 
 ```bash
 vecs project remove myproject
 ```
 
-Drops the chromadb collections, BM25 `.db` files, and config entry. Embedding cost is sunk — re-adding the project means re-embedding from scratch.
+Drops chromadb collections, BM25 `.db` files, config entry. Embedding cost sunk — re-add means re-embed from scratch.
 
-### Reclaim disk space after large pruning
+### Reclaim disk space after big pruning
 
-ChromaDB's underlying SQLite doesn't return free pages to the OS automatically. After a big sweep, run VACUUM:
+ChromaDB's underlying SQLite doesn't return free pages to OS automatically. After big sweep, run VACUUM:
 
 ```bash
 # Stop any process holding ~/.vecs/chromadb/chroma.sqlite3 first.
-# If you use the MCP server, your editor will respawn it on next use.
+# If you use MCP server, your editor respawns it on next use.
 lsof ~/.vecs/chromadb/chroma.sqlite3      # find holders
 kill <pid>                                # graceful stop
 
@@ -198,11 +230,11 @@ python -c "import sqlite3; c=sqlite3.connect('$HOME/.vecs/chromadb/chroma.sqlite
 du -sh ~/.vecs/chromadb/chroma.sqlite3    # confirm shrink
 ```
 
-ChromaDB's HNSW vector dirs (`~/.vecs/chromadb/<uuid>/`) don't auto-compact either. To fully reclaim those you'd need to drop and re-index a collection (Voyage API cost). Tombstoned vectors are harmless — they're skipped at query time.
+ChromaDB's HNSW vector dirs (`~/.vecs/chromadb/<uuid>/`) don't auto-compact either. Full reclaim needs drop + re-index of collection (Voyage API cost). Tombstoned vectors harmless — skipped at query time.
 
 ### Find and delete orphan vector dirs
 
-A vector dir is "orphan" when no live ChromaDB segment references it (collection drops, aborted runs):
+Vector dir "orphan" when no live ChromaDB segment references it (collection drops, aborted runs):
 
 ```bash
 python <<'PY'
@@ -219,11 +251,11 @@ PY
 # Delete each one with: rm -rf ~/.vecs/chromadb/<orphan-uuid>
 ```
 
-Always run this with the MCP server stopped (it can re-create them mid-script otherwise).
+Always run with MCP server stopped (can re-create them mid-script otherwise).
 
-### Find which paths are inflating a collection
+### Find which paths inflate a collection
 
-Use this output to decide what to add to `exclude_dirs`:
+Use this output to pick what to add to `exclude_dirs`:
 
 ```bash
 python <<'PY'
@@ -249,13 +281,13 @@ for p, n in Counter(paths).most_common(10):
 PY
 ```
 
-### Add a one-off document to a project's `docs` collection
+### Add one-off document to project's `docs` collection
 
 ```bash
 echo "Notes from today's standup..." | vecs add -p myproject -t "2026-04-27 standup"
 ```
 
-The doc gets stored under the project's `docs_dir`, embedded immediately, and is searchable via `vecs search ... -c docs`.
+Doc stored under project's `docs_dir`, embedded immediately, searchable via `vecs search ... -c docs`.
 
 ### Check status
 
@@ -274,7 +306,7 @@ du -sh ~/.vecs/chromadb/* | sort -hr | head    # biggest segments
 
 ## Configuration reference
 
-`~/.vecs/config.yaml` is the source of truth. The CLI commands (`project add`, `project remove`) edit this file, but you can also edit it directly — the next `vecs index` picks up changes.
+`~/.vecs/config.yaml` is source of truth. CLI commands (`project add`, `project remove`) edit this file, but you can edit directly — next `vecs index` picks up changes.
 
 ```yaml
 projects:
@@ -292,11 +324,11 @@ projects:
 ```
 
 Rules:
-- `extensions` includes the leading dot.
+- `extensions` includes leading dot.
 - `include_dirs` and `exclude_dirs` are paths relative to that `code_dir.path`. Not globs — directory prefixes.
 - `exclude_dirs` wins over `include_dirs` when both match.
-- A project must have at least one `code_dir`. `sessions_dir` and `docs_dir` are optional.
-- `~/.vecs/config.yaml.bak` is a snapshot the CLI writes before each edit.
+- Project must have at least one `code_dir`. `sessions_dir` and `docs_dir` optional.
+- `~/.vecs/config.yaml.bak` is snapshot CLI writes before each edit.
 
 CLI:
 
@@ -312,24 +344,28 @@ Everything vecs writes lives under `~/.vecs/`:
 
 | Path                                 | What it is                                                   |
 |--------------------------------------|--------------------------------------------------------------|
-| `~/.vecs/config.yaml`                | The project registry (source of truth)                       |
-| `~/.vecs/config.yaml.bak`            | Auto-snapshot from the last CLI write                        |
+| `~/.vecs/config.yaml`                | Project registry (source of truth)                           |
+| `~/.vecs/config.yaml.bak`            | Auto-snapshot from last CLI write                            |
 | `~/.vecs/chromadb/chroma.sqlite3`    | ChromaDB metadata + document store                           |
 | `~/.vecs/chromadb/<uuid>/`           | HNSW vector index for one collection segment                 |
 | `~/.vecs/bm25/<project>_<suffix>.db` | SQLite FTS5 BM25 sidecar (`suffix` ∈ `code/sessions/docs`)   |
 | `~/.vecs/manifests/<project>.json`   | Content hashes per file for incremental indexing             |
+| `~/.vecs/manifests/_codex_routing.json` | Codex orphan census + cwd-cache for fast re-walks         |
 | `~/.vecs/manifest.json`              | Legacy single-file manifest (still read for migration)       |
 | `~/.vecs/docs/<project>/`            | Auto-created docs target for `vecs add` if no `docs_dir`     |
 | `~/.vecs/reindex.log`                | launchd / cron index logs (if you set up auto-reindex)       |
 
-## MCP tools (already wired by the install above)
+## MCP tools (already wired by install above)
 
-- `semantic_search(query, collection?, n_results?, path_filter?, project?)` — hybrid vector + BM25 search across code / sessions / docs
-- `reindex(project?)` — incremental reindex
-- `index_status(project?)` — per-project chunk counts
-- `add_document(content, title, project)` — save and index a document into the project's `docs_dir` (auto-creates one under `~/.vecs/docs/{project}/` if not configured)
+- `semantic_search(query, collection?, n_results?, path_filter?, project?)` — hybrid vector + BM25 search across code / sessions / docs. Session results display `{claude_code}` or `{codex}` agent tag.
+- `reindex(project?)` — incremental reindex (Claude Code + Codex sessions in one pass)
+- `index_status(project?)` — per-project chunk counts; appends Codex orphan summary when present
+- `add_document(content, title, project)` — save and index document into project's `docs_dir` (auto-creates one under `~/.vecs/docs/{project}/` if not configured)
+- `codex_orphans()` — list Codex `cwd`s that didn't match any project, with project suggestions
+- `codex_assign(cwd, project)` — route Codex sessions for a `cwd` to a project, invalidate stale chunks/manifest entries
+- `codex_ignore(cwd)` — stop indexing Codex sessions captured at `cwd`, sweep already-indexed chunks
 
-The server holds an open handle on `~/.vecs/chromadb/chroma.sqlite3`. Stop it before running VACUUM or moving files.
+Server holds open handle on `~/.vecs/chromadb/chroma.sqlite3`. Stop it before VACUUM or moving files.
 
 ## Auto-reindex (launchd)
 
@@ -370,18 +406,19 @@ launchctl unload ~/Library/LaunchAgents/com.vecs.reindex.plist   # disable
 tail -f ~/.vecs/reindex.log                                       # watch
 ```
 
-Logs carry ISO timestamps, per-project durations, and chunk-id context on truncation/retry — grep by date or `attempt N/5` to forensically reconstruct a run.
+Logs carry ISO timestamps, per-project durations, chunk-id context on truncation/retry — grep by date or `attempt N/5` to forensically reconstruct run.
 
 ## How it works
 
-1. **Discovery** — for each project's `code_dirs`, walk the tree, filter by `extensions`, then by `include_dirs` / `exclude_dirs`. Hash file content, compare against the per-project manifest, queue only changed/new files.
+1. **Discovery** — for each project's `code_dirs`, walk tree, filter by `extensions`, then by `include_dirs` / `exclude_dirs`. Hash file content, compare against per-project manifest, queue only changed/new files.
 2. **Chunking**
-   - Code: `.cs` / `.ts` / `.tsx` parsed with tree-sitter and split at class/method boundaries; other extensions use line-based windows (200 lines, 50 overlap).
-   - Sessions: append-only JSONL chunked into 10-message windows with 2-message overlap; `byte_offset` stored so subsequent runs only read new bytes.
+   - Code: `.cs` / `.ts` / `.tsx` parsed with tree-sitter, split at class/method boundaries; other extensions use line-based windows (200 lines, 50 overlap).
+   - Sessions: append-only JSONL chunked into 10-message windows with 2-message overlap; `byte_offset` stored so subsequent runs only read new bytes. Two parsers (Claude Code, Codex) feed one shared chunking pipeline; chunks tagged with `agent` metadata.
+   - Codex routing: each `rollout-*.jsonl` is keyed by `session_meta.payload.cwd` (mtime-cached so subsequent walks skip parsing line 1). Bidirectional resolved-path containment matches `cwd` to projects via `code_dirs[].path`; ambiguous ancestor cwds go to orphan tracking, never silently misrouted.
    - Docs: Markdown and PDF split at heading boundaries; plain text falls back to size-based chunks.
-3. **Embedding** — Voyage AI (`voyage-code-3` for code, `voyage-3` for sessions and docs) via an adaptive batcher that calibrates the char-to-token ratio from API responses. Transient errors retry with backoff; permanent errors fail fast.
-4. **Storage** — vectors + metadata go into ChromaDB; a parallel SQLite FTS5 BM25 sidecar (`~/.vecs/bm25/{project}_{collection}.db`) is incrementally upserted as chunks change.
-5. **Cleanup** — files removed from disk are pruned from the manifest; files now under `exclude_dirs` are pruned and their chromadb chunks swept.
+3. **Embedding** — Voyage AI (`voyage-code-3` for code, `voyage-3` for sessions and docs) via adaptive batcher that calibrates char-to-token ratio from API responses. Transient errors retry with backoff; permanent errors fail fast.
+4. **Storage** — vectors + metadata go into ChromaDB; parallel SQLite FTS5 BM25 sidecar (`~/.vecs/bm25/{project}_{collection}.db`) incrementally upserted as chunks change.
+5. **Cleanup** — files removed from disk pruned from manifest; files now under `exclude_dirs` pruned and chromadb chunks swept.
 6. **Search** — query embedded once (cached, 5-min TTL), runs against vectors and BM25, results merged via Reciprocal Rank Fusion, deduplicated, returned.
 
 ## Embedding cost
@@ -391,7 +428,7 @@ Logs carry ISO timestamps, per-project durations, and chunk-id context on trunca
 | code           | `voyage-code-3`  | free              |
 | sessions, docs | `voyage-3`       | $0.06 / 1M tokens |
 
-Re-embedding a project costs roughly: `total_chunks × ~500 tokens × model_rate`. For a 10K-chunk Python repo on `voyage-3`, that's ≈ $0.30. Code is free, so most users only pay for sessions and docs.
+Re-embedding project costs roughly: `total_chunks × ~500 tokens × model_rate`. For 10K-chunk Python repo on `voyage-3`, ≈ $0.30. Code free, so most users only pay for sessions and docs.
 
 ## Development
 
