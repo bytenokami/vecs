@@ -54,7 +54,7 @@ Produced by `architect` (`Plan`). Source: profile slot `acceptance_source` + `ac
     - `object: str`
     - `chain_key: str = f"{subject}|{predicate}"` (composite; non-unique across rows; used to locate the current state and all historical rows for a (subject, predicate) chain)
     - `valid_from: int` (unix epoch ms; the moment this state became current)
-    - `invalid_at: int | None` (unix epoch ms; the moment this state was superseded; `None` for the one current row in a chain)
+    - `invalid_at: int` (unix epoch ms; `0` sentinel = "still current"; non-zero = invalidation timestamp. Chroma metadata does not accept `None`; the implementation uses `INVALID_AT_NONE_SENTINEL = 0`. Abstract semantics remain `invalid_at == 0 ⇔ current`.)
     - `is_current: bool` (companion field; `True` for the one current row in a chain, `False` on superseded rows. Schema field name + bool-vs-int representation is pinned post-Phase-7-dry-run per Fix 1: if Chroma normalizes bool literals to int, swap to `is_current_int: 0|1` and update the where-clause accordingly. v1 ships whichever form the dry-run validates.)
     - `source_id: str` (session_id; all v1 rows are session-sourced)
     - `version: int` (starts at 1 on INSERT; bumps by 1 on each SUPERSEDE in the chain)
