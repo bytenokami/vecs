@@ -35,14 +35,21 @@ Schema (per profile `feedback_artifact` row contract): `pass | finding-id | seve
 | 3 | sinker-3.2 | MAJOR | Phase 7 dry-run subtask signature retains `source_type` arg | applied-in-design | Pass-4 edit: arg removed from line 499 of design |
 | 3 | reviewer-3.1 | MINOR | Test description references `role`+`content` not `role`+`text` | applied-in-design | Pass-4 edit: description corrected (line 417) |
 | 3 | sinker-3.3 | MAJOR | Multi-key Chroma `where={"chain_key": ..., "is_current": True}` not dry-run-validated | applied-in-design | Pass-4 edit: new dry-run bullet asserts both flat + `$and`-wrapped forms; canonical form pinned post-dry-run |
+| dryrun-1 | sinker-d1.1 | MAJOR | `INVALID_AT_NONE_SENTINEL = 0` deviated from doc `invalid_at: int \| None` (Chroma metadata rejects `None`) | applied-in-design | design line 57 + acceptance row-schema bullet amended to pin `invalid_at: int` with `0` sentinel |
+| dryrun-1 | sinker-d1.2 | MAJOR | SUPERSEDE write-order (add-FIRST / flip-SECOND) not test-asserted; future refactor could silently reverse it | applied-in-impl | `test_supersede_write_order_add_first_then_flip` spies on `add`+`update`, monkeypatches `update` to raise, asserts call order = `[add, update]`, verifies repair branch returns NOOP on re-run |
+| dryrun-1 | sinker-d1.3 | MAJOR | `test_no_deletes_against_prose_facts` path-relative — fails when pytest cwd ≠ repo root | applied-in-impl | Anchored with `Path(__file__).resolve().parents[1]` |
+| dryrun-1 | sinker-d1.4 | MAJOR | `.delete(` grep had tautological bypass clause (`or "# delete" in src`) — any future comment containing `# delete` would whitewash a real delete | applied-in-impl | Dropped tolerance clause; assertion now strict |
+| dryrun-1 | sinker-d1.5 | MAJOR | Repair-branch NOOP path (all current rows have same object) was unasserted by any test | applied-in-impl | `test_repair_branch_noop_when_operative_matches_incoming` hand-seeds 2 `is_current=True` rows for the same chain_key with same object; asserts NOOP and demotion of lower-version row |
+| dryrun-1 | reviewer-d1.1 | MAJOR | Acceptance line 68 requires "unit test asserts pin form" for `anthropic==X.Y.Z`; no such test existed | applied-in-impl | `test_pyproject_pins_anthropic_exact_version` reads pyproject.toml, asserts exactly one `"anthropic==…"` line |
+| dryrun-1 | sinker-d1.6 | MINOR | Multi-key-where test didn't pin canonical form; silently flipped to `$and` if flat dict raised in future Chroma | applied-in-impl | Renamed to `test_chroma_multi_key_where_canonical_form_pinned`; asserts `$and` form succeeds unconditionally; flat-dict form observed under XOR gate (raise-XOR-match) |
 
 ## Pre-known gap candidates (move to runtime gaps after Phase 7 dry-run)
 
-1. **First Anthropic API call invariant.** Profile Phase 0 `bootstrap_done_check` does not currently verify `ANTHROPIC_API_KEY`. Candidate runbook addendum.
-2. **First `anthropic` dependency.** Profile Phase 0 `pipeline_setup_runbook` may need an addendum for the Anthropic install path.
-3. **Chroma `where`-clause for `None` values.** v1 sidesteps with `is_current: bool` companion field. If Chroma's filter API gains native NULL support, the companion field can be retired (v2 opportunity).
-4. **Chroma bool-vs-int normalization.** Field name `is_current` may need to become `is_current_int: 0|1` per Phase 7 dry-run. Decision pinned post-dry-run.
-5. **Chroma multi-key where syntax.** Flat dict vs `$and` wrapping. Canonical form pinned post-dry-run.
+1. **First Anthropic API call invariant.** Profile Phase 0 `bootstrap_done_check` does not currently verify `ANTHROPIC_API_KEY`. Candidate runbook addendum. **STATUS post-dry-run: confirmed gap** — operator needed to load key from Keychain manually; `README.md` Install section addendum still TODO.
+2. **First `anthropic` dependency.** Profile Phase 0 `pipeline_setup_runbook` may need an addendum for the Anthropic install path. **STATUS post-dry-run: addressed indirectly** — `uv sync` picked up `anthropic==0.103.1` pin automatically; no manual step needed.
+3. **Chroma `where`-clause for `None` values.** v1 sidesteps with `is_current: bool` companion field. **STATUS post-dry-run: pinned permanently** — `invalid_at: int` with `0` sentinel; documented in design + acceptance.
+4. **Chroma bool-vs-int normalization.** Field name `is_current` may need to become `is_current_int: 0|1` per Phase 7 dry-run. **STATUS post-dry-run: pinned to `is_current: bool`** — Chroma 1.0.x accepts bool literals natively; `test_chroma_bool_where_verification` passes.
+5. **Chroma multi-key where syntax.** Flat dict vs `$and` wrapping. **STATUS post-dry-run: canonical form = `$and`** — production code uses `{"$and": [{"chain_key": ...}, {"is_current": True}]}`. Flat dict also works on Chroma 1.0.x but `$and` is the pinned form.
 
 ## Convergence summary
 
@@ -50,5 +57,7 @@ Schema (per profile `feedback_artifact` row contract): `pass | finding-id | seve
 - Pass 2: 4 findings (1 BLOCKER, 2 MAJOR, 1 MINOR). All applied in design pass 2.
 - Pass 3: 3 findings (0 BLOCKER, 2 MAJOR, 1 MINOR). All applied in design pass 3-4.
 - Pass 4: reviewer verdict = ship.
+- Dry-run pass 1: 7 findings (0 BLOCKER, 6 MAJOR, 1 MINOR). All applied. 1 doc-deviation, 5 test gaps, 1 path-bug.
+- Dry-run pass 2: reviewer verdict = ship.
 
-Total: 27 findings tracked; 26 `applied-in-design`; 1 `parked-v2`. Zero `wontfix`.
+Total: 34 findings tracked; 33 `applied-in-design` or `applied-in-impl`; 1 `parked-v2`. Zero `wontfix`.
