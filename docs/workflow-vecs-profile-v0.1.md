@@ -160,9 +160,21 @@ Vecs uses git branches per feature (`.worktrees/` directory exists at repo root)
 | `feedback_targets` | `[0, 2]` |
 | `feedback_artifact` | `context-doc-edit` |
 | `feedback_apply_owner` | `"self"` |
+| `worktree_cleanup` | `mandatory` |
 | `rollup.cadence` | `"none"` |
 
 The `retro_template` file exists at `docs/templates/retro.md` (stub; phase-by-phase notes + gap log section + feedback-applied table).
+
+**Worktree cleanup (mandatory).** After retro lands, every `worktree-agent-*` branch created during the feature must be either merged into master (if it carries production work) or force-deleted (if it carries spike/scratch work whose results are already digested into landed docs). `abort_policy: branch-drop` covers mid-feature abort; this slot covers the end-of-feature housekeeping the abort policy doesn't reach. Cleanup commands:
+
+```bash
+git worktree list                                      # inventory
+git worktree unlock .claude/worktrees/<dir>            # unlock if locked
+git worktree remove --force .claude/worktrees/<dir>    # remove worktree
+git branch -D <branch>                                 # force-delete branch (unmerged scratch)
+```
+
+If hooks block `git branch -D`, the operator runs it by hand; cleanup is gating for marking the feature shipped.
 
 ---
 

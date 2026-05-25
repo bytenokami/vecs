@@ -17,6 +17,20 @@ uv tool install --from . vecs
 echo 'export VOYAGE_API_KEY="your-key-here"' >> ~/.zshrc && source ~/.zshrc
 ```
 
+Optional: enable prose-drift detector (CLI subcommand `vecs prose-drift`; requires Anthropic API key).
+
+```bash
+# macOS — store in Keychain (encrypted at rest); auto-loaded into env on shell start.
+security add-generic-password -a "$USER" -s ANTHROPIC_API_KEY -w  # silent prompt for key value
+echo 'export ANTHROPIC_API_KEY="$(security find-generic-password -a "$USER" -s ANTHROPIC_API_KEY -w 2>/dev/null)"' >> ~/.zshrc
+source ~/.zshrc
+
+# Linux / CI — set env var directly.
+export ANTHROPIC_API_KEY="your-key-here"
+```
+
+If `ANTHROPIC_API_KEY` is unset, prose-drift exits 3 with a clear error; other vecs features (index, search, codex) are unaffected.
+
 3. Register MCP server with agent. JSON shape same for most clients — only config path differs:
 
 ```json

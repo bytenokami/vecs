@@ -37,6 +37,6 @@ See `docs/features/prose-staleness-detector/gaps.md`. 34 findings tracked; 33 ap
 
 | Target phase | Artifact | Owner |
 |---|---|---|
-| Phase 0 (Bootstrap) | `README.md` Install section addendum: `ANTHROPIC_API_KEY` storage guidance (Keychain helper for macOS; env-var for CI) | self (pending; tracked as gaps.md pre-known #1) |
+| Phase 0 (Bootstrap) | `README.md` Install section addendum: `ANTHROPIC_API_KEY` storage guidance (Keychain helper for macOS; env-var for CI) | **applied** in `README.md:19-30` |
 | Phase 2 (Context) | None this pass. `src/vecs/CLAUDE.md` will get a `Tests` bullet (gated `VECS_TEST_REAL_LLM` integration test) when Phase 5 lands. | self |
-| Profile (workflow-vecs-profile-v0.1.md) | Add worktree-cleanup as explicit Phase 8 step (currently implicit under `abort_policy: branch-drop`) | self |
+| Profile (workflow-vecs-profile-v0.1.md) | Add `worktree_cleanup: mandatory` slot to Phase 8 with explicit cleanup commands | **applied** in `docs/workflow-vecs-profile-v0.1.md:163` + new paragraph |
