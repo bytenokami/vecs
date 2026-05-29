@@ -555,6 +555,35 @@ def test_find_prose_drift_sorted_by_subject_predicate(fake_anthropic, fake_voyag
     assert subjects == ["alpha", "zeta"]
 
 
+# ----- Task 6: paraphrase-miss xfail (fold-in C) ------------------------
+
+
+@pytest.mark.xfail(
+    reason="v1 boundary: exact (subject,predicate) chain_key cannot match cross-predicate "
+    "paraphrase. 'team|has_role:none' vs 'team|employs:sasha' do not collide. "
+    "Recovered by the v2 embedding-similarity + LLM contradiction-judge stage "
+    "(docs/features/prose-staleness-detector/v2-roadmap.md).",
+    strict=True,
+)
+def test_cross_predicate_paraphrase_drift_is_detected(fake_anthropic, fake_voyage):
+    project = "p_paraphrase"
+    # Chat says the team EMPLOYS Sasha (predicate 'employs').
+    prose_drift.add_fact_with_state_machine(
+        prose_drift.Triple("team", "employs", "sasha"), "be_dev_announce", project,
+    )
+    # Doc says the team HAS_ROLE none (predicate 'has_role') — a real contradiction
+    # a human would spot, but a different (subject,predicate) chain.
+    fake_anthropic["state"]["response_text"] = (
+        '[{"subject":"team","predicate":"has_role","object":"no backend developer"}]'
+    )
+    _seed_doc(project, "Our team has no backend developer.", "team.md")
+
+    report = prose_drift.find_prose_drift(_Proj(project))
+    # v1 will report ZERO drift here (the hole). xfail(strict) asserts this fails today
+    # and turns RED the day v2 closes the gap — forcing this test to be promoted.
+    assert len(report["drift"]) == 1
+
+
 # ----- integration: real Anthropic call (gated) -------------------------
 
 
