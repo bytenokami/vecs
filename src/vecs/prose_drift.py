@@ -258,6 +258,31 @@ def _get_prose_facts_collection(project: str):
     return client.get_or_create_collection(name=f"{project}-prose-facts")
 
 
+def _get_docs_collection(project: str):
+    path = _chroma_path()
+    path.mkdir(parents=True, exist_ok=True)
+    client = chromadb.PersistentClient(path=str(path))
+    return client.get_or_create_collection(name=f"{project}-docs")
+
+
+def iterate_indexed_docs(project: str):
+    """Yield (chunk_text, source_relpath) for every indexed doc-chunk.
+
+    source_relpath is read from metadata key `file_path` (cite doc_chunker.py:103),
+    relative to project.docs_dir. No fallback key: chunks lacking `file_path`
+    are skipped.
+    """
+    coll = _get_docs_collection(project)
+    res = coll.get(include=["documents", "metadatas"])
+    docs = res.get("documents") or []
+    metas = res.get("metadatas") or []
+    for text, meta in zip(docs, metas):
+        relpath = (meta or {}).get("file_path")
+        if relpath is None:
+            continue
+        yield (text, relpath)
+
+
 def _voyage_embed(text: str) -> list[float]:
     vo = get_voyage_client()
     result = vo.embed([text], model=SESSIONS_MODEL, input_type="document")

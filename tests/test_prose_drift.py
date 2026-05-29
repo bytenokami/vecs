@@ -455,6 +455,35 @@ def test_doc_extract_cache_miss_on_text_change(fake_anthropic):
     assert len(fake_anthropic["calls"]) == 2
 
 
+# ----- Task 4: iterate_indexed_docs -------------------------------------
+
+
+def test_iterate_indexed_docs_yields_text_and_file_path(fake_voyage):
+    project = "p_docs"
+    coll = prose_drift._get_docs_collection(project)
+    coll.add(
+        ids=["d1", "d2"],
+        embeddings=[[0.1, 0.2, 0.3, 0.4], [0.1, 0.2, 0.3, 0.4]],
+        documents=["team has no backend dev", "we use postgres"],
+        metadatas=[{"file_path": "team.md"}, {"file_path": "stack.md"}],
+    )
+    out = sorted(prose_drift.iterate_indexed_docs(project))
+    assert out == [("team has no backend dev", "team.md"), ("we use postgres", "stack.md")]
+
+
+def test_iterate_indexed_docs_no_fallback_key(fake_voyage):
+    project = "p_docs_nofallback"
+    coll = prose_drift._get_docs_collection(project)
+    coll.add(
+        ids=["d1"],
+        embeddings=[[0.1, 0.2, 0.3, 0.4]],
+        documents=["orphan chunk"],
+        metadatas=[{"path": "team.md"}],  # wrong key — must NOT be read as file_path
+    )
+    out = list(prose_drift.iterate_indexed_docs(project))
+    assert out == [], "chunk without file_path metadata must be skipped (no fallback)"
+
+
 # ----- integration: real Anthropic call (gated) -------------------------
 
 
