@@ -186,6 +186,41 @@ def index_status(project: str | None = None) -> str:
 
 
 @mcp.tool()
+def prose_drift(project: str | None = None) -> dict:
+    """Report contradictions between indexed docs and current chat-session facts.
+
+    On-demand recrawl. With project=None, scans every project where
+    prose_drift_enabled is true and returns a dict keyed by project name
+    ({} if none enabled). With a named project, returns that project's payload.
+    Detects exact (subject, predicate) object-collisions only (v1).
+
+    Args:
+        project: Project name, or None to scan all enabled projects.
+    """
+    from vecs.prose_drift import _preflight_global, _preflight_project
+
+    config = load_config()
+
+    g = _preflight_global(config)
+    if not g.ok:
+        return {"error": g.code} if g.detail is None else {"error": g.code, "detail": g.detail}
+
+    from vecs.prose_drift import find_prose_drift
+
+    if project is None:
+        out: dict = {}
+        for name, proj in config.projects.items():
+            if proj.prose_drift_enabled:
+                out[name] = find_prose_drift(proj)
+        return out
+
+    p = _preflight_project(config, project)
+    if not p.ok:
+        return {"error": p.code, "detail": p.detail}
+    return find_prose_drift(config.projects[project])
+
+
+@mcp.tool()
 def add_document(
     content: str,
     title: str,

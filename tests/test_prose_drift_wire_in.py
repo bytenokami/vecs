@@ -145,3 +145,74 @@ def test_cli_limit_truncates_exit_1(monkeypatch, fake_anthropic):
     assert "drift truncated: showing 10 of 100" in res.output
     # sort order preserved: first printed is s000
     assert printed[0].startswith("s000 | p |")
+
+
+# ---------------------------------------------------------------------------
+# Task 9: MCP tool `prose_drift`
+# ---------------------------------------------------------------------------
+
+
+def _cfg_with(monkeypatch, projects):
+    from vecs.config import VecsConfig
+    cfg = VecsConfig(path=Path("/tmp/none.yaml"), projects=projects)
+    import vecs.mcp_server
+    monkeypatch.setattr(vecs.mcp_server, "load_config", lambda *a, **k: cfg)
+    return cfg
+
+
+def _enabled(name):
+    from vecs.config import ProjectConfig
+    return ProjectConfig(name=name, prose_drift_enabled=True)
+
+
+def _disabled(name):
+    from vecs.config import ProjectConfig
+    return ProjectConfig(name=name)
+
+
+def _patch_find(monkeypatch):
+    import vecs.prose_drift as pd
+    monkeypatch.setattr(pd, "find_prose_drift", lambda proj: {
+        "drift": [], "facts_scanned": 1, "facts_scanned_docs": 1, "project": proj.name,
+    })
+
+
+def test_mcp_named_project_returns_payload(monkeypatch, fake_anthropic):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    _cfg_with(monkeypatch, {"vecs": _enabled("vecs")})
+    _patch_find(monkeypatch)
+    from vecs.mcp_server import prose_drift
+    out = prose_drift(project="vecs")
+    assert out == {"drift": [], "facts_scanned": 1, "facts_scanned_docs": 1, "project": "vecs"}
+
+
+def test_mcp_none_scans_only_enabled(monkeypatch, fake_anthropic):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    _cfg_with(monkeypatch, {"a": _enabled("a"), "b": _enabled("b"), "c": _disabled("c")})
+    _patch_find(monkeypatch)
+    from vecs.mcp_server import prose_drift
+    out = prose_drift(project=None)
+    assert set(out.keys()) == {"a", "b"}
+    assert out["a"]["project"] == "a"
+
+
+def test_mcp_none_no_enabled_returns_empty_dict(monkeypatch, fake_anthropic):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    _cfg_with(monkeypatch, {"c": _disabled("c")})
+    _patch_find(monkeypatch)
+    from vecs.mcp_server import prose_drift
+    assert prose_drift(project=None) == {}
+
+
+def test_mcp_none_global_preflight_failure_is_error_dict(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    _cfg_with(monkeypatch, {"a": _enabled("a")})
+    from vecs.mcp_server import prose_drift
+    assert prose_drift(project=None) == {"error": "anthropic_key_missing"}
+
+
+def test_mcp_named_disabled_is_error_dict(monkeypatch, fake_anthropic):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    _cfg_with(monkeypatch, {"vecs": _disabled("vecs")})
+    from vecs.mcp_server import prose_drift
+    assert prose_drift(project="vecs") == {"error": "prose_drift_disabled", "detail": "vecs"}
