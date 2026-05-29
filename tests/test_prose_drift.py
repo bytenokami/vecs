@@ -562,6 +562,7 @@ def test_find_prose_drift_sorted_by_subject_predicate(fake_anthropic, fake_voyag
 @pytest.mark.xfail(
     reason="v1 boundary: exact (subject,predicate) chain_key cannot match cross-predicate "
     "paraphrase. 'team|has_role:none' vs 'team|employs:sasha' do not collide. "
+    "B1 paraphrase finding: docs/research/prose-drift-review-and-sota-2026-05-29.md. "
     "Recovered by the v2 embedding-similarity + LLM contradiction-judge stage "
     "(docs/features/prose-staleness-detector/v2-roadmap.md).",
     strict=True,
@@ -651,6 +652,49 @@ def test_be_dev_contradiction_surfaces(fake_anthropic, fake_voyage):
     assert len(report["drift"]) == 1
     d = report["drift"][0]
     assert d["subject"] == "team" and d["predicate"] == "has_role"
+    assert d["doc"]["object"] == "no backend developer"
+    assert d["chat"]["object"] == "sasha is backend engineer"
+    assert d["chat"]["session_id"] == "be_dev_announce"
+    assert d["chat_history_versions"] >= 1
+
+
+def test_be_dev_contradiction_via_fixtures(fake_anthropic, fake_voyage):
+    """Same scenario as above, but exercised against the committed fixture FILES
+    (docs/team.md + sessions/be_dev_announce.jsonl) rather than inline strings.
+
+    Acceptance item 24 / design line 448. Loads the fixture doc content into the
+    docs collection and seeds the session-side fact derived from the fixture
+    session, then asserts find_prose_drift surfaces exactly one (team, has_role)
+    drift carrying both objects.
+    """
+    project = "vecs-bedev-fixtures"
+    fixtures = Path(__file__).resolve().parent / "fixtures" / "prose_drift"
+    doc_text = (fixtures / "docs" / "team.md").read_text()
+    session_lines = [
+        json.loads(ln)
+        for ln in (fixtures / "sessions" / "be_dev_announce.jsonl").read_text().splitlines()
+        if ln.strip()
+    ]
+    # Sanity: the fixture files carry the contradicting prose we rely on.
+    assert "no backend developer" in doc_text
+    assert any("Sasha" in m["text"] for m in session_lines)
+
+    # Session-side current fact (the indexer would have extracted this from the
+    # be_dev_announce.jsonl user turn). source_id mirrors the fixture file stem.
+    prose_drift.add_fact_with_state_machine(
+        prose_drift.Triple("team", "has_role", "sasha is backend engineer"),
+        "be_dev_announce", project,
+    )
+    # Doc-side extraction over the fixture's team.md returns the contradicting fact.
+    fake_anthropic["state"]["response_text"] = (
+        '[{"subject":"team","predicate":"has_role","object":"no backend developer"}]'
+    )
+    _seed_doc(project, doc_text, "team.md")
+
+    report = prose_drift.find_prose_drift(_Proj(project))
+    drift = [d for d in report["drift"] if (d["subject"], d["predicate"]) == ("team", "has_role")]
+    assert len(drift) == 1
+    d = drift[0]
     assert d["doc"]["object"] == "no backend developer"
     assert d["chat"]["object"] == "sasha is backend engineer"
     assert d["chat"]["session_id"] == "be_dev_announce"
