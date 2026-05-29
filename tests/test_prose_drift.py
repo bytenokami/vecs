@@ -146,7 +146,9 @@ def test_cache_invalidates_on_prompt_version_bump(fake_anthropic, monkeypatch, t
     msgs = [{"role": "user", "text": "hi", "timestamp": "0"}]
     extract_facts(msgs, "p_pv")
     assert len(fake_anthropic["calls"]) == 1
-    monkeypatch.setattr(prose_drift, "EXTRACTION_PROMPT_VERSION", "v2")
+    # Use a sentinel distinct from the live default so the bump always differs
+    # from whatever version the first call cached under.
+    monkeypatch.setattr(prose_drift, "EXTRACTION_PROMPT_VERSION", "v_test_bump")
     extract_facts(msgs, "p_pv")
     assert len(fake_anthropic["calls"]) == 2, "prompt_version bump must invalidate cache"
 
@@ -401,6 +403,21 @@ def test_pyproject_pins_anthropic_exact_version():
         ln.strip() for ln in pyproject.splitlines() if ln.strip().startswith('"anthropic==')
     ]
     assert len(pinned) == 1, f"expected exactly one anthropic pin line; got {pinned}"
+
+
+# ----- Task 2: canonicalization prompt (fold-in B) ----------------------
+
+
+def test_extraction_prompt_version_bumped_to_v2():
+    assert prose_drift.EXTRACTION_PROMPT_VERSION == "v2"
+
+
+def test_extraction_prompt_has_canonicalization_guidance():
+    p = prose_drift.EXTRACTION_PROMPT
+    assert "canonical" in p.lower()
+    # A controlled-vocabulary hint and at least one worked example must be present.
+    assert "has_role" in p
+    assert "Example" in p
 
 
 # ----- integration: real Anthropic call (gated) -------------------------

@@ -21,7 +21,7 @@ from vecs.clients import get_voyage_client
 from vecs.config import CHROMADB_DIR, SESSIONS_MODEL
 
 PROSE_EXTRACTION_MODEL = "claude-opus-4-7"
-EXTRACTION_PROMPT_VERSION = "v1"
+EXTRACTION_PROMPT_VERSION = "v2"
 
 EVENT_INSERT = "INSERT"
 EVENT_NOOP = "NOOP"
@@ -36,9 +36,23 @@ _PROSE_DRIFT_CACHE_DIR = Path.home() / ".vecs" / "prose_drift_cache"
 EXTRACTION_PROMPT = """Extract structured factual claims from the user-authored messages below as a JSON array of objects.
 
 Each object: {{"subject": <str>, "predicate": <str>, "object": <str>}}.
-Use short, canonicalized lowercase strings for subject and predicate. Object may be verbatim.
-Only extract assertions the user is making about the project, team, or work state. Skip questions, hypotheticals, and meta-talk.
-If no factual claims, return [].
+
+Canonicalization rules (critical — drift detection joins on exact (subject, predicate)):
+- subject and predicate are SHORT, lowercase, snake_case canonical strings.
+- Collapse synonyms to ONE canonical predicate. Prefer these when they fit:
+  has_role, headcount, status, owns, uses, decision, deadline, location, name.
+- Map paraphrases to the same (subject, predicate). e.g. "we have no backend dev",
+  "the team lacks a server engineer", and "no one owns the backend" all become
+  subject="team", predicate="has_role" (object describes the role state).
+- object may be a natural-language phrase (verbatim is fine).
+- Only extract assertions the user makes about the project, team, or work state.
+  Skip questions, hypotheticals, and meta-talk. If no factual claims, return [].
+
+Example input:  [user]: We still have no backend developer on the team.
+Example output: [{{"subject":"team","predicate":"has_role","object":"no backend developer"}}]
+
+Example input:  [user]: Sasha just joined as our backend engineer.
+Example output: [{{"subject":"team","predicate":"has_role","object":"sasha is backend engineer"}}]
 
 Messages:
 {messages}
