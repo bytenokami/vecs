@@ -42,6 +42,7 @@ Schema (per profile `feedback_artifact` row contract): `pass | finding-id | seve
 | dryrun-1 | sinker-d1.5 | MAJOR | Repair-branch NOOP path (all current rows have same object) was unasserted by any test | applied-in-impl | `test_repair_branch_noop_when_operative_matches_incoming` hand-seeds 2 `is_current=True` rows for the same chain_key with same object; asserts NOOP and demotion of lower-version row |
 | dryrun-1 | reviewer-d1.1 | MAJOR | Acceptance line 68 requires "unit test asserts pin form" for `anthropic==X.Y.Z`; no such test existed | applied-in-impl | `test_pyproject_pins_anthropic_exact_version` reads pyproject.toml, asserts exactly one `"anthropic==…"` line |
 | dryrun-1 | sinker-d1.6 | MINOR | Multi-key-where test didn't pin canonical form; silently flipped to `$and` if flat dict raised in future Chroma | applied-in-impl | Renamed to `test_chroma_multi_key_where_canonical_form_pinned`; asserts `$and` form succeeds unconditionally; flat-dict form observed under XOR gate (raise-XOR-match) |
+| wire-in | sinker-w1.1 | MINOR | SQLite cache DDL omits the `extracted_at` columns the design DDL (lines 83/92) lists; no v1 code path reads them | parked-v2 | Deferred to the parked v2 cache-compactor; no functional impact in v1 (no reader). `docs/features/prose-staleness-detector/v2-roadmap.md` |
 
 ## Pre-known gap candidates (move to runtime gaps after Phase 7 dry-run)
 

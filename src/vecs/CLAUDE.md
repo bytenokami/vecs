@@ -6,8 +6,8 @@ Targets workflow profile at `docs/workflow-vecs-profile-v0.1.md` (Phase 2 `conte
 
 ## Entry points
 
-- `cli.py:main` — Click group. Subcommands: `index`, `search`, `add-document`, `status`, `codex` group.
-- `mcp_server.py` — FastMCP server named `vecs`. Tools: `semantic_search`, `reindex`, `index_status`, `add_document`, `codex_orphans`, `codex_assign`, `codex_ignore`.
+- `cli.py:main` — Click group. Subcommands: `index`, `search`, `add-document`, `status`, `prose-drift`, `codex` group.
+- `mcp_server.py` — FastMCP server named `vecs`. Tools: `semantic_search`, `reindex`, `index_status`, `add_document`, `prose_drift`, `codex_orphans`, `codex_assign`, `codex_ignore`.
 
 ## Modules
 
@@ -40,11 +40,16 @@ Targets workflow profile at `docs/workflow-vecs-profile-v0.1.md` (Phase 2 `conte
 
 - `tests/` contains one module per source module (13 total). New feature touching module M MUST add or update `tests/test_M.py` (Phase 5 `new_test_required_per_feature: true`).
 - Runner: `uv run pytest -q`.
+- Opt-in integration tests gated by VECS_TEST_REAL_LLM=1 — real LLM calls; default-skipped in CI. See tests/test_prose_drift.py::test_integration_real_anthropic.
 
 ## Workflow context
 
 This repo authors the workflow framework base (`docs/workflow-framework-v0.1.md`) and applies it via the vecs profile (`docs/workflow-vecs-profile-v0.1.md`). Features land via the profile's phases.
 
+## prose-drift v1 boundary
+
+`vecs prose-drift` / `mcp__vecs__prose_drift` is an on-demand recrawl, not a write-time detector. v1 reports only exact `(subject, predicate)` object-collisions between indexed docs and current chat facts. Out of scope (v2 — see `docs/features/prose-staleness-detector/v2-roadmap.md`): cross-predicate/paraphrase contradictions (needs the embedding-similarity + LLM contradiction judge), omission (doc silent on a now-true fact), and soft/temporal "used to have" contradictions.
+
 ## Staleness baseline
 
-This file is the Phase 2 context-tree starter for `context_tree_root: src/vecs/`. `staleness_check: commit-sha-tag` baselines from the commit that introduces this file.
+This file is the Phase 2 context-tree starter for `context_tree_root: src/vecs/`. `staleness_check: [commit-sha-tag, custom:prose-vplus]` baselines from the commit that introduces this file.
