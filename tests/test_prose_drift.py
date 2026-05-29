@@ -484,6 +484,77 @@ def test_iterate_indexed_docs_no_fallback_key(fake_voyage):
     assert out == [], "chunk without file_path metadata must be skipped (no fallback)"
 
 
+# ----- Task 5: find_prose_drift -----------------------------------------
+
+
+def _seed_doc(project, text, relpath):
+    coll = prose_drift._get_docs_collection(project)
+    coll.add(
+        ids=[f"d-{relpath}"],
+        embeddings=[[0.1, 0.2, 0.3, 0.4]],
+        documents=[text],
+        metadatas=[{"file_path": relpath}],
+    )
+
+
+class _Proj:
+    def __init__(self, name):
+        self.name = name
+
+
+def test_find_prose_drift_no_drift_when_no_facts(fake_anthropic):
+    fake_anthropic["state"]["response_text"] = (
+        '[{"subject":"team","predicate":"has_role","object":"no backend developer"}]'
+    )
+    _seed_doc("p_nd", "team has no backend dev", "team.md")
+    report = prose_drift.find_prose_drift(_Proj("p_nd"))
+    assert report["drift"] == []
+    assert report["facts_scanned"] == 0
+    assert report["facts_scanned_docs"] == 1
+    assert report["project"] == "p_nd"
+
+
+def test_find_prose_drift_surfaces_collision(fake_anthropic, fake_voyage):
+    project = "p_drift"
+    # Session-side current row: team has_role "Sasha is backend engineer"
+    prose_drift.add_fact_with_state_machine(
+        prose_drift.Triple("team", "has_role", "sasha is backend engineer"),
+        "be_dev_announce", project,
+    )
+    # Doc-side claims the opposite.
+    fake_anthropic["state"]["response_text"] = (
+        '[{"subject":"team","predicate":"has_role","object":"no backend developer"}]'
+    )
+    _seed_doc(project, "Our team has no backend developer.", "team.md")
+
+    report = prose_drift.find_prose_drift(_Proj(project))
+    assert len(report["drift"]) == 1
+    d = report["drift"][0]
+    assert d["subject"] == "team" and d["predicate"] == "has_role"
+    assert d["doc"] == {"object": "no backend developer", "source": "team.md"}
+    assert d["chat"]["object"] == "sasha is backend engineer"
+    assert d["chat"]["session_id"] == "be_dev_announce"
+    assert d["chat_history_versions"] == 1
+    assert report["facts_scanned"] == 1
+    assert report["facts_scanned_docs"] == 1
+
+
+def test_find_prose_drift_sorted_by_subject_predicate(fake_anthropic, fake_voyage):
+    project = "p_sort"
+    for subj in ("zeta", "alpha"):
+        prose_drift.add_fact_with_state_machine(
+            prose_drift.Triple(subj, "p", "chat_val"), "s", project,
+        )
+    fake_anthropic["state"]["response_text"] = (
+        '[{"subject":"zeta","predicate":"p","object":"doc_val"},'
+        '{"subject":"alpha","predicate":"p","object":"doc_val"}]'
+    )
+    _seed_doc(project, "irrelevant", "x.md")
+    report = prose_drift.find_prose_drift(_Proj(project))
+    subjects = [d["subject"] for d in report["drift"]]
+    assert subjects == ["alpha", "zeta"]
+
+
 # ----- integration: real Anthropic call (gated) -------------------------
 
 

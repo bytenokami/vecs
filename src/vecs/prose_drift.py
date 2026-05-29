@@ -283,6 +283,66 @@ def iterate_indexed_docs(project: str):
         yield (text, relpath)
 
 
+def _current_row_for_chain(collection, chain_key: str) -> dict | None:
+    """Read-only lookup of the operative current row for a chain. No repair writes."""
+    res = collection.get(
+        where={"$and": [{"chain_key": chain_key}, {"is_current": True}]}
+    )
+    ids = res.get("ids") or []
+    metas = res.get("metadatas") or []
+    if not ids:
+        return None
+    if len(ids) > 1:
+        # Transient post-crash state: highest-version row is operative (read path
+        # does not mutate; the next write-path call repairs via add_fact_with_state_machine).
+        return max(metas, key=lambda m: m.get("version", 0))
+    return metas[0]
+
+
+def find_prose_drift(project) -> dict:
+    """Compare doc-side triples (query-time) against current session-side facts.
+
+    Scheduled/on-demand recrawl: iterates indexed doc-chunks, extracts triples,
+    and reports each (subject, predicate) whose doc-object collides with a
+    DIFFERENT current chat-object. v1 detects exact (subject, predicate)
+    object-collisions only (see v1-boundary note in docs).
+
+    Returns the MCP payload dict:
+      {"drift": [...], "facts_scanned": int, "facts_scanned_docs": int, "project": str}
+    """
+    name = project.name
+    facts = _get_prose_facts_collection(name)
+    drift: list[dict] = []
+    docs_scanned = 0
+    for chunk_text, source_relpath in iterate_indexed_docs(name):
+        docs_scanned += 1
+        for dt in extract_facts_from_doc(chunk_text, source_relpath, project=name):
+            chain_key = f"{dt.subject}|{dt.predicate}"
+            cur = _current_row_for_chain(facts, chain_key)
+            if cur is None or cur["object"] == dt.object:
+                continue
+            drift.append(
+                {
+                    "subject": dt.subject,
+                    "predicate": dt.predicate,
+                    "doc": {"object": dt.object, "source": source_relpath},
+                    "chat": {
+                        "object": cur["object"],
+                        "session_id": cur.get("source_id", "?"),
+                    },
+                    "chat_history_versions": int(cur.get("version", 1)),
+                }
+            )
+    drift.sort(key=lambda d: (d["subject"], d["predicate"]))
+    facts_scanned = len(facts.get(where={"is_current": True}).get("ids") or [])
+    return {
+        "drift": drift,
+        "facts_scanned": facts_scanned,
+        "facts_scanned_docs": docs_scanned,
+        "project": name,
+    }
+
+
 def _voyage_embed(text: str) -> list[float]:
     vo = get_voyage_client()
     result = vo.embed([text], model=SESSIONS_MODEL, input_type="document")
