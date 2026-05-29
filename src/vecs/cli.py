@@ -87,8 +87,6 @@ def prose_drift_cmd(project: str, limit: int):
     extracted from indexed docs against the current state extracted from chat
     sessions. v1 detects exact (subject, predicate) object-collisions only.
     """
-    import sys
-
     from vecs.config import load_config
     from vecs.prose_drift import _preflight_global, _preflight_project
 
@@ -97,7 +95,7 @@ def prose_drift_cmd(project: str, limit: int):
     g = _preflight_global(config)
     if not g.ok:
         if g.code == "anthropic_unavailable":
-            click.echo(f"anthropic not installed: pip install anthropic", err=True)
+            click.echo("anthropic not installed: pip install anthropic", err=True)
         else:
             click.echo("ANTHROPIC_API_KEY not set", err=True)
         raise SystemExit(3)
