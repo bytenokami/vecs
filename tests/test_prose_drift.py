@@ -420,6 +420,41 @@ def test_extraction_prompt_has_canonicalization_guidance():
     assert "Example" in p
 
 
+# ----- Task 3: doc-side extraction + dual-table cache -------------------
+
+
+def test_extract_facts_from_doc_returns_triples(fake_anthropic):
+    fake_anthropic["state"]["response_text"] = (
+        '[{"subject":"team","predicate":"has_role","object":"no backend developer"}]'
+    )
+    out = prose_drift.extract_facts_from_doc("Our team has no backend developer.", "team.md")
+    assert len(out) == 1
+    assert out[0] == prose_drift.Triple("team", "has_role", "no backend developer")
+
+
+def test_doc_extract_writes_both_tables_with_matching_sha(fake_anthropic):
+    import sqlite3
+    prose_drift.extract_facts_from_doc("Our team has no backend developer.", "team.md")
+    db = prose_drift._cache_path("default")
+    conn = sqlite3.connect(str(db))
+    doc_sha = conn.execute("SELECT sha256 FROM doc_facts").fetchone()[0]
+    ext_sha = conn.execute("SELECT text_sha FROM extraction_cache").fetchone()[0]
+    conn.close()
+    assert doc_sha == ext_sha
+
+
+def test_doc_extract_cache_hit_skips_anthropic(fake_anthropic):
+    prose_drift.extract_facts_from_doc("same text", "team.md")
+    prose_drift.extract_facts_from_doc("same text", "team.md")
+    assert len(fake_anthropic["calls"]) == 1
+
+
+def test_doc_extract_cache_miss_on_text_change(fake_anthropic):
+    prose_drift.extract_facts_from_doc("text A", "team.md")
+    prose_drift.extract_facts_from_doc("text B", "team.md")
+    assert len(fake_anthropic["calls"]) == 2
+
+
 # ----- integration: real Anthropic call (gated) -------------------------
 
 

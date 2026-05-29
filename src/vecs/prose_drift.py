@@ -59,6 +59,22 @@ Messages:
 
 Return ONLY the JSON array, no prose."""
 
+DOC_EXTRACTION_PROMPT = """Extract structured factual claims from the documentation text below as a JSON array of objects.
+
+Each object: {{"subject": <str>, "predicate": <str>, "object": <str>}}.
+
+Canonicalization rules (critical — drift detection joins on exact (subject, predicate)):
+- subject and predicate are SHORT, lowercase, snake_case canonical strings.
+- Collapse synonyms to ONE canonical predicate. Prefer these when they fit:
+  has_role, headcount, status, owns, uses, decision, deadline, location, name.
+- Map paraphrases to the same (subject, predicate) as the equivalent chat claim would.
+- object may be a natural-language phrase. Only extract asserted facts. If none, return [].
+
+Text:
+{text}
+
+Return ONLY the JSON array, no prose."""
+
 
 @dataclass(frozen=True)
 class Triple:
@@ -179,6 +195,60 @@ def extract_facts(messages: list[dict], project: str) -> list[Triple]:
         return [Triple(**t) for t in parsed]
     finally:
         conn.close()
+
+
+def extract_facts_from_doc(
+    text: str, source_relpath: str, project: str = "default"
+) -> list[Triple]:
+    """Query-time doc-side extraction. Caches in extraction_cache + doc_facts.
+
+    Doc text is hashed raw (no canonicalization — no role/timestamp metadata).
+    doc_facts.sha256 == extraction_cache.text_sha by construction.
+    Never writes Chroma; v1 doc triples are compared in-memory only.
+    """
+    text_sha = _sha256(text)
+    conn = _init_cache(project)
+    try:
+        row = conn.execute(
+            "SELECT triples_json FROM extraction_cache "
+            "WHERE text_sha=? AND model=? AND prompt_version=?",
+            (text_sha, PROSE_EXTRACTION_MODEL, EXTRACTION_PROMPT_VERSION),
+        ).fetchone()
+        if row is not None:
+            triples = [Triple(**t) for t in json.loads(row[0])]
+            _ensure_doc_facts_row(conn, source_relpath, text_sha, row[0])
+            conn.commit()
+            return triples
+
+        import anthropic
+
+        client = anthropic.Anthropic()
+        prompt = DOC_EXTRACTION_PROMPT.format(text=text)
+        # NOTE: no `temperature` kwarg. claude-opus-4-7 rejects it (400).
+        resp = client.messages.create(
+            model=PROSE_EXTRACTION_MODEL,
+            max_tokens=2048,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = resp.content[0].text
+        parsed: list[dict[str, Any]] = json.loads(_strip_fence(raw))
+        triples_json = json.dumps(parsed)
+        conn.execute(
+            "INSERT OR REPLACE INTO extraction_cache VALUES (?, ?, ?, ?)",
+            (text_sha, PROSE_EXTRACTION_MODEL, EXTRACTION_PROMPT_VERSION, triples_json),
+        )
+        _ensure_doc_facts_row(conn, source_relpath, text_sha, triples_json)
+        conn.commit()
+        return [Triple(**t) for t in parsed]
+    finally:
+        conn.close()
+
+
+def _ensure_doc_facts_row(conn, source_relpath: str, sha256: str, triples_json: str) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO doc_facts VALUES (?, ?, ?)",
+        (source_relpath, sha256, triples_json),
+    )
 
 
 def _get_prose_facts_collection(project: str):
