@@ -630,6 +630,33 @@ def test_preflight_project_ok_when_enabled():
     assert r.ok is True
 
 
+# ----- Task 11: BE-dev contradiction end-to-end (mocked Anthropic) ------
+
+
+def test_be_dev_contradiction_surfaces(fake_anthropic, fake_voyage):
+    """Canonical scenario: doc says 'no backend developer', chat says 'Sasha is BE dev'."""
+    project = "vecs-bedev"
+    # Session-side current fact (as the indexer would have written it).
+    prose_drift.add_fact_with_state_machine(
+        prose_drift.Triple("team", "has_role", "sasha is backend engineer"),
+        "be_dev_announce", project,
+    )
+    # Doc-side extraction returns the contradicting fact.
+    fake_anthropic["state"]["response_text"] = (
+        '[{"subject":"team","predicate":"has_role","object":"no backend developer"}]'
+    )
+    _seed_doc(project, "The team has no backend developer.", "team.md")
+
+    report = prose_drift.find_prose_drift(_Proj(project))
+    assert len(report["drift"]) == 1
+    d = report["drift"][0]
+    assert d["subject"] == "team" and d["predicate"] == "has_role"
+    assert d["doc"]["object"] == "no backend developer"
+    assert d["chat"]["object"] == "sasha is backend engineer"
+    assert d["chat"]["session_id"] == "be_dev_announce"
+    assert d["chat_history_versions"] >= 1
+
+
 # ----- integration: real Anthropic call (gated) -------------------------
 
 
