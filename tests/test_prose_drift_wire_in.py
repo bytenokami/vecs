@@ -216,3 +216,90 @@ def test_mcp_named_disabled_is_error_dict(monkeypatch, fake_anthropic):
     _cfg_with(monkeypatch, {"vecs": _disabled("vecs")})
     from vecs.mcp_server import prose_drift
     assert prose_drift(project="vecs") == {"error": "prose_drift_disabled", "detail": "vecs"}
+
+
+# ---------------------------------------------------------------------------
+# Task 10: Indexer wire-in (prose-drift facet block)
+# ---------------------------------------------------------------------------
+
+import vecs.indexer as indexer
+
+
+class _FakeColl:
+    def __init__(self):
+        self.added = []
+    def get_or_create_collection(self, *a, **k):
+        return self
+    def add(self, **k):
+        self.added.append(k)
+    def get(self, **k):
+        return {"ids": [], "metadatas": []}
+
+
+def _prep_indexer(monkeypatch, tmp_path, enabled):
+    # Pin the session pipeline's external deps to no-ops.
+    monkeypatch.setattr(indexer, "_get_session_new_content",
+                        lambda f, m: ("raw-content", 10, True))
+    monkeypatch.setattr(indexer, "chunk_session",
+                        lambda msgs, sid, n, overlap: [
+                            {"text": "[user]: x", "metadata": {"chunk_index": 0}}])
+    monkeypatch.setattr(indexer, "_make_chunk_id", lambda a, b: f"{a}#{b}")
+    monkeypatch.setattr(indexer, "_embed_and_store", lambda chunks, c, m, vo: {ch["id"] for ch in chunks})
+    monkeypatch.setattr(indexer, "_track_embed_success",
+                        lambda ids, c2f, fec, fc, coll: set(c2f.values()))
+    monkeypatch.setattr(indexer, "_sync_bm25", lambda *a, **k: None)
+    logs = []
+    monkeypatch.setattr(indexer, "_log", lambda m: logs.append(m))
+
+    class _Manifest:
+        def __init__(self, *a): pass
+        def mark_session_indexed(self, *a, **k): pass
+        def save(self): pass
+        def get_session_info(self, f): return None
+    monkeypatch.setattr(indexer, "Manifest", _Manifest)
+
+    sm_calls = []
+    import vecs.prose_drift as pd
+    monkeypatch.setattr(pd, "extract_facts", lambda msgs, project: [pd.Triple("team", "has_role", "x")])
+    monkeypatch.setattr(pd, "add_fact_with_state_machine",
+                        lambda t, source_id, project: sm_calls.append((t, source_id, project)) or "INSERT")
+
+    proj = ProjectConfig(name="vecs", prose_drift_enabled=enabled)
+    return proj, sm_calls, logs
+
+
+def test_state_machine_runs_when_enabled(monkeypatch, tmp_path):
+    proj, sm_calls, _ = _prep_indexer(monkeypatch, tmp_path, enabled=True)
+    f = tmp_path / "be_dev_announce.jsonl"
+    f.write_text("{}")
+    indexer._index_session_files(
+        proj, [f], lambda content: [{"role": "user", "text": "we hired Sasha", "timestamp": "0"}],
+        "claude_code", vo=object(), db=_FakeColl(), log_label="s",
+    )
+    assert len(sm_calls) == 1
+    assert sm_calls[0][1] == "be_dev_announce"  # source_id == file stem
+    assert sm_calls[0][2] == "vecs"
+
+
+def test_state_machine_skipped_when_disabled(monkeypatch, tmp_path):
+    proj, sm_calls, _ = _prep_indexer(monkeypatch, tmp_path, enabled=False)
+    f = tmp_path / "s.jsonl"; f.write_text("{}")
+    indexer._index_session_files(
+        proj, [f], lambda content: [{"role": "user", "text": "x", "timestamp": "0"}],
+        "claude_code", vo=object(), db=_FakeColl(), log_label="s",
+    )
+    assert sm_calls == []
+
+
+def test_extract_failure_does_not_abort_indexer(monkeypatch, tmp_path):
+    proj, sm_calls, logs = _prep_indexer(monkeypatch, tmp_path, enabled=True)
+    import vecs.prose_drift as pd
+    monkeypatch.setattr(pd, "extract_facts",
+                        lambda msgs, project: (_ for _ in ()).throw(RuntimeError("boom")))
+    f = tmp_path / "s.jsonl"; f.write_text("{}")
+    # Must NOT raise.
+    indexer._index_session_files(
+        proj, [f], lambda content: [{"role": "user", "text": "x", "timestamp": "0"}],
+        "claude_code", vo=object(), db=_FakeColl(), log_label="s",
+    )
+    assert any("prose extract failed" in m for m in logs)

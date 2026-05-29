@@ -901,6 +901,7 @@ def _index_session_files(
     file_session_meta: dict[Path, tuple[int, int, bool]] = {}
 
     indexed_count = 0
+    file_messages: dict[Path, list[dict]] = {}
     for f in files:
         content, new_offset, is_full = _get_session_new_content(f, manifest)
         if not content:
@@ -910,6 +911,7 @@ def _index_session_files(
         session_id = f.stem
 
         messages = parser_fn(content)
+        file_messages[f] = messages
         if not messages:
             # Mark indexed anyway so byte_offset advances; otherwise we re-read
             # the same uninteresting bytes every run.
@@ -962,6 +964,42 @@ def _index_session_files(
             manifest.mark_session_indexed(f, byte_offset=new_offset, chunk_count=total_chunk_count)
 
     manifest.save()
+
+    if project.prose_drift_enabled:
+        try:
+            from vecs.prose_drift import add_fact_with_state_machine, extract_facts
+            for f in fully_succeeded:
+                session_id = f.stem
+                messages = file_messages.get(f)
+                if not messages:
+                    continue
+                user_messages = [m for m in messages if m.get("role") == "user"]
+                if not user_messages:
+                    continue
+                try:
+                    triples = extract_facts(user_messages, project.name)
+                except Exception as e:
+                    _log(f"[{project.name}] prose extract failed for {f.name}: {e}")
+                    continue
+                if not triples:
+                    _log(f"[{project.name}] prose-drift {f.name}: triples=0")
+                    continue
+                counts = {"INSERT": 0, "NOOP": 0, "SUPERSEDE": 0}
+                for t in triples:
+                    try:
+                        event = add_fact_with_state_machine(
+                            t, source_id=session_id, project=project.name,
+                        )
+                        counts[event] = counts.get(event, 0) + 1
+                    except Exception as e:
+                        _log(f"[{project.name}] prose state-machine failed for {f.name} triple {t}: {e}")
+                        continue
+                _log(
+                    f"[{project.name}] prose-drift {f.name}: "
+                    f"INSERT={counts['INSERT']} NOOP={counts['NOOP']} SUPERSEDE={counts['SUPERSEDE']}"
+                )
+        except ImportError as e:
+            _log(f"[{project.name}] anthropic not installed; skipping prose-drift facet: {e}")
 
     if len(succeeded_ids) > 0:
         _sync_bm25(collection, project.name, "sessions")
