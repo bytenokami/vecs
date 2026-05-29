@@ -77,6 +77,71 @@ def status(project: str | None):
     click.echo(f"Tracked files:        {s.get('manifest_entries', 0)}")
 
 
+@main.command("prose-drift")
+@click.option("--project", "-p", required=True, help="Project to scan for prose drift.")
+@click.option("--limit", default=50, help="Max drift lines to print (default 50).")
+def prose_drift_cmd(project: str, limit: int):
+    """Recrawl indexed docs and report contradictions vs current chat facts.
+
+    On-demand recrawl (not write-time): compares (subject, predicate) facts
+    extracted from indexed docs against the current state extracted from chat
+    sessions. v1 detects exact (subject, predicate) object-collisions only.
+    """
+    import sys
+
+    from vecs.config import load_config
+    from vecs.prose_drift import _preflight_global, _preflight_project
+
+    config = load_config()
+
+    g = _preflight_global(config)
+    if not g.ok:
+        if g.code == "anthropic_unavailable":
+            click.echo(f"anthropic not installed: pip install anthropic", err=True)
+        else:
+            click.echo("ANTHROPIC_API_KEY not set", err=True)
+        raise SystemExit(3)
+
+    p = _preflight_project(config, project)
+    if not p.ok:
+        if p.code == "project_unknown":
+            click.echo(f"unknown project: {project}", err=True)
+        else:
+            click.echo(f"prose drift not enabled for project {project}", err=True)
+        raise SystemExit(2)
+
+    from vecs.prose_drift import find_prose_drift
+
+    report = find_prose_drift(config.projects[project])
+
+    if report["facts_scanned"] == 0:
+        click.echo(f"no chat sessions for project {project}")
+        raise SystemExit(0)
+
+    drift = report["drift"]
+    if not drift:
+        click.echo("no prose drift")
+        raise SystemExit(0)
+
+    total = len(drift)
+    shown = drift[:limit]
+    for d in shown:
+        click.echo(
+            f"{d['subject']} | {d['predicate']} | "
+            f"doc=\"{d['doc']['object']}\" @ {project}/{d['doc']['source']} "
+            f"≠ chat=\"{d['chat']['object']}\" @ session={d['chat']['session_id']} "
+            f"(chat_history_versions={d['chat_history_versions']})"
+        )
+    if total > limit:
+        click.echo(f"drift truncated: showing {limit} of {total}", err=True)
+    click.echo(
+        "note: v1 detects exact (subject,predicate) object-collisions only; "
+        "omission/temporal/cross-predicate drift is out of scope (see v2-roadmap).",
+        err=True,
+    )
+    raise SystemExit(1)
+
+
 @main.command()
 @click.option("--project", "-p", required=True, help="Project to add the doc to.")
 @click.option("--title", "-t", required=True, help="Document title (used as filename).")
