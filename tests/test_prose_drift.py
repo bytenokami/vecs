@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from vecs import prose_drift
+from vecs.config import ProjectConfig
 from vecs.prose_drift import (
     EVENT_INSERT,
     EVENT_NOOP,
@@ -582,6 +583,51 @@ def test_cross_predicate_paraphrase_drift_is_detected(fake_anthropic, fake_voyag
     # v1 will report ZERO drift here (the hole). xfail(strict) asserts this fails today
     # and turns RED the day v2 closes the gap — forcing this test to be promoted.
     assert len(report["drift"]) == 1
+
+
+# ----- Task 7: preflight + exception hierarchy --------------------------
+
+
+class _Cfg:
+    def __init__(self, projects):
+        self.projects = projects
+
+
+def test_preflight_global_ok_when_key_set_and_anthropic_importable(monkeypatch, fake_anthropic):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    r = prose_drift._preflight_global(_Cfg({}))
+    assert r.ok is True
+
+
+def test_preflight_global_err_key_missing(monkeypatch, fake_anthropic):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    r = prose_drift._preflight_global(_Cfg({}))
+    assert r.ok is False and r.code == "anthropic_key_missing"
+
+
+def test_preflight_global_err_anthropic_unavailable(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setattr(prose_drift, "_anthropic_importable", lambda: (False, "no module named anthropic"))
+    r = prose_drift._preflight_global(_Cfg({}))
+    assert r.ok is False and r.code == "anthropic_unavailable"
+    assert r.detail
+
+
+def test_preflight_project_err_unknown():
+    r = prose_drift._preflight_project(_Cfg({}), "ghost")
+    assert r.ok is False and r.code == "project_unknown" and r.detail == "ghost"
+
+
+def test_preflight_project_err_disabled():
+    p = ProjectConfig(name="vecs")  # prose_drift_enabled defaults False
+    r = prose_drift._preflight_project(_Cfg({"vecs": p}), "vecs")
+    assert r.ok is False and r.code == "prose_drift_disabled"
+
+
+def test_preflight_project_ok_when_enabled():
+    p = ProjectConfig(name="vecs", prose_drift_enabled=True)
+    r = prose_drift._preflight_project(_Cfg({"vecs": p}), "vecs")
+    assert r.ok is True
 
 
 # ----- integration: real Anthropic call (gated) -------------------------

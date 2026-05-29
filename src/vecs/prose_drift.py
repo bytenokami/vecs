@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import time
 import uuid
@@ -81,6 +82,56 @@ class Triple:
     subject: str
     predicate: str
     object: str
+
+
+class ProseDriftError(Exception):
+    """Base for prose-drift errors."""
+
+
+class AnthropicUnavailable(ProseDriftError):
+    pass
+
+
+class AnthropicKeyMissing(ProseDriftError):
+    pass
+
+
+class ProseDriftDisabled(ProseDriftError):
+    pass
+
+
+@dataclass(frozen=True)
+class PreflightResult:
+    ok: bool
+    code: str | None = None
+    detail: str | None = None
+
+
+def _anthropic_importable() -> tuple[bool, str]:
+    try:
+        import anthropic  # noqa: F401
+        return (True, "")
+    except Exception as e:  # ImportError or transitive failure
+        return (False, str(e))
+
+
+def _preflight_global(config) -> PreflightResult:
+    """Invariants that apply to ANY prose-drift invocation."""
+    importable, err = _anthropic_importable()
+    if not importable:
+        return PreflightResult(False, "anthropic_unavailable", err)
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return PreflightResult(False, "anthropic_key_missing")
+    return PreflightResult(True)
+
+
+def _preflight_project(config, project_name: str) -> PreflightResult:
+    """Invariants specific to one project."""
+    if project_name not in config.projects:
+        return PreflightResult(False, "project_unknown", project_name)
+    if not config.projects[project_name].prose_drift_enabled:
+        return PreflightResult(False, "prose_drift_disabled", project_name)
+    return PreflightResult(True)
 
 
 def _cache_dir() -> Path:
