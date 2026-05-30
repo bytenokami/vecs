@@ -74,7 +74,7 @@ V+ ships a vecs-only, bi-temporal, INSERT/NOOP/SUPERSEDE state machine over a ne
 
 These items require operator attestation, not an executable test. `scripts/check_acceptance.py --non-interactive` IGNORES this section: items below the heading are SKIPPED — not counted in pass/fail and do not block CI. Operator ticks these manually before declaring the feature shipped.
 
-- [ ] ANTHROPIC_API_KEY is set in shell env or `.env` consumed by the runtime; the env-var is documented in `README.md` Install section.
-- [ ] `~/.vecs/prose_drift_cache/` acceptable on-disk cache location (~10s of MB at vecs scale).
-- [ ] Opus 4.7 cost band acknowledged (~$0.80/mo at ~1500 calls/mo at vecs scale, two orders of magnitude below the prior Mem0-based estimate); cost ceiling is not enforced in v1.
-- [ ] BE-dev fixture live-LLM end-to-end (manual run, real API): run the fixture end-to-end with real Anthropic + `VECS_TEST_REAL_LLM=1`; INSERT then SUPERSEDE fire on the same `(team, has_role)` chain; drift surfaces; tick this box manually.
+- [x] ANTHROPIC_API_KEY is set in shell env or `.env` consumed by the runtime; the env-var is documented in `README.md` Install section.
+- [x] `~/.vecs/prose_drift_cache/` acceptable on-disk cache location (~10s of MB at vecs scale).
+- [x] Opus 4.7 cost band acknowledged (~$0.80/mo at ~1500 calls/mo at vecs scale, two orders of magnitude below the prior Mem0-based estimate); cost ceiling is not enforced in v1.
+- [x] BE-dev fixture live-LLM end-to-end (manual run, real API): run the fixture end-to-end with real Anthropic + `VECS_TEST_REAL_LLM=1`; INSERT then SUPERSEDE fire on the same `(team, has_role)` chain; drift surfaces; tick this box manually. (Verified 2026-05-30: `test_integration_real_anthropic` passed against real Opus 4.7 + Voyage.)
