@@ -51,6 +51,7 @@ class ProjectConfig:
     # under one of these is routed to this project. Bypasses bidirectional
     # containment matching against code_dirs.
     codex_cwds: list[Path] = field(default_factory=list)
+    prose_drift_enabled: bool = False
 
     @property
     def code_collection(self) -> str:
@@ -63,6 +64,10 @@ class ProjectConfig:
     @property
     def docs_collection(self) -> str:
         return f"{self.name}-docs"
+
+    @property
+    def prose_facts_collection(self) -> str:
+        return f"{self.name}-prose-facts"
 
 
 @dataclass
@@ -220,6 +225,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> VecsConfig:
             sessions_dirs=sessions_dirs,
             docs_dir=Path(proj["docs_dir"]) if proj.get("docs_dir") else None,
             codex_cwds=codex_cwds,
+            prose_drift_enabled=bool(proj.get("prose_drift_enabled", False)),
         )
 
     # Top-level Codex settings (all optional, sensible defaults).
