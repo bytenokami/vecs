@@ -70,6 +70,34 @@ V+ ships a vecs-only, bi-temporal, INSERT/NOOP/SUPERSEDE state machine over a ne
 - [x] **Phase 7 dry-run Chroma bool-where verification** (Fix 1 / BLOCKER 1): during the dry-run, after seeding two rows for a chain (one with `is_current=True`, one with `is_current=False`), `collection.get(where={"is_current": True})["ids"]` returns exactly 1 id and `collection.get(where={"is_current": False})["ids"]` returns exactly 1 id. If Chroma rejects bool literals (some versions normalize to int), the dry-run FAILS and the row schema is revised pre-implementation (rename to `is_current_int: 0|1` with `0=False`, `1=True`, and update the where-clause accordingly). Field name + values are pinned post-dry-run.
 - [x] **Phase 7 dry-run Chroma multi-key where verification**: state-machine lookup `collection.get(where={"chain_key": k, "is_current": True})` (two keys) is asserted against BOTH the flat dict form and the `{"$and": [...]}` wrapped form. Whichever Chroma accepts in the pinned version is the canonical lookup syntax in `src/vecs/prose_drift.py`; the other is removed. If Chroma rejects both forms, the dry-run FAILS.
 
+## stage-2 recall — cross-predicate / paraphrase
+
+Source: `docs/features/prose-staleness-detector/stage2-recall-design.md`. Closes the v1 exact-`chain_key` boundary via an embedding-similarity fallback + ONE Opus contradiction-judge on MISS. Top-1 candidate, always-on, bounded by similarity threshold + verdict cache.
+
+- [x] `_cosine(a, b)` returns standard cosine similarity; a zero-norm vector yields `0.0` (no `ZeroDivisionError`). Unit-tested at identical/orthogonal/opposite/zero reference points.
+- [x] `_load_current_rows(collection)` returns `[(meta, embedding)]` for every `is_current=True` fact, loaded once per scan, deduped to the max-version row per `chain_key`, read-only (does not flip a transient duplicate `is_current` row).
+- [x] `_best_semantic_candidate(doc_emb, rows)` returns the highest-cosine `(meta, sim)`; `None` when `rows` is empty. Threshold gating is the caller's responsibility.
+- [x] On a `chain_key` MISS, `find_prose_drift` embeds the doc triple, takes the single best `is_current` candidate, and escalates to the judge only when `sim >= STAGE2_SIM_THRESHOLD` (0.85). Below threshold → no judge call, no drift.
+- [x] Judge model id is exactly `claude-opus-4-7` (module constant `PROSE_JUDGE_MODEL`); judge calls pass no `temperature`. Judge returns `{contradicts, confidence, reason}`; fence-tolerant parse.
+- [x] Judge verdicts cached in `judge_cache(doc_triple_json, chat_triple_json, model, prompt_version, verdict_json)`; a repeat scan with no new facts/docs makes zero new anthropic calls (rerun-determinism preserved).
+- [x] A semantic finding emits a drift entry with `match_type="semantic"`, `similarity`, `confidence`, and a `chat` block carrying the chat-side `subject`/`predicate`/`object`/`session_id` (which differ from the doc-side `subject`/`predicate`). Exact findings gain `match_type="exact"` and keep their v1 shape.
+- [x] Judge says NOT a contradiction (above threshold) → no drift entry.
+- [x] A single judge call error (API or unparseable) is caught: that candidate is skipped, the scan continues, and `report["stage2_judge_errors"]` counts it. `report["stage2_judge_calls"]` counts judge invocations.
+- [x] The cross-predicate scenario (chat `team|employs:sasha` vs doc `team|has_role:"no backend developer"`) now surfaces exactly one semantic drift — `test_cross_predicate_paraphrase_drift_is_detected` is promoted from `xfail(strict)` to a passing test.
+- [x] CLI prints semantic lines with both predicates and a `[semantic sim=.. conf=..]` tag; the trailing note states cross-predicate/paraphrase is now partially covered while omission and soft/temporal contradictions remain out of scope.
+- [x] All pre-existing prose-drift tests stay green (exact path unchanged in behaviour).
+
+### stage-2 review hardening (Phase-4)
+
+- [x] `stage2_judge_calls` counts actual judge API calls (a `judge_cache` hit does not increment it); a rescan with no new facts/docs reports `stage2_judge_calls == 0`, makes zero new anthropic calls, and returns identical drift.
+- [x] The doc-triple embedding is cached (`embed_cache`); a rescan makes zero new Voyage calls for the same triple.
+- [x] Similarity threshold is inclusive at 0.85 (just-above escalates, just-below does not) — pinned by near-boundary tests.
+- [x] Two MISS triples in one scan accumulate counters correctly; a judge error on one does not abort the scan or suppress the other's drift.
+- [x] Judge `confidence` is clamped to [0.0, 1.0]; a non-numeric confidence is counted as a judge error (never a false-positive drift). Confidence is advisory — `contradicts` is the gate.
+- [x] `_best_semantic_candidate` breaks cosine ties deterministically (smallest `chain_key`).
+- [x] Only parse-family errors are swallowed as a skipped candidate; a fatal anthropic error propagates (aborts the scan). The CLI surfaces a nonzero `stage2_judge_errors` on stderr.
+- [x] The semantic CLI line renders the chat-side `subject|predicate` (cross-subject pairings are not hidden). The MCP `prose_drift` docstring describes both stages + the additive fields/keys.
+
 ## Operator sign-off (out-of-band; not gated by `--non-interactive`)
 
 These items require operator attestation, not an executable test. `scripts/check_acceptance.py --non-interactive` IGNORES this section: items below the heading are SKIPPED — not counted in pass/fail and do not block CI. Operator ticks these manually before declaring the feature shipped.

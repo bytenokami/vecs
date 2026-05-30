@@ -192,7 +192,15 @@ def prose_drift(project: str | None = None) -> dict:
     On-demand recrawl. With project=None, scans every project where
     prose_drift_enabled is true and returns a dict keyed by project name
     ({} if none enabled). With a named project, returns that project's payload.
-    Detects exact (subject, predicate) object-collisions only (v1).
+
+    Two detection stages: (1) exact — same (subject, predicate) chain, differing
+    object; (2) semantic — on a chain_key miss, the most similar current fact above a
+    threshold is escalated to one contradiction-judge, catching cross-predicate /
+    paraphrase drift. Each drift entry carries match_type ("exact" | "semantic"); a
+    semantic entry adds similarity + confidence and a chat block with the chat-side
+    subject/predicate/object/session_id. The payload also includes facts_scanned,
+    facts_scanned_docs, stage2_judge_calls, and stage2_judge_errors. Still out of
+    scope: omission and soft/temporal "used to have" contradictions.
 
     Args:
         project: Project name, or None to scan all enabled projects.

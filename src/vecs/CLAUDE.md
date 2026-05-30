@@ -52,7 +52,7 @@ Platform direction (search → agent memory; knowledge shapes & bundles): `docs/
 
 ## prose-drift v1 boundary
 
-`vecs prose-drift` / `mcp__vecs__prose_drift` is an on-demand recrawl, not a write-time detector. v1 reports only exact `(subject, predicate)` object-collisions between indexed docs and current chat facts. Out of scope (v2 — see `docs/features/prose-staleness-detector/v2-roadmap.md`): cross-predicate/paraphrase contradictions (needs the embedding-similarity + LLM contradiction judge), omission (doc silent on a now-true fact), and soft/temporal "used to have" contradictions.
+`vecs prose-drift` / `mcp__vecs__prose_drift` is an on-demand recrawl, not a write-time detector. It reports two kinds of contradiction between indexed docs and current chat facts: (1) **exact** — same `(subject, predicate)` chain, differing object; (2) **semantic** (stage-2) — on a `chain_key` MISS, the most cosine-similar current fact above `STAGE2_SIM_THRESHOLD` is escalated to ONE Opus contradiction-judge, catching cross-predicate/paraphrase drift (`match_type` distinguishes them; see `docs/features/prose-staleness-detector/stage2-recall-design.md`). Still out of scope (v2 — see `v2-roadmap.md`): omission (doc silent on a now-true fact) and soft/temporal "used to have" contradictions.
 
 ## Staleness baseline
 

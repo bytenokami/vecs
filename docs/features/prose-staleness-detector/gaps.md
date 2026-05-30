@@ -62,3 +62,25 @@ Schema (per profile `feedback_artifact` row contract): `pass | finding-id | seve
 - Dry-run pass 2: reviewer verdict = ship.
 
 Total: 34 findings tracked; 33 `applied-in-design` or `applied-in-impl`; 1 `parked-v2`. Zero `wontfix`.
+
+## stage-2 recall — Phase-4 multi-agent review (2026-05-31)
+
+Reviewers: code-reviewer, adversarial critical-sinker, correctness-verifier, test-auditor. Confirmation pass after fixes: `VERDICT: approve`.
+
+| pass | finding-id | severity | summary | decision | follow-up-link |
+|---|---|---|---|---|---|
+| s2-1 | s2.embed-cost | HIGH | doc-triple embedding re-computed every scan (unbounded Voyage cost) | applied-in-impl | `embed_cache` + `_voyage_embed_cached` |
+| s2-1 | s2.error-swallow | HIGH | bare `except` masked fatal anthropic errors as clean scans | applied-in-impl | swallow parse-family only; fatal errors propagate |
+| s2-1 | s2.threshold-boundary | HIGH | no near-0.85 boundary test | applied-in-impl | just-above/just-below threshold tests |
+| s2-1 | s2.cost-metric | MEDIUM | `stage2_judge_calls` counted cache hits as API calls | applied-in-impl | `_judge_contradiction_ex` returns `api_called`; counted only on real call |
+| s2-1 | s2.rerun-untested | MEDIUM | rerun-determinism unverified at `find_prose_drift` level | applied-in-impl | `test_rescan_makes_no_new_anthropic_calls_and_is_deterministic` |
+| s2-1 | s2.error-silent | MEDIUM | `stage2_judge_errors` never surfaced to operator | applied-in-impl | CLI stderr summary when nonzero |
+| s2-1 | s2.confidence | MEDIUM | judge confidence unclamped / non-numeric crashes silently | applied-in-impl | `_clamp_unit` to [0,1]; non-numeric → counted error |
+| s2-1 | s2.tie | MEDIUM | cosine-tie candidate nondeterministic (breaks rescan stability) | applied-in-impl | smallest-`chain_key` tie-break + test |
+| s2-1 | s2.cross-subject | MEDIUM | semantic CLI line hid chat-side subject | applied-in-impl | render `chat[subject\|predicate]` |
+| s2-1 | s2.mcp-docstring | MEDIUM | MCP `prose_drift` docstring stale ("v1 exact only") | applied-in-impl | docstring describes both stages + new keys |
+| s2-1 | s2.multi-miss | MEDIUM | multi-MISS-per-scan accumulation untested | applied-in-impl | two-MISS test (1 contradiction, 1 error) |
+| s2-1 | s2.confidence-gate | LOW | confidence reported but not gated | wontfix (advisory) | boolean `contradicts` is the gate; calibrated band parked-v2 |
+| s2-1 | s2.embed-versioning | LOW | no-delete store: stale fact vectors if embedding model changes | parked-v2 | recorded in `stage2-recall-design.md` + `v2-roadmap.md` |
+
+stage-2 total: 13 findings — 11 `applied-in-impl`, 1 `wontfix` (advisory confidence), 1 `parked-v2`. Confirmation reviewer: `VERDICT: approve`, 316 tests pass.
