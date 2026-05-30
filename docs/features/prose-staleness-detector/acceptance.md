@@ -87,6 +87,17 @@ Source: `docs/features/prose-staleness-detector/stage2-recall-design.md`. Closes
 - [x] CLI prints semantic lines with both predicates and a `[semantic sim=.. conf=..]` tag; the trailing note states cross-predicate/paraphrase is now partially covered while omission and soft/temporal contradictions remain out of scope.
 - [x] All pre-existing prose-drift tests stay green (exact path unchanged in behaviour).
 
+### stage-2 review hardening (Phase-4)
+
+- [x] `stage2_judge_calls` counts actual judge API calls (a `judge_cache` hit does not increment it); a rescan with no new facts/docs reports `stage2_judge_calls == 0`, makes zero new anthropic calls, and returns identical drift.
+- [x] The doc-triple embedding is cached (`embed_cache`); a rescan makes zero new Voyage calls for the same triple.
+- [x] Similarity threshold is inclusive at 0.85 (just-above escalates, just-below does not) — pinned by near-boundary tests.
+- [x] Two MISS triples in one scan accumulate counters correctly; a judge error on one does not abort the scan or suppress the other's drift.
+- [x] Judge `confidence` is clamped to [0.0, 1.0]; a non-numeric confidence is counted as a judge error (never a false-positive drift). Confidence is advisory — `contradicts` is the gate.
+- [x] `_best_semantic_candidate` breaks cosine ties deterministically (smallest `chain_key`).
+- [x] Only parse-family errors are swallowed as a skipped candidate; a fatal anthropic error propagates (aborts the scan). The CLI surfaces a nonzero `stage2_judge_errors` on stderr.
+- [x] The semantic CLI line renders the chat-side `subject|predicate` (cross-subject pairings are not hidden). The MCP `prose_drift` docstring describes both stages + the additive fields/keys.
+
 ## Operator sign-off (out-of-band; not gated by `--non-interactive`)
 
 These items require operator attestation, not an executable test. `scripts/check_acceptance.py --non-interactive` IGNORES this section: items below the heading are SKIPPED — not counted in pass/fail and do not block CI. Operator ticks these manually before declaring the feature shipped.

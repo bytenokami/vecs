@@ -81,8 +81,14 @@ def fake_anthropic(monkeypatch):
             prompt = kwargs["messages"][0]["content"].lower()
             # Route by prompt: the contradiction-judge prompt is the only one that
             # mentions "contradict"; everything else is an extraction call.
-            text = state["judge_response"] if "contradict" in prompt else state["response_text"]
-            return _FakeResp(text)
+            if "contradict" in prompt:
+                # Per-call judge responses (FIFO) override the single default,
+                # letting one scan exercise multiple distinct verdicts.
+                queue = state.get("judge_responses")
+                if queue:
+                    return _FakeResp(queue.pop(0))
+                return _FakeResp(state["judge_response"])
+            return _FakeResp(state["response_text"])
 
     class _FakeClient:
         def __init__(self):
@@ -703,6 +709,166 @@ def test_exact_finding_tagged_match_type_exact(fake_anthropic, fake_voyage):
     assert d["match_type"] == "exact"
     assert d["chat"]["subject"] == "team" and d["chat"]["predicate"] == "has_role"
     assert report["stage2_judge_calls"] == 0
+
+
+# ----- stage-2 review-driven hardening -----------------------------------
+
+
+def _seed_paraphrase(fake_anthropic, project):
+    prose_drift.add_fact_with_state_machine(
+        prose_drift.Triple("team", "employs", "sasha"), "be_dev_announce", project,
+    )
+    fake_anthropic["state"]["response_text"] = (
+        '[{"subject":"team","predicate":"has_role","object":"no backend developer"}]'
+    )
+    fake_anthropic["state"]["judge_response"] = (
+        '{"contradicts": true, "confidence": 0.88, "reason": "contradiction"}'
+    )
+    _seed_doc(project, "Our team has no backend developer.", "team.md")
+
+
+def test_rescan_makes_no_new_anthropic_calls_and_is_deterministic(fake_anthropic, fake_voyage):
+    """Rerun-determinism at the scan level (acceptance line: repeat scan = zero new
+    anthropic calls). Judge + extraction caches make scan 2 free."""
+    project = "p_rescan"
+    _seed_paraphrase(fake_anthropic, project)
+
+    r1 = prose_drift.find_prose_drift(_Proj(project))
+    calls_after_1 = len(fake_anthropic["calls"])
+    judge_after_1 = len(_judge_calls(fake_anthropic))
+    voyage_after_1 = len(fake_voyage)
+    assert r1["stage2_judge_calls"] == 1
+
+    r2 = prose_drift.find_prose_drift(_Proj(project))
+    # No new anthropic calls of any kind on the second scan.
+    assert len(fake_anthropic["calls"]) == calls_after_1
+    assert len(_judge_calls(fake_anthropic)) == judge_after_1
+    # No new Voyage embeds either — the doc-triple embedding is cached.
+    assert len(fake_voyage) == voyage_after_1
+    # stage2_judge_calls counts ACTUAL api calls — a cached rescan makes zero.
+    assert r2["stage2_judge_calls"] == 0
+    # Drift is identical across runs.
+    assert r1["drift"] == r2["drift"]
+
+
+def test_stage2_threshold_is_inclusive_just_above(fake_anthropic, fake_voyage_textmap):
+    import math as _m
+    project = "p_thr_above"
+    fake_voyage_textmap["vectors"]["team employs sasha"] = [0.86, _m.sqrt(1 - 0.86**2), 0.0, 0.0]
+    fake_voyage_textmap["vectors"]["team has_role no backend developer"] = [1.0, 0.0, 0.0, 0.0]
+    _seed_paraphrase(fake_anthropic, project)
+    report = prose_drift.find_prose_drift(_Proj(project))
+    assert report["stage2_judge_calls"] == 1
+    assert len(report["drift"]) == 1
+    assert report["drift"][0]["similarity"] >= prose_drift.STAGE2_SIM_THRESHOLD
+
+
+def test_stage2_threshold_excludes_just_below(fake_anthropic, fake_voyage_textmap):
+    import math as _m
+    project = "p_thr_below"
+    fake_voyage_textmap["vectors"]["team employs sasha"] = [0.84, _m.sqrt(1 - 0.84**2), 0.0, 0.0]
+    fake_voyage_textmap["vectors"]["team has_role no backend developer"] = [1.0, 0.0, 0.0, 0.0]
+    _seed_paraphrase(fake_anthropic, project)
+    report = prose_drift.find_prose_drift(_Proj(project))
+    assert report["stage2_judge_calls"] == 0
+    assert report["drift"] == []
+
+
+def test_stage2_multiple_miss_triples_one_scan(fake_anthropic, fake_voyage):
+    """Two MISS triples in one scan: one judged contradiction, one judge error.
+    Counters accumulate; the error does not abort the scan."""
+    project = "p_multi"
+    prose_drift.add_fact_with_state_machine(
+        prose_drift.Triple("team", "employs", "sasha"), "s1", project,
+    )
+    prose_drift.add_fact_with_state_machine(
+        prose_drift.Triple("repo", "uses", "go"), "s2", project,
+    )
+    fake_anthropic["state"]["response_text"] = (
+        '[{"subject":"team","predicate":"has_role","object":"no backend developer"},'
+        '{"subject":"repo","predicate":"lang","object":"python"}]'
+    )
+    fake_anthropic["state"]["judge_responses"] = [
+        '{"contradicts": true, "confidence": 0.9, "reason": "yes"}',
+        "this is not json",
+    ]
+    _seed_doc(project, "doc text", "x.md")
+    report = prose_drift.find_prose_drift(_Proj(project))
+    assert report["stage2_judge_calls"] == 2  # both reached the API
+    assert report["stage2_judge_errors"] == 1
+    assert len(report["drift"]) == 1
+
+
+def test_best_semantic_candidate_tie_breaks_on_chain_key():
+    rows = [
+        ({"chain_key": "z|z", "object": "x"}, [1.0, 0.0, 0.0, 0.0]),
+        ({"chain_key": "a|a", "object": "y"}, [1.0, 0.0, 0.0, 0.0]),
+    ]
+    meta, sim = prose_drift._best_semantic_candidate([1.0, 0.0, 0.0, 0.0], rows)
+    assert sim == pytest.approx(1.0)
+    assert meta["chain_key"] == "a|a"  # deterministic: smallest chain_key wins ties
+
+
+def test_stage2_same_object_different_predicate_judge_rejects(fake_anthropic, fake_voyage):
+    """High similarity but the judge rules NOT a contradiction (same object, different
+    predicate) -> no drift. Proves the system relies on the judge, not similarity."""
+    project = "p_same_obj"
+    prose_drift.add_fact_with_state_machine(
+        prose_drift.Triple("team", "employs", "sasha"), "s", project,
+    )
+    fake_anthropic["state"]["response_text"] = (
+        '[{"subject":"team","predicate":"owns","object":"sasha"}]'
+    )
+    fake_anthropic["state"]["judge_response"] = (
+        '{"contradicts": false, "confidence": 0.2, "reason": "same person, not contradictory"}'
+    )
+    _seed_doc(project, "team owns sasha", "x.md")
+    report = prose_drift.find_prose_drift(_Proj(project))
+    assert report["drift"] == []
+    assert report["stage2_judge_calls"] == 1
+
+
+def test_judge_confidence_is_clamped_into_unit_interval(fake_anthropic, fake_voyage):
+    project = "p_clamp"
+    _seed_paraphrase(fake_anthropic, project)
+    fake_anthropic["state"]["judge_response"] = (
+        '{"contradicts": true, "confidence": 1.5, "reason": "overconfident"}'
+    )
+    report = prose_drift.find_prose_drift(_Proj(project))
+    assert len(report["drift"]) == 1
+    assert report["drift"][0]["confidence"] == 1.0
+
+
+def test_judge_non_numeric_confidence_counts_as_error_not_drift(fake_anthropic, fake_voyage):
+    project = "p_badconf"
+    _seed_paraphrase(fake_anthropic, project)
+    fake_anthropic["state"]["judge_response"] = (
+        '{"contradicts": true, "confidence": "high", "reason": "unparseable confidence"}'
+    )
+    report = prose_drift.find_prose_drift(_Proj(project))
+    assert report["drift"] == []
+    assert report["stage2_judge_errors"] == 1
+
+
+def test_prompt_routing_marker_is_stable():
+    """The test fake routes judge vs extraction on the 'contradict' substring; pin it."""
+    assert "contradict" in prose_drift.JUDGE_PROMPT.lower()
+    assert "contradict" not in prose_drift.EXTRACTION_PROMPT.lower()
+    assert "contradict" not in prose_drift.DOC_EXTRACTION_PROMPT.lower()
+
+
+def test_load_current_rows_roundtrips_real_embedding_for_cosine(fake_voyage):
+    """Exercise the real add -> Chroma -> _load_current_rows -> _cosine path so the
+    numpy/float round-trip is covered, not just python-float fakes."""
+    project = "p_roundtrip"
+    prose_drift.add_fact_with_state_machine(
+        prose_drift.Triple("k", "p", "v"), "s", project,
+    )
+    rows = prose_drift._load_current_rows(prose_drift._get_prose_facts_collection(project))
+    assert len(rows) == 1
+    emb = rows[0][1]
+    assert all(isinstance(float(x), float) for x in emb)
+    assert prose_drift._cosine(emb, emb) == pytest.approx(1.0)
 
 
 # ----- Task 7: preflight + exception hierarchy --------------------------

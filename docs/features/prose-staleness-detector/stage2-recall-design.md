@@ -94,6 +94,25 @@ Runner: `uv run pytest -q`. Live: `VECS_TEST_REAL_LLM=1 uv run pytest -k test_in
 - `tests/test_prose_drift.py` — fixtures + promoted xfail + new tests.
 - Docs: tick stage-2 in `v2-roadmap.md`; update the v1-boundary notes in `src/vecs/CLAUDE.md` and the `find_prose_drift` docstring.
 
+## Review hardening (2026-05-31, Phase-4 multi-agent review)
+
+Applied after the architect/critical-sinker/reviewer/correctness/test-auditor pass:
+
+- **`stage2_judge_calls` counts actual judge API calls, not escalations.** `_judge_contradiction_ex` returns `(verdict, api_called)`; a `judge_cache` hit returns `api_called=False`, so a cached rescan reports `stage2_judge_calls == 0`. A parse failure still counts as one call (the API was hit) + one error.
+- **Doc-triple embedding is cached** (`embed_cache` table, keyed by `sha256(text) + model`) via `_voyage_embed_cached`, so a rescan re-embeds nothing — the per-MISS Voyage cost is paid once, not every scan.
+- **Fatal vs per-candidate errors.** `find_prose_drift` swallows only parse-family errors (`JSONDecodeError`/`KeyError`/`ValueError`/`TypeError`/`IndexError`) as a counted, skipped candidate. A transient/fatal anthropic error (auth, rate-limit) propagates and aborts the scan rather than silently masking real contradictions as a clean result.
+- **`stage2_judge_errors` surfaced.** The CLI emits a stderr line when nonzero (`stage-2: N judge call(s), M errored and were skipped …`) so a missed contradiction is not invisible.
+- **Confidence is clamped to [0.0, 1.0]** on parse (`_clamp_unit`); a non-numeric confidence is a parse error (counted + skipped, never a false-positive drift). Confidence remains **advisory** — the boolean `contradicts` is the gate; calibrated drift-confidence is deferred (v2-roadmap).
+- **Deterministic cosine tie-break:** on equal similarity, `_best_semantic_candidate` prefers the lexicographically smallest `chain_key`, so rescans are stable.
+- **Cross-subject honesty:** stage-2 is subject-agnostic (the judge, not a subject match, gates the verdict), so the CLI semantic line renders the chat-side `subject|predicate`, not just the predicate.
+- **Stale MCP docstring** for `prose_drift` updated to describe both stages + the additive fields/keys.
+
+Added tests: scan-level rerun-determinism (zero new anthropic + zero new Voyage calls); threshold inclusivity just-above/just-below 0.85; two MISS triples in one scan (one contradiction, one judge error, scan continues); cosine-tie winner; same-object/different-predicate judged-not-contradiction; confidence clamp + non-numeric→error; prompt-routing marker guard; real embedding round-trip through `_load_current_rows`/`_cosine`; CLI chat-subject render + judge-error surfacing.
+
+## Known limitation (recorded)
+
+The judge runs cosine over historical `is_current` rows embedded with `SESSIONS_MODEL`. If that embedding model changes, stored fact vectors drift out of the query's space and similarity silently degrades. Mitigation: the model is pinned; re-embed the fact store on any model change. Tracked in `v2-roadmap.md`.
+
 ## Out of scope (deferred, unchanged)
 
 PSI drift-confidence calibration; SQLite fact-store migration; valid-time (Snodgrass second axis); extraction-model cost metering; top-k candidates; assistant-turn re-enablement. Each remains its own `v2-roadmap.md` entry.

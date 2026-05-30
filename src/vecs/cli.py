@@ -128,7 +128,8 @@ def prose_drift_cmd(project: str, limit: int):
             click.echo(
                 f"{d['subject']} | {d['predicate']} | "
                 f"doc=\"{d['doc']['object']}\" @ {project}/{d['doc']['source']} "
-                f"≠ chat[{d['chat']['predicate']}]=\"{d['chat']['object']}\" "
+                f"≠ chat[{d['chat']['subject']}|{d['chat']['predicate']}]="
+                f"\"{d['chat']['object']}\" "
                 f"@ session={d['chat']['session_id']} "
                 f"[semantic sim={d['similarity']:.2f} conf={d['confidence']:.2f}] "
                 f"(chat_history_versions={d['chat_history_versions']})"
@@ -142,6 +143,14 @@ def prose_drift_cmd(project: str, limit: int):
             )
     if total > limit:
         click.echo(f"drift truncated: showing {limit} of {total}", err=True)
+    judge_errors = report.get("stage2_judge_errors", 0)
+    if judge_errors:
+        judge_calls = report.get("stage2_judge_calls", 0)
+        click.echo(
+            f"stage-2: {judge_calls} judge call(s), {judge_errors} errored and "
+            "were skipped (possible missed contradictions)",
+            err=True,
+        )
     click.echo(
         "note: exact (subject,predicate) collisions + stage-2 semantic "
         "similarity-judge are covered; omission and soft/temporal contradictions "

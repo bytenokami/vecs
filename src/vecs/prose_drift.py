@@ -218,6 +218,16 @@ def _init_cache(project: str) -> sqlite3.Connection:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS embed_cache (
+            text_sha TEXT NOT NULL,
+            model TEXT NOT NULL,
+            embedding_json TEXT NOT NULL,
+            PRIMARY KEY (text_sha, model)
+        )
+        """
+    )
     conn.commit()
     return conn
 
@@ -439,17 +449,24 @@ def find_prose_drift(project) -> dict:
             # chain_key MISS -> stage-2 semantic fallback.
             if not current_rows:
                 continue
-            doc_emb = _voyage_embed(f"{dt.subject} {dt.predicate} {dt.object}")
+            doc_emb = _voyage_embed_cached(
+                f"{dt.subject} {dt.predicate} {dt.object}", name
+            )
             cand = _best_semantic_candidate(doc_emb, current_rows)
             if cand is None or cand[1] < STAGE2_SIM_THRESHOLD:
                 continue
             cand_meta, sim = cand
-            judge_calls += 1
+            # Only per-candidate parse failures are swallowed (counted + skipped);
+            # a fatal anthropic error (auth, rate-limit) propagates and aborts the scan
+            # rather than masking real contradictions as a clean result.
             try:
-                verdict = _judge_contradiction(dt, cand_meta, name)
-            except Exception:
+                verdict, api_called = _judge_contradiction_ex(dt, cand_meta, name)
+            except (json.JSONDecodeError, KeyError, ValueError, TypeError, IndexError):
+                judge_calls += 1  # an api call was made; it just failed to parse
                 judge_errors += 1
                 continue
+            if api_called:
+                judge_calls += 1
             if verdict.contradicts:
                 drift.append(
                     _semantic_drift_entry(
@@ -472,6 +489,29 @@ def _voyage_embed(text: str) -> list[float]:
     vo = get_voyage_client()
     result = vo.embed([text], model=SESSIONS_MODEL, input_type="document")
     return result.embeddings[0]
+
+
+def _voyage_embed_cached(text: str, project: str) -> list[float]:
+    """_voyage_embed with a per-project SQLite cache, so a doc-triple embedded on one
+    scan is not re-embedded (a Voyage call) on the next — keeps rescans cheap."""
+    text_sha = _sha256(text)
+    conn = _init_cache(project)
+    try:
+        row = conn.execute(
+            "SELECT embedding_json FROM embed_cache WHERE text_sha=? AND model=?",
+            (text_sha, SESSIONS_MODEL),
+        ).fetchone()
+        if row is not None:
+            return json.loads(row[0])
+        emb = list(_voyage_embed(text))
+        conn.execute(
+            "INSERT OR REPLACE INTO embed_cache VALUES (?, ?, ?)",
+            (text_sha, SESSIONS_MODEL, json.dumps(emb)),
+        )
+        conn.commit()
+        return emb
+    finally:
+        conn.close()
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
@@ -518,7 +558,11 @@ def _best_semantic_candidate(
     best: tuple[dict, float] | None = None
     for meta, emb in rows:
         sim = _cosine(doc_emb, emb)
-        if best is None or sim > best[1]:
+        if (
+            best is None
+            or sim > best[1]
+            or (sim == best[1] and meta.get("chain_key", "") < best[0].get("chain_key", ""))
+        ):
             best = (meta, sim)
     return best
 
@@ -528,11 +572,39 @@ def _triple_key(subject: str, predicate: str, object: str) -> str:
         {"subject": subject, "predicate": predicate, "object": object},
         sort_keys=True,
         separators=(",", ":"),
+        ensure_ascii=False,
     )
 
 
-def _judge_contradiction(doc_triple: Triple, chat_meta: dict, project: str) -> Verdict:
-    """Ask ONE Opus judge whether a doc triple contradicts a chat fact. Cached.
+def _clamp_unit(x) -> float:
+    """Coerce to float and clamp to [0.0, 1.0]. Raises ValueError on non-numeric."""
+    return max(0.0, min(1.0, float(x)))
+
+
+def _verdict_from_json(s: str) -> Verdict:
+    d = json.loads(s)
+    return Verdict(
+        contradicts=bool(d["contradicts"]),
+        confidence=_clamp_unit(d.get("confidence", 0.0)),
+        reason=str(d.get("reason", "")),
+    )
+
+
+def _parse_verdict(resp) -> Verdict:
+    if not resp.content:
+        raise ValueError("empty judge response")
+    return _verdict_from_json(_strip_fence(getattr(resp.content[0], "text", "")))
+
+
+def _judge_contradiction_ex(
+    doc_triple: Triple, chat_meta: dict, project: str
+) -> tuple[Verdict, bool]:
+    """Judge whether a doc triple contradicts a chat fact. Returns (verdict, api_called).
+
+    api_called is False on a judge_cache hit (no anthropic call, zero cost). A parse
+    failure (malformed/non-numeric verdict) RAISES so the caller counts it as both an
+    api call and an error; a transient/fatal anthropic error (auth, rate-limit) also
+    propagates and aborts the scan rather than being silently swallowed.
 
     chat_meta is a `<project>-prose-facts` row metadata dict; only its
     (subject, predicate, object) participate in the verdict + cache key.
@@ -551,7 +623,7 @@ def _judge_contradiction(doc_triple: Triple, chat_meta: dict, project: str) -> V
             (doc_key, chat_key, PROSE_JUDGE_MODEL, JUDGE_PROMPT_VERSION),
         ).fetchone()
         if row is not None:
-            return Verdict(**json.loads(row[0]))
+            return (_verdict_from_json(row[0]), False)
 
         import anthropic
 
@@ -566,12 +638,7 @@ def _judge_contradiction(doc_triple: Triple, chat_meta: dict, project: str) -> V
             max_tokens=512,
             messages=[{"role": "user", "content": prompt}],
         )
-        parsed = json.loads(_strip_fence(resp.content[0].text))
-        verdict = Verdict(
-            contradicts=bool(parsed["contradicts"]),
-            confidence=float(parsed.get("confidence", 0.0)),
-            reason=str(parsed.get("reason", "")),
-        )
+        verdict = _parse_verdict(resp)
         conn.execute(
             "INSERT OR REPLACE INTO judge_cache VALUES (?, ?, ?, ?, ?)",
             (
@@ -589,9 +656,14 @@ def _judge_contradiction(doc_triple: Triple, chat_meta: dict, project: str) -> V
             ),
         )
         conn.commit()
-        return verdict
+        return (verdict, True)
     finally:
         conn.close()
+
+
+def _judge_contradiction(doc_triple: Triple, chat_meta: dict, project: str) -> Verdict:
+    """Cached single-pair contradiction verdict (Verdict only; _ex exposes the api flag)."""
+    return _judge_contradiction_ex(doc_triple, chat_meta, project)[0]
 
 
 def _new_row_metadata(

@@ -57,5 +57,49 @@ def test_cli_prose_drift_renders_semantic_and_exact_lines(monkeypatch):
     assert "employs" in out
     # Exact line is unchanged in spirit: doc + chat objects on one line.
     assert "sasha is BE" in out
-    # Updated trailing note: cross-predicate now partially covered.
-    assert "partially" in out or "stage-2" in out or "semantic" in out
+    # Trailing note: tightened to a unique substring of the actual note text.
+    assert "remain out of scope" in out
+
+
+def test_cli_semantic_line_shows_chat_subject(monkeypatch):
+    """A cross-subject semantic pairing must render the chat subject, not hide it
+    behind the doc subject."""
+    report = {
+        "facts_scanned": 1, "facts_scanned_docs": 1,
+        "stage2_judge_calls": 1, "stage2_judge_errors": 0, "project": "vecs",
+        "drift": [
+            {
+                "subject": "team", "predicate": "has_role", "match_type": "semantic",
+                "similarity": 0.9, "confidence": 0.8,
+                "doc": {"object": "no BE dev", "source": "team.md"},
+                "chat": {"subject": "org", "predicate": "funds",
+                         "object": "two BE hires", "session_id": "s2"},
+                "chat_history_versions": 1,
+            },
+        ],
+    }
+    _patch_preflight_and_config(monkeypatch, report)
+    result = CliRunner().invoke(cli_mod.main, ["prose-drift", "-p", "vecs"])
+    assert result.exit_code == 1
+    # chat-side subject AND predicate both visible (cross-subject is not hidden).
+    assert "org" in result.output and "funds" in result.output
+
+
+def test_cli_surfaces_judge_errors(monkeypatch):
+    report = {
+        "facts_scanned": 1, "facts_scanned_docs": 1,
+        "stage2_judge_calls": 3, "stage2_judge_errors": 2, "project": "vecs",
+        "drift": [
+            {
+                "subject": "team", "predicate": "has_role", "match_type": "exact",
+                "doc": {"object": "no BE dev", "source": "team.md"},
+                "chat": {"subject": "team", "predicate": "has_role",
+                         "object": "sasha is BE", "session_id": "s1"},
+                "chat_history_versions": 1,
+            },
+        ],
+    }
+    _patch_preflight_and_config(monkeypatch, report)
+    result = CliRunner().invoke(cli_mod.main, ["prose-drift", "-p", "vecs"])
+    # When judge calls errored, the operator is told (else a missed contradiction is invisible).
+    assert "2" in result.output and "error" in result.output.lower()
