@@ -46,6 +46,10 @@ Targets workflow profile at `docs/workflow-vecs-profile-v0.1.md` (Phase 2 `conte
 
 This repo authors the workflow framework base (`docs/workflow-framework-v0.1.md`) and applies it via the vecs profile (`docs/workflow-vecs-profile-v0.1.md`). Features land via the profile's phases.
 
+## Roadmap
+
+Platform direction (search → agent memory; knowledge shapes & bundles): `docs/vecs-roadmap.md`. prose-drift feature deferrals: `docs/features/prose-staleness-detector/v2-roadmap.md`.
+
 ## prose-drift v1 boundary
 
 `vecs prose-drift` / `mcp__vecs__prose_drift` is an on-demand recrawl, not a write-time detector. v1 reports only exact `(subject, predicate)` object-collisions between indexed docs and current chat facts. Out of scope (v2 — see `docs/features/prose-staleness-detector/v2-roadmap.md`): cross-predicate/paraphrase contradictions (needs the embedding-similarity + LLM contradiction judge), omission (doc silent on a now-true fact), and soft/temporal "used to have" contradictions.
