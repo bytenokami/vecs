@@ -2,7 +2,9 @@
 
 vecs is **code-aware agent memory**: index your code, your AI-agent sessions, and your docs; retrieve what's relevant; and flag what's gone stale. This is the platform view — where vecs goes beyond search. The prose-drift staleness feature's own deferrals live in `docs/features/prose-staleness-detector/v2-roadmap.md`.
 
-Sketches, not contracts. Updated 2026-05-30.
+**Team + frontier strategy** (retrieval-quality quick wins, the staged team-sharing path, and the MCP tool-surface decision, grounded in a verified 2026 SOTA sweep): `docs/vecs-platform-strategy-2026-05.md`. This roadmap covers retrieval *shapes*; the strategy doc covers *sharing* and the *agent-facing tool surface*.
+
+Sketches, not contracts. Updated 2026-05-31.
 
 ## Guiding principles
 
@@ -15,7 +17,7 @@ Sketches, not contracts. Updated 2026-05-30.
 
 - **Hybrid retrieval** — Chroma vectors (Voyage `voyage-code-3` for code, `voyage-3` for prose) + SQLite FTS5 BM25, fused.
 - **Indexing** — code (tree-sitter AST), AI sessions (Claude Code + Codex, auto-routed by cwd), docs.
-- **prose-drift v1** — bi-temporal staleness detector: the first *structured* shape (temporal facts + provenance + a contract-style output, not chunk similarity). CLI + MCP.
+- **prose-drift** — bi-temporal staleness detector: the first *structured* shape (temporal facts + provenance + a contract-style output, not chunk similarity). CLI + MCP. **stage-2 recall shipped** (2026-05-30): exact `chain_key` collisions + embedding-similarity + Opus contradiction-judge on MISS, catching cross-predicate/paraphrase drift.
 - Embedded, zero servers; CLI (`vecs`) + MCP server.
 
 ## Knowledge shapes — vecs coverage
@@ -31,7 +33,11 @@ Sketches, not contracts. Updated 2026-05-30.
 
 ## Track A — prose-drift feature v2
 
-Recall + temporal + cost hardening for the staleness detector. Full list: `docs/features/prose-staleness-detector/v2-roadmap.md`. Headline item: **stage-2 embedding-similarity + LLM contradiction-judge** on a `chain_key` miss — recovers paraphrase/cross-predicate contradictions (closes the `xfail` recall hole). It's Graphiti's per-edge method, no graph DB.
+Recall + temporal + cost hardening for the staleness detector. Full list: `docs/features/prose-staleness-detector/v2-roadmap.md`. Headline item **stage-2 embedding-similarity + LLM contradiction-judge** on a `chain_key` miss — ✅ **shipped 2026-05-30** (Graphiti's per-edge method, no graph DB). Remaining: valid-time axis, multi-scope/actor provenance (team memory), write-time adjudication, SQLite migration, Sonnet-extraction + metering — see the strategy doc's Pillar 1b.
+
+## Track C — team sharing
+
+Make vecs a shared base for the engineering team's agents without a premature infra jump. Staged path (detail in `docs/vecs-platform-strategy-2026-05.md`, Pillar 2): **Stage 0** read-only published bundle (`vecs publish`/`vecs pull`, zero new ops, embeds once for the whole team) → **Stage 1** one shared vecs FastMCP over Streamable HTTP + token auth (carries both Chroma *and* the FTS5 sidecar) → **Stage 2** object-storage-backed store, only past the ~7M-embedding single-node ceiling. Rejected: NFS-mounted `~/.vecs` (SQLite corruption) and a Chroma-only server (strands BM25).
 
 ## Track B — platform: shapes & bundles
 
