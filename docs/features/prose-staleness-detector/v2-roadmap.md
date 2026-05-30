@@ -4,11 +4,11 @@ Feature-scoped deferrals for **prose-drift**. Platform-level directions (bundle 
 
 Each entry is a sketch, not a contract. v1 shipped 2026-05-30 (47/47 acceptance, live-LLM verified). The recall/cost items below are sourced from the architecture review at `docs/research/prose-drift-review-and-sota-2026-05-29.md`.
 
-## Stage-2 recall — paraphrase / cross-predicate (highest value)
+## Stage-2 recall — paraphrase / cross-predicate (highest value) — ✅ SHIPPED 2026-05-30
 
-v1 joins on an exact `(subject, predicate)` `chain_key`, so paraphrase and cross-predicate contradictions slip through — e.g. doc `team|has_role:"no backend dev"` vs chat `team|employs:"sasha"` never collide. The `xfail(strict)` test `test_cross_predicate_paraphrase_drift_is_detected` encodes this hole and flips RED the day this lands.
+Design: `stage2-recall-design.md`. On a `chain_key` MISS, `find_prose_drift` embeds the doc triple, takes the single most cosine-similar `is_current` fact (`STAGE2_SIM_THRESHOLD = 0.85`), and escalates that one pair to ONE Opus contradiction-judge (`PROSE_JUDGE_MODEL`), cached in `judge_cache`. Positive verdict → a `match_type="semantic"` drift entry carrying `similarity` + `confidence`. This is Graphiti's per-edge invalidation method **without** a graph DB. The per-row Voyage embedding (previously dead weight on the collision path) is now load-bearing. `test_cross_predicate_paraphrase_drift_is_detected` was promoted from `xfail(strict)` to a passing test.
 
-Sketch: on a `chain_key` MISS, query the `is_current` rows by Voyage cosine-similarity (the per-row embedding already exists and is currently dead weight on the collision path); above a threshold (~0.85), escalate the candidate pair to ONE LLM contradiction-judge call. This is Graphiti's per-edge invalidation method **without** adopting a graph DB — stays inside vecs's embedded constraint. Emit a confidence band (see drift-confidence below) to suppress judge false positives.
+Deferred from this increment (still open below): a calibrated confidence band to replace the raw judge `confidence` float; top-k candidates per miss (shipped as top-1); a cost ceiling on judge calls.
 
 ## Valid-time axis — soft / temporal contradictions
 
