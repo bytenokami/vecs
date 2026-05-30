@@ -38,8 +38,6 @@ Cites: `pyproject.toml:19-30` (pytest, pytest-cov, ruff declared as dev deps; uv
 | `acceptance_format` | `checklist` |
 | `pass_threshold` | `all-pass` |
 
-Precedent: `docs/superpowers/specs/2026-05-05-codex-sessions-design.md` uses an explicit Q1–Q7 locked-decision table.
-
 ## Phase 2 — Project Context
 
 `enabled: true`, `cadence: scaffold+per-feature`.
