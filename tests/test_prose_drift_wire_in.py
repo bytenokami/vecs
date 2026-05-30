@@ -147,6 +147,61 @@ def test_cli_limit_truncates_exit_1(monkeypatch, fake_anthropic):
     assert printed[0].startswith("s000 | p |")
 
 
+def test_cli_anthropic_import_missing_exit_3(monkeypatch):
+    """Acceptance item 9 / design line 457: anthropic not importable -> exit 3.
+
+    Force _preflight_global to yield ("anthropic_unavailable", ...) by patching
+    _anthropic_importable, with the API key present so the failure is purely the
+    missing-module path.
+    """
+    _enable_project(monkeypatch)  # sets ANTHROPIC_API_KEY
+    import vecs.prose_drift as pd
+    monkeypatch.setattr(
+        pd, "_anthropic_importable",
+        lambda: (False, "no module named anthropic"),
+    )
+    res = CliRunner().invoke(main, ["prose-drift", "-p", "vecs"])
+    assert res.exit_code == 3
+    assert "anthropic not installed: pip install anthropic" in res.output
+
+
+def test_cli_prose_drift_rerun_deterministic(monkeypatch, fake_anthropic):
+    """Acceptance item 34 / line 62: re-running prose-drift with no new sessions
+    or doc changes returns the same drift list. With find_prose_drift mocked to a
+    fixed 2-entry list, two invocations produce byte-identical stdout (exit 1 both).
+    """
+    _enable_project(monkeypatch)
+    _mock_report(monkeypatch, drift=[
+        {
+            "subject": "team", "predicate": "has_role",
+            "doc": {"object": "no backend developer", "source": "team.md"},
+            "chat": {"object": "sasha", "session_id": "be_dev_announce"},
+            "chat_history_versions": 1,
+        },
+        {
+            "subject": "stack", "predicate": "database",
+            "doc": {"object": "mysql", "source": "stack.md"},
+            "chat": {"object": "postgres", "session_id": "infra_chat"},
+            "chat_history_versions": 2,
+        },
+    ])
+    first = CliRunner().invoke(main, ["prose-drift", "-p", "vecs"])
+    second = CliRunner().invoke(main, ["prose-drift", "-p", "vecs"])
+    assert first.exit_code == 1 and second.exit_code == 1
+    assert first.output == second.output
+
+
+def test_cli_as_of_flag_rejected(monkeypatch, fake_anthropic):
+    """Acceptance item 41 / design line 141: no --as-of surface in v1.
+
+    Click rejects the unknown option with a usage error -> exit 2. (Distinct from
+    the project-preflight exit-2 path; here Click never reaches the command body.)
+    """
+    _enable_project(monkeypatch)
+    res = CliRunner().invoke(main, ["prose-drift", "-p", "vecs", "--as-of", "2026-01-01"])
+    assert res.exit_code == 2
+
+
 # ---------------------------------------------------------------------------
 # Task 9: MCP tool `prose_drift`
 # ---------------------------------------------------------------------------
@@ -303,3 +358,89 @@ def test_extract_failure_does_not_abort_indexer(monkeypatch, tmp_path):
         "claude_code", vo=object(), db=_FakeColl(), log_label="s",
     )
     assert any("prose extract failed" in m for m in logs)
+
+
+def test_state_machine_only_for_fully_succeeded_files(monkeypatch, tmp_path):
+    """Acceptance item 21: only files in fully_succeeded get state-machine calls."""
+    proj, sm_calls, _ = _prep_indexer(monkeypatch, tmp_path, enabled=True)
+    fa = tmp_path / "a.jsonl"; fa.write_text("{}")
+    fb = tmp_path / "b.jsonl"; fb.write_text("{}")
+    # File A fully succeeds; file B is withheld from fully_succeeded (partial fail).
+    monkeypatch.setattr(indexer, "_track_embed_success", lambda *a, **k: {fa})
+    indexer._index_session_files(
+        proj, [fa, fb], lambda content: [{"role": "user", "text": "claim", "timestamp": "0"}],
+        "claude_code", vo=object(), db=_FakeColl(), log_label="s",
+    )
+    source_ids = [c[1] for c in sm_calls]
+    assert source_ids == ["a"], "state machine must run only for fully-succeeded file A"
+    assert "b" not in source_ids
+
+
+def test_state_machine_skips_partial_file_runs_next_time(monkeypatch, tmp_path):
+    """Acceptance item 21: a partial-fail file is faceted exactly once, on the
+    later run where its chunks fully succeed — no duplicate INSERTs across runs."""
+    proj, sm_calls, _ = _prep_indexer(monkeypatch, tmp_path, enabled=True)
+    fa = tmp_path / "a.jsonl"; fa.write_text("{}")
+    fb = tmp_path / "b.jsonl"; fb.write_text("{}")
+    parser = lambda content: [{"role": "user", "text": "claim", "timestamp": "0"}]
+
+    # Run 1: only A succeeds; B partial.
+    monkeypatch.setattr(indexer, "_track_embed_success", lambda *a, **k: {fa})
+    indexer._index_session_files(
+        proj, [fa, fb], parser, "claude_code", vo=object(), db=_FakeColl(), log_label="s",
+    )
+    # Run 2: B now fully succeeds.
+    monkeypatch.setattr(indexer, "_track_embed_success", lambda *a, **k: {fb})
+    indexer._index_session_files(
+        proj, [fa, fb], parser, "claude_code", vo=object(), db=_FakeColl(), log_label="s",
+    )
+
+    source_ids = [c[1] for c in sm_calls]
+    assert source_ids.count("b") == 1, "B must be faceted exactly once across the two runs"
+
+
+def test_mcp_anthropic_missing_returns_error_dict(monkeypatch):
+    """Acceptance item 9 (MCP half): anthropic unavailable → error dict, no raise."""
+    import vecs.prose_drift as pd
+    monkeypatch.setattr(pd, "_anthropic_importable", lambda: (False, "no module named anthropic"))
+    _cfg_with(monkeypatch, {"vecs": _enabled("vecs")})
+    from vecs.mcp_server import prose_drift
+    out = prose_drift(project="vecs")
+    assert out == {"error": "anthropic_unavailable", "detail": "no module named anthropic"}
+
+
+# ---------------------------------------------------------------------------
+# Code-path isolation guards (acceptance items 24, 33)
+# ---------------------------------------------------------------------------
+
+import inspect
+
+
+def test_index_docs_does_not_write_facts():
+    """Acceptance item 24: the doc-indexing path never invokes the state machine."""
+    src = inspect.getsource(indexer.index_docs)
+    for token in ("add_fact_with_state_machine", "extract_facts", "prose_drift", "prose-facts"):
+        assert token not in src, f"index_docs must not reference {token!r}"
+
+
+def test_code_vecs_path_untouched():
+    """Acceptance item 33: the code-vecs path imports neither anthropic nor prose_drift.
+
+    The legitimate lazy `from vecs.prose_drift import ...` lives inside
+    `_index_session_files` (sessions path), NOT index_code — so this scopes to the
+    index_code FUNCTION body plus the four code-path modules, never the whole
+    indexer module.
+    """
+    import vecs.ast_chunker
+    import vecs.bm25_index
+    import vecs.chunkers
+    import vecs.searcher
+
+    code_fn_src = inspect.getsource(indexer.index_code)
+    assert "anthropic" not in code_fn_src
+    assert "prose_drift" not in code_fn_src
+
+    for mod in (vecs.chunkers, vecs.ast_chunker, vecs.bm25_index, vecs.searcher):
+        msrc = inspect.getsource(mod)
+        assert "import anthropic" not in msrc, f"{mod.__name__} must not import anthropic"
+        assert "prose_drift" not in msrc, f"{mod.__name__} must not reference prose_drift"
