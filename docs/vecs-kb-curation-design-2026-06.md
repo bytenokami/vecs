@@ -1,8 +1,8 @@
 # vecs Knowledge-Base Curation — End-State Design & Increment Program
 
 **Date:** 2026-06-01
-**Revision:** v2 (post Phase-4 multi-agent review). v1 was attacked by four independent thinking-on reviewers (internal-logic, evidence/SOTA audit, codebase-reality, architecture/sequencing); all returned REVISE. This revision folds in every confirmed finding. Material corrections from v1 are flagged inline as **[v1-fix]**.
-**Status:** Approved direction; per-increment specs follow. Several scope items are **contingent** on the open decisions in §7 — those are tagged and must not be frozen into an `acceptance.md` until resolved.
+**Revision:** v3 (two Phase-4 multi-agent review rounds). v1 attacked by 4 reviewers → v2; v2 re-attacked by 4 reviewers → v3. Material corrections are flagged inline as **[v2-fix]** (this round) or **[v1-fix]** (prior round).
+**Status:** Approved direction; per-increment specs follow. Scope items marked **(contingent: §7)** depend on an unresolved decision and must not be frozen into an `acceptance.md` until resolved.
 **Pillars:** (1) frontier retrieval quality, (2) team-shared knowledge base, (3) agent-facing tool surface.
 **Companion docs:** `docs/vecs-platform-strategy-2026-05.md` (platform strategy + SOTA), `docs/vecs-roadmap.md` (platform direction), `src/vecs/CLAUDE.md` (module context).
 
@@ -10,7 +10,7 @@
 
 ## 0. What this document is
 
-The **end-state design** for vecs as a *frontier-quality, team-shared knowledge base for coding agents*, plus the **sequenced increment program** to get there. Grounded in (a) a verified investigation of the live repo and `~/.vecs/` store, and (b) a 2026 SOTA research pass, **re-audited** in Phase-4 review — citation scopes and magnitudes below reflect the audit, not the first-pass research.
+The **end-state design** for vecs as a *frontier-quality, team-shared knowledge base for coding agents*, plus the **sequenced increment program** to get there. Grounded in a verified investigation of the live repo + `~/.vecs/` store, a 2026 SOTA research pass, and two rounds of adversarial review (citation scopes/magnitudes reflect the audits).
 
 ### North star
 
@@ -18,56 +18,53 @@ Every decision is judged by one test: **does it make the coding agent a more eff
 
 ### Hard constraints (non-negotiable)
 
-- **Embedded, zero external servers.** Stores live in ChromaDB or SQLite/FTS5 under `~/.vecs/`. No graph DB, no standing service. (Borrow methods from Graphiti/Zep, never the substrate.)
+- **Embedded, zero external servers.** Stores live in ChromaDB or SQLite/FTS5 under `~/.vecs/`. No graph DB, no standing service.
 - **Contract-first.** Config-schema and tool-surface changes are designed before code.
 - **Appropriate context, not maximum.** Condense to high-signal; keep raw addressable as fallback.
-- **Index storage never written inside the repo.** `~/.vecs/` only.
+- **Index storage never written inside the repo.** `~/.vecs/` only. (This excludes Git-LFS-into-the-code-repo as a bundle target — see §6 Increment 5.) **[v2-fix]**
 
 ### Explicitly out of scope
 
-The **repo-dependency / code-graph** bet (the largest standalone Pillar-1 lever — code-graph retrieval, ~32.8% SWE-bench in the strategy doc) is **not** part of this curation program. It is tracked in `docs/vecs-roadmap.md` (Track B2) / the strategy doc. This program improves *curation, freshness, facts, and sharing* — not the code graph. **[v1-fix: was implied complete under Pillar 1; now scoped out explicitly.]**
+The **repo-dependency / code-graph** bet (the largest standalone Pillar-1 lever, ~32.8% SWE-bench in the strategy doc) is **not** part of this curation program; it is tracked in `docs/vecs-roadmap.md` (Track B2). This program improves *curation, freshness, facts, and sharing* — not the code graph.
 
 ---
 
 ## 1. The end-state vision
 
-**One line:** vecs becomes the *most up-to-date, condensed-but-not-lacking* knowledge base the engineering team's agents share — code, docs, sessions, and durable facts — where retrieval is fresh, version-aware, deduplicated, the team's best-curated knowledge is first-class and searchable with provenance, and the index is publishable to teammates.
+**One line:** vecs becomes the *most up-to-date, condensed-but-not-lacking* team-shared knowledge base — code, docs, sessions, durable facts — where retrieval is fresh, version-aware, deduplicated, the team's best-curated knowledge is first-class and searchable with provenance, and the index is publishable to teammates *after* it is freshness-defended.
 
-**The shape ("condensed but not lacking"):** index **small, high-signal units** (tight chunks + curated/extracted facts) for precision → keep **raw transcripts/docs addressable** as a lossy fallback → **freshness-stamp and supersede** so stale content is filtered *before scoring* → **publish as an immutable bundle** for the team → **amplify with contextual retrieval + reranking last**, once the index is clean.
+**The shape ("condensed but not lacking"):** index **small, high-signal units** (tight chunks + curated/extracted facts) for precision → keep **raw transcripts/docs addressable** as a lossy fallback → **freshness-stamp and supersede** so stale content is filtered *before scoring* → **then publish** as an immutable bundle for the team → **amplify with contextual retrieval + reranking last**.
 
 ### End-state collection topology
 
 | Collection | Role | Built from | Searched | Lifecycle |
 |---|---|---|---|---|
 | `<p>-code` | code recall | code files (extension-filtered, **no `.md`**) | default | git-driven incremental; `version_id` + validity; tombstoned |
-| `<p>-docs` | doc/prose recall | `docs_dir` **+ multi-path per-repo docs + rerouted in-repo `.md`** (heading-chunked) | default | hash-incremental; `version_id` |
+| `<p>-docs` | doc/prose recall | `docs_dir` **+ multi-path per-repo docs + rerouted in-repo `.md`** (heading-chunked, source-root-qualified ids) | default | hash-incremental; `version_id` |
 | `<p>-sessions` | raw transcript fallback | chat JSONL (lightly cleaned; later extract-and-link) | default, **down-weighted** (per-collection RRF weight) | append-aware; near-dup deduped |
-| `<p>-prose-facts` | **first-class durable facts** | promoted curated `memory/*.md` + chat-extracted triples, gated by a write-time merge | default (after Increment 2) + explicit; **gets an FTS5 sidecar in Increment 1** so it fuses symmetrically | bi-temporal supersede; provenance + scope tier |
+| `<p>-prose-facts` | **first-class durable facts** | promoted curated `memory/*.md` + chat-extracted triples, gated by a write-time merge | default after Increment 2 (the `is_current` filter ships with facts search in Inc 2); **FTS5 sidecar built in Inc 1** | bi-temporal supersede; provenance + scope tier |
 
-Per-chunk metadata contract (end-state): `version_id` (git SHA for code, revision/mtime for docs, session/run id for chat), `valid_from`/`valid_to`, `provenance` (source + actor/agent + scope tier), `kind` (static / versioned / event) for kind-aware recency. **[v1-fix: §1 asserted "sessions: lower weight" with no mechanism; the mechanism (per-collection RRF weight) is now a named Increment-1 deliverable, see §5.1.]**
+Per-chunk metadata contract (end-state): `version_id`, `valid_from`/`valid_to`, `provenance` (source + actor/agent + scope tier), `kind` (static/versioned/event). Sessions are down-weighted via a **per-collection RRF weight** (§5.1). **[v1-fix: mechanism was unspecified.]**
 
 ---
 
 ## 2. Verified current state (2026-06-01)
 
-All facts carry repo/live-store evidence.
+**What is indexed.** Three collections per project (`code`/`sessions`/`docs`) across `bloomly`, `eric`, `livly`, from `~/.vecs/config.yaml`. Code matched by **file extension** (mandatory per `code_dir`, no default — `config.py:39-40`); sessions by globbing `*.jsonl` in one `sessions_dir` per project plus Codex sessions routed by `cwd`; docs from **one** `docs_dir` per project — **only `livly` has one** (`config.py:49`); `bloomly`/`eric` have none. Live counts: **code 12,823** (bloomly 599, eric 274, livly 11,950); **sessions 1,134** (bloomly 108, **eric 0 — empty**, livly 1,026); **docs 1,586** (livly only). `chroma.sqlite3` ≈ 3.6 GB (`chromadb/` dir ≈ 4.2 GB). **[v2-fix: v2 said livly docs 1,580 / sessions 1,025; live is 1,586 / 1,026, and eric-sessions is empty.]**
 
-**What is indexed.** Three collections per project (`code` / `sessions` / `docs`) across projects `bloomly`, `eric`, `livly`, discovered from `~/.vecs/config.yaml`. Code is matched by **file extension** (mandatory per `code_dir`, no default — `config.py:39-40`) within include/exclude dir rules; sessions by globbing `*.jsonl` in one `sessions_dir` per project plus Codex sessions routed by `cwd`; docs from **one** `docs_dir` per project — **only `livly` has one** (`config.py:49`); `bloomly`/`eric` have none. Live counts (as-of 2026-06-01): **12,823 code / 1,134 session / 1,580 doc** chunks, of which **livly = 11,950 / 1,025 / 1,580**. **[v1-fix: the "1,025 session" figure used elsewhere in v1 is livly-only; the cross-project total is 1,133–1,134 (minor live drift). Both now labeled.]** `chroma.sqlite3` ≈ **3.6 GB** (the `chromadb/` dir ≈ 4.2 GB). **[v1-fix: was "3.9 GB".]**
+**Chunking.** Code = tree-sitter AST (C#/TS) else 200-line line-chunks (overlap 50); sessions = 10-message groups (overlap 2); docs = H1/H2 headings, paragraph fallback. Refs: `config.py:24-27`, `ast_chunker.py`, `chunkers.py`, `doc_chunker.py`.
 
-**Chunking.** Code = tree-sitter AST (C#/TS) else 200-line line-chunks (overlap 50); sessions = 10-message groups (overlap 2); docs = H1/H2 heading boundaries with paragraph fallback (min 30 chars). Refs: `config.py:24-27`, `ast_chunker.py`, `chunkers.py`, `doc_chunker.py`.
-
-**Sessions are lightly cleaned, not verbatim.** `preprocess_session` (`chunkers.py:46-96`) parses turns, strips `<system-reminder>` blocks and base64 blobs, and reformats to `[role]: text`; embedding happens later in `_embed_and_store` (`indexer.py:385-458`). **[v1-fix: v1 said "embeds raw turns" and cited the parsing function as the embed site — both wrong; it is light cleaning at parse time, embedding elsewhere.]**
+**Sessions are lightly cleaned, not verbatim.** `preprocess_session` (`chunkers.py:46-96`) strips `<system-reminder>` + base64 and reformats to `[role]: text`; embedding is later in `_embed_and_store` (`indexer.py:385-458`).
 
 **Curation / dedup / freshness (today).**
-- Incremental only: SHA-256 file-hash manifest skips unchanged files; sessions tracked by byte-offset + identity-hash.
-- **Dedup is search-time only** — Jaccard 0.55 line-overlap (`searcher.py:57-79`). No index-time dedup; chunk ids are path-keyed `{source_key}:{chunk_index}` (`_make_chunk_id`, `indexer.py:348`) with **no content hash**.
-- Fusion is RRF with **global** weights (k=60, w_vector=1.0, w_bm25=0.6; `searcher.py:82-114`) — **no per-collection weighting, no reranker, no recency/time-decay.**
-- Stale-chunk cleanup runs after a successful embed for docs (unconditional, `indexer.py:1118`) and for **full** session re-index, but **not for incremental session appends** (`indexer.py:942-943`). Orphan chunks from a mid-batch crash are **self-healing**: a partially-embedded file is not in `fully_succeeded` (`indexer.py:604-607`) so the manifest doesn't record it; it is reprocessed and cleaned on the next reindex of that file. **[v1-fix: v1 implied permanent orphans; they persist only until the next reindex of that file.]**
-- The "no content-addressable" comment at `indexer.py:505-506` describes the **BM25/FTS5 sidecar** sync, not the Chroma store; the Chroma `upsert` (`indexer.py:449`) is also content-blind. **[v1-fix: misattributed in v1.]**
+- Incremental only: SHA-256 file-hash manifest skips unchanged files (`needs_indexing`, `indexer.py:129-138`); unchanged files never reach `_embed_and_store`. Sessions tracked by byte-offset + identity-hash.
+- **Dedup is search-time only** — Jaccard 0.55 (`searcher.py:57-79`). Chunk ids are path-keyed `{source_key}:{chunk_index}` (`_make_chunk_id`, `indexer.py:348`), **no content hash**.
+- **Fusion concatenates all collections into one RRF rank space** with global weights (k=60, w_vector=1.0, w_bm25=0.6; `searcher.py:82-114`, fused once at `:209` over concatenated `all_results`/`bm25_results`). Code hits are appended first (`:145-146`), so they systematically out-rank docs/sessions by append order. **No per-collection weighting, no reranker, no recency.** **[v2-fix: relevant to Inc-1 search work — per-collection weighting is a fusion refactor, not a parameter add.]**
+- Stale-chunk cleanup runs after a successful embed for docs (unconditional, `:1118`) and **full** session re-index, but **not for incremental session appends** (`:942-943`). `prune_out_of_scope` (`:189-227`) removes manifest keys under a code-dir root that are no longer in scope (and their chunks) — but it keys on full-path manifest keys and is exclude-dirs-oriented; it is not an asserted path for "extension removed from config." Mid-batch-crash orphans self-heal: a partially-embedded file isn't in `fully_succeeded` (`:604-607`) so the manifest doesn't record it; reprocessed + cleaned next reindex.
 
-**Fact store: write path exists but is OFF; no data.** vecs *has* a fact-write path (`indexer.py:968-1000`) that extracts triples from chat during indexing and writes them through `add_fact_with_state_machine` (`prose_drift.py:685-758`), an **exact `chain_key` (subject|predicate) INSERT/NOOP/SUPERSEDE merge** that flips `is_current` and never deletes. **But it is gated by `prose_drift_enabled` (default `False`, `config.py:54`), which is set on no project — the key is absent from `~/.vecs/config.yaml`.** Verified against the live store: ChromaDB lists only `bloomly-code/-sessions`, `eric-code/-sessions`, `livly-code/-docs/-sessions` — **no `*-prose-facts` collection exists, and zero triples have ever been written.** **[v1-fix — BLOCKER: v1 claimed "the fact store exists but is not searched." It does not exist in the live store. Populating it requires `prose_drift_enabled=True` + a metered extraction reindex (the unmetered cost §8 flags). This moves the facts work out of "quick wins" into Increment 2.]** Facts (when written) embed with voyage-3 via `_voyage_embed` (`prose_drift.py:488-491`; embed sites `:723`, `:743`); `:350-354` is the collection getter, not an embed site. The collection is created via raw `chromadb` with **no `_sync_bm25`** call → vector-only, no FTS5 sidecar.
+**Fact store: write path exists but is OFF; no data.** The fact-write path (`indexer.py:968-1000` → `add_fact_with_state_machine`, `prose_drift.py:685-758`, an **exact `chain_key` INSERT/NOOP/SUPERSEDE merge** flipping `is_current`, never deleting) is gated by `prose_drift_enabled` (default `False`, `config.py:54`), **absent from `~/.vecs/config.yaml`**. Verified live: ChromaDB lists only `bloomly-code/-sessions`, `eric-code/-sessions`, `livly-code/-docs/-sessions` — **no `*-prose-facts` collection; zero triples written.** Facts (when written) embed with voyage-3 via `_voyage_embed` (`prose_drift.py:488-491`, which consumes `SESSIONS_MODEL` — so a sessions-model swap silently changes the facts model too); the collection is created with no `_sync_bm25` → vector-only, no FTS5 sidecar.
 
-**The memory ↔ vecs inversion (confirmed, refined).** The team's durable knowledge lives as curated markdown fact files under the agent memory dir. These are **never indexed** — `sessions_dir` globs `*.jsonl` only (`indexer.py:1024`). Meanwhile **raw chat transcripts are indexed (1,025 livly session chunks)**. So curated facts are not searchable and not shared, *and* the would-be fact store is disabled. vecs is single-machine (`~/.vecs/`) with a per-user stdio MCP server.
+**The memory↔vecs inversion (confirmed).** Curated `memory/*.md` facts are never indexed (`sessions_dir` globs `*.jsonl` only, `:1024`); raw chat transcripts are (1,026 livly session chunks). vecs is single-machine, per-user stdio MCP.
 
 ---
 
@@ -75,38 +72,36 @@ All facts carry repo/live-store evidence.
 
 Severity = impact on the north star.
 
-| # | Gap | Sev | Evidence (code) | SOTA backing (see §9) |
+| # | Gap | Sev | Owner increment | SOTA backing (§9) |
 |---|---|---|---|---|
-| G1 | **Memory↔vecs disconnect** — curated durable facts not indexed; the fact-write path is disabled and the prose-facts collection does not exist | High | memory dirs hold `.md` only; `prose_drift_enabled` off everywhere; no `-prose-facts` collection in live store | Collaborative Memory (private→shared + provenance) |
-| G2a | **Chat-transcript redundancy** — cumulative histories repeat prior turns | **Cost, not north-star-rated** | sessions embedded with light cleaning (`chunkers.py:46-96`) | byte-exact dedup ≈zero quality change (cost/latency win, *not* accuracy) |
-| G2b | **Chat-transcript topical noise** — verbatim multi-turn dialogue competes with answer-bearing content | Med | raw turns in `-sessions` | distractor harm (analogy from NQ single-distractor setting, ~6–11 pts) |
-| G3 | **`.md` indexed AS code** — prose competes with code | Med | all 8 livly `code_dirs` list `.md`; `indexer.py:696-699` | distractor harm (same analogy) |
-| G4 | **Scattered docs** — only `docs_dir` indexed; per-repo `docs/` missed | Med | `docs_dir` single-valued; only livly has one | adding unique answer-bearing coverage helps ("Less LLM, More Documents") |
-| G5 | **No freshness defense** — no version/build stamp, no recency, no pre-retrieval supersession filter, no tombstones; incremental appends never clean superseded chunks | High | `indexer.py:942-943`; no recency in RRF | stale code context *actively harmful*, worse than no retrieval; outdated docs worse than no retrieval (HoH) |
-| G6 | **No index-time dedup** — near-identical chunks across branches/forks/appends coexist | Med | `searcher.py:57-79` post-hoc only; no content hash | MinHash-LSH now standard infra (qualitative) |
-| G7 | **Fact store has no actor/scope/valid-time** — can't be *team* memory even when populated | Med | `prose_drift.py:669-684` has `is_current`, no actor/scope | bi-temporal valid-time + provenance |
-| G8 | **No *semantic* promotion gate** — an exact `chain_key` merge exists, but no top-k semantic merge to catch paraphrase/cross-predicate dupes; bulk-indexing would surface confidently-wrong stale facts | Med | exact merge `prose_drift.py:685-758`; no top-k semantic step | Mem0 ADD/UPDATE/DELETE/NOOP against top-k; naive accumulation failure mode (illustrative) |
-| G9 | **Chunk size not tuned for precision** | Low | `config.py:24` 200-line code; doc heading sections can be large | small chunks ≈2× precision at ≈equal recall; pair with parent/window fetch |
+| G1 | **Memory↔vecs disconnect** — curated facts not indexed; fact-write path disabled, prose-facts collection nonexistent | High | 2 | Collaborative Memory |
+| G2a | **Chat-transcript redundancy** (cumulative histories repeat) | Cost-only | 4c dedup; largely subsumed by 6 (transcript demotion) | byte-exact dedup ≈zero quality change (cost/latency) |
+| G2b | **Chat-transcript topical noise** (verbatim dialogue competes with answers) | Med | 6 (transcript inversion) | distractor harm (analogy) |
+| G3 | **`.md` indexed AS code** | Med | 1 (reroute) | distractor harm (analogy) |
+| G4 | **Scattered docs** — only `docs_dir` indexed; per-repo `docs/` dirs missed | Med | **1 (in-repo `.md` under code_dirs) + 3 (per-repo `docs/` dirs)** | coverage helps ("Less LLM, More Documents") |
+| G5 | **No freshness defense** — no version stamp, no pre-retrieval supersession filter, no tombstones; incremental appends never clean superseded chunks | High | 4 | stale worse than no retrieval (code-RAG; HoH) |
+| G6 | **No index-time dedup** | Med | 4c (with ownership model) | MinHash-LSH standard infra (qualitative) |
+| G7 | **Fact store has no actor/scope/valid-time** | Med | 2 | bi-temporal valid-time + provenance |
+| G8 | **No *semantic* promotion gate** (exact `chain_key` merge exists; no top-k semantic merge) | Med | 2 | Mem0 ADD/UPDATE/DELETE/NOOP top-k |
+| G9 | **Chunk size not tuned + no parent/window fetch** | Low | 3 | small chunks ≈2× precision; gate on measured answer win |
 
-**[v1-fix: G2 was a single "High" gap; its evidence was cost-only or self-admittedly lossy. Split into G2a (cost) + G2b (quality), with the distractor evidence attached to the quality half. G8 reworded — a merge gate exists; the gap is the *semantic* top-k step.]**
+**[v2-fix: G4's per-repo `docs/` half and G9 are now owned by Increment 3 (Docs & chunking), which was dropped in the v2 rewrite and is restored here. G2a is explicitly addressed by 4c dedup and largely subsumed by Increment 6, so it is not a silent orphan.]**
 
 ---
 
-## 4. Design principles from the research (audited)
+## 4. Design principles from the research (audited twice)
 
-Confidence and scope reflect the Phase-4 evidence audit. Several v1 magnitudes were overstated and are corrected here.
-
-1. **Curate, don't hoard — but the lever is noise/staleness/redundancy, not size per se.** Stale, redundant, and topically-confusable content hurts; coverage of *answer-bearing* passages helps. **[v1-fix: v1's "corpus quality dominates size (high confidence, multiple sources)" overstated its citations — the Distracting Effect is about distractors, and "Less LLM, More Documents" argues coverage *helps*. Reframed; confidence medium.]** Backing: redundancy pruning (Zero-RAG, high), stale-harm (HoH, high), distractor-harm (Distracting Effect, high *for its NQ setting*; our `.md`/chat uses are analogies), coverage helps (Less LLM More Documents, high — used only for G4).
-2. **Stale is worse than absent.** Stale *code* context actively redirects the model to obsolete state; outdated docs mislead rather than abstain. → version-stamp, **hard-filter superseded before scoring**, tombstone deletes. (Direction high; magnitudes from small samples — §8.)
-3. **Extract beats verbatim for chat — but extraction is lossy.** ~35:1 compression drops temporal markers, coreference, ephemeral detail (33–35 pt gaps on some categories; **only ~7 pt on PersonaMem-v2** — the penalty is *not* uniform). → promote extracted facts **and keep the raw transcript addressable**. Never delete the source. (Medium.)
-4. **Dedup is a cost/latency win, not a quality claim — and only byte-exact is proven loss-free.** Byte-exact dedup shows zero measured quality change (inference-time RAG study). **Near-duplicate (MinHash) dedup is NOT covered by that zero-loss result** — near-dup is exactly where quality risk lives; source it separately and gate it. The ~80%/≈24% reduction figures are **our corpus estimates**, not from the cited dedup-infra sources. **[v1-fix: v1 attributed zero-loss to MinHash too and sourced the 80/24 figures to the infra papers — both overreaches.]**
-5. **"Condensed but not lacking" base case is cheap.** Small chunks (~200–400 tokens) ≈**2× precision** at roughly equal recall (Chroma eval: 3.6→7.0, "doubled" — **not** 4.7×) + parent/sentence-window fetch. The cheap **ClusterSemanticChunker** (no LLM call, reuses the embedding model) posts the eval's *highest* precision; only the **LLM-prompted** chunker isn't worth its cost. **[v1-fix: "4.7×" was fabricated (~2.4× inflated); the "skip semantic chunkers" claim contradicted the source's own headline method — both corrected.]**
-6. **Contextual Retrieval is the highest-ROI quality upgrade — but it amplifies whatever is indexed.** ~100-token LLM context blurb per chunk before *both* the embedding and BM25 index (−49% retrieval failures; −67% with a reranker). Sequence it **after** curation. (High — verbatim from Anthropic.)
-7. **Facts: supersede, don't delete; make version first-class.** Bi-temporal valid-time + `invalidated_by` + ingestion timestamp. Borrow the method, not the graph substrate. (High.)
-8. **Recency is a conditional prior, never dominant.** Kind-aware exponential half-life as a post-RRF re-score, **eval-gated**. Note the source weights α on the *semantic* term (so its "α≥0.9 degrades" means *too little* recency); when we wire α to the *recency* term, keep it low — recency as tie-breaker. The reported effect is a drop to ~0.667, not a "collapse," and is on time-stamped event logs that **won't transfer** to code/doc retrieval. **[v1-fix: α convention was inverted and "collapse" overstated.]**
-9. **No unsupervised clustering for canonical-version/topic selection** — topic clustering scored ≈0.08 F1. Use deterministic git/version signals + the existing selective Opus contradiction-judge. (Topic-clustering result is real; applying it to *version* selection is our inference.)
-10. **Team memory needs provenance + tiers + redaction + a promotion gate.** Private vs shared tiers; attach who/which-agent/which-session/when; redact on promotion to shared; gate with a top-k LLM merge; run consolidation **offline**. (High — Mem0, Collaborative Memory; the "naive accumulation" failure mode is from a vendor blog, **illustrative**, backed by the peer-reviewed pair.) **[v1-fix: vendor blog was load-bearing at High; downgraded.]**
-11. **Measure version-alignment, not just relevance.** A system can score faithfulness 0.95 and still be wrong on a stale chunk. Track stale-retrieval-rate; for memory use LongMemEval / LoCoMo. **The harness for this is built in Increment 1** (§6) — v1 had no owner for it. (High.)
+1. **Curate, don't hoard — the lever is noise/staleness/redundancy, not size.** Backing: redundancy pruning (Zero-RAG, high), stale-harm (HoH, high), distractor-harm (Distracting Effect, high *for its NQ single-distractor setting*; our `.md`/chat uses are analogies), coverage helps (Less LLM More Documents, high — used only for G4). **[v1-fix: "quality dominates size" overstated; downgraded.]**
+2. **Stale is worse than absent.** Version-stamp, **hard-filter superseded before scoring**, tombstone deletes. (Direction high; magnitudes from small samples — §8.)
+3. **Extract beats verbatim for chat — but extraction is lossy** (33–35 pt on some categories; **~7 pt on PersonaMem-v2** — not uniform). Promote extracted facts **and keep raw addressable**. (Medium.)
+4. **Dedup is cost/latency, not quality — only byte-exact is proven loss-free.** Near-duplicate (MinHash) dedup is **not** covered by the zero-loss result and must be gated; the ~80%/24% reduction figures are **our corpus estimates**, not from the cited infra sources. **[v1-fix.]**
+5. **"Condensed but not lacking" base case is cheap.** Small chunks (~200–400 tok) ≈**2× precision** (Chroma eval 3.6→7.0, "doubled"; **recall trades down somewhat — mitigate with parent/sentence-window fetch**, do not claim equal recall) + the cheap **ClusterSemanticChunker** (no LLM, highest precision); only the **LLM-prompted** chunker isn't worth its cost. **[v1-fix: "4.7×" was fabricated; v2-fix: dropped the unbacked "equal recall" qualifier.]**
+6. **Contextual Retrieval is the highest-ROI quality upgrade — amplifies whatever is indexed** (−49% / −67% with reranker). Sequence after curation. (High, verbatim.)
+7. **Facts: supersede, don't delete; version first-class.** (High.)
+8. **Recency is a conditional prior, never dominant, eval-gated.** Source weights α on the *semantic* term; when wiring α to the *recency* term keep it low. The reported effect is a drop to ~0.667 (not a "collapse") on event-log data that **won't transfer** to code/doc. **[v1-fix.]**
+9. **No unsupervised clustering for canonical-version/topic selection** (≈0.08 F1, topic-clustering; version-selection is our inference).
+10. **Team memory needs provenance + tiers + redaction + a promotion gate**, consolidation **offline**. (High — Mem0, Collaborative Memory; the naive-accumulation source is an illustrative vendor blog backed by the peer-reviewed pair.) **[v1-fix.]**
+11. **Measure version-alignment, not just relevance.** Track stale-retrieval-rate (needs a per-chunk `version_id`/embed-hash anchor); memory on LongMemEval/LoCoMo. Harness seeded in Increment 1. (High.)
 
 ---
 
@@ -116,105 +111,90 @@ Confidence and scope reflect the Phase-4 evidence audit. Several v1 magnitudes w
 
 ```
 query
-  → PRE-RETRIEVAL validity filter: metadata predicate (Chroma where / FTS5 clause)
-      · facts: is_current = True
-      · code/docs: not superseded / valid_to unset-or-future
-      · drops stale chunks BEFORE they consume candidate slots        [Inc 4; facts predicate in Inc 1]
-  → embed (per-collection model) + BM25 (FTS5, incl. facts sidecar)   [facts FTS5 in Inc 1]
-  → RRF fuse across code/docs/sessions/facts with PER-COLLECTION weights
-      (sessions down-weighted; facts weight defined now they have FTS5) [Inc 1 contract]
-  → kind-aware recency prior (flag, default-OFF, eval-gated, α low)    [Inc 4]
-  → optional rerank (voyage rerank-2.5-lite, flag)                     [Inc 6]
-  → result-shaping (detail levels, get_chunk just-in-time)             [later / Pillar 3]
+  → PRE-RETRIEVAL validity filter (metadata predicate, before fusion)        [Inc 4a]
+      · facts: is_current = True                                              [the facts predicate ships with facts search in Inc 2]
+      · code/docs: not superseded; valid_to unset or in the future ("expired" = valid_to in the past)
+  → embed (per-collection model) + BM25 (FTS5, incl. facts sidecar [Inc 1])
+  → RRF fuse with PER-COLLECTION rank lists + weights (sessions down-weighted) [Inc 1: fusion refactor]
+  → kind-aware recency prior (flag, default-OFF, eval-gated, α low)           [Inc 4b]
+  → optional rerank (voyage rerank-2.5-lite, flag)                            [Inc 7]
+  → result-shaping (detail levels, get_chunk)                                 [later / Pillar 3]
 ```
 
-**[v1-fix: v1 drew the validity filter *after* RRF fusion, contradicting principle 2 ("filter before scoring"). Moved to a pre-retrieval metadata predicate so stale chunks never enter fusion. Also: "expired" is now defined (valid_to in the past); per-collection semantics are specified rather than one generic filter.]**
+**[v1-fix: validity filter moved pre-fusion. v2-fix: the `is_current` facts predicate is inert in Inc 1 (facts empty/unsearched), so it ships with facts search in Inc 2 — Inc 1 builds only the FTS5 plumbing + the fusion refactor. Per-collection weighting requires restructuring `reciprocal_rank_fusion` into per-collection rank lists (today it fuses one concatenated list, `searcher.py:82-114,209`); "preserve current ranking" is NOT a meaningful baseline since current order is partly append-order.]**
 
 ### 5.2 Stores
 
-- **code / docs / sessions** — ChromaDB + FTS5 sidecars. Add `version_id` + validity metadata and a **content-hash embedding cache** so reindex re-embeds only changed chunks (cuts Voyage cost; de-risks the Stage-0 bundle). **[Inc 1.]**
-- **facts** — `<p>-prose-facts`, first-class: gets an **FTS5 sidecar** (Inc 1) so it fuses symmetrically; bi-temporal; provenance + scope tier; populated and gated in Inc 2.
+- **code / docs / sessions** — ChromaDB + FTS5 sidecars; add `version_id` + validity; **content-hash embedding cache** (re-embed only changed chunks). The cache must contribute cache-hit chunk ids to `succeeded_ids` and idempotently ensure the chunk is present, so the per-file `succeeded == expected` invariant (`indexer.py:604-607`) still holds — **this is the invariant the v1 dedup idea violated.** **[Inc 1.]**
+- **facts** — `<p>-prose-facts`, first-class: **FTS5 sidecar** (Inc 1); bi-temporal; provenance + scope tier; populated and gated in Inc 2; embedding model pinned + dim-stamped on the collection (note `_voyage_embed` shares `SESSIONS_MODEL`).
 
 ### 5.3 Memory bridge (end-state)
 
 ```
 source (curated memory/*.md | chat transcript)
-  → extract / parse                                  (lossy; keep source pointer)
-  → exact chain_key merge (EXISTS: prose_drift.py)   INSERT | NOOP | SUPERSEDE
-  → + semantic top-k merge gate (NEW)                ADD | UPDATE | SUPERSEDE | NOOP
+  → extract / parse (lossy; keep source pointer)
+  → exact chain_key merge (EXISTS: prose_drift.py)  +  semantic top-k merge gate (NEW)
   → attach provenance + scope tier
-  → (shared tier) redact personal/sensitive          [paired with Stage-0 consumer, Inc 3]
-  → write to <p>-prose-facts (searchable)            + keep raw transcript addressable
-  (offline / scheduled, not in the agent hot path)
+  → (shared tier) redact personal/sensitive          [paired with the Stage-0 consumer, Inc 5]
+  → write to <p>-prose-facts (searchable)  + keep raw transcript addressable
+  (offline / scheduled, not in the hot path)
 ```
 
 ### 5.4 Team-sharing (Stage-0 bundle)
 
-Publish the index once as an **immutable bundle** (Chroma dir + FTS5 `.db` + a manifest stamping **embedding model + dim**, versioned by commit SHA); teammates `vecs pull` and read locally. **Hard requirement = the manifest model/dim stamp (cheap, available in Inc 1) + the content-hash cache.** Per-chunk `version_id` is **not** a precondition — it is a later enhancement for *incremental* bundle rebuilds. **[v1-fix: v1 gated the whole bundle on Increment-4 per-chunk version stamps; that over-coupling is removed.]** Bundles are re-published as later increments land (freshness, quality). Stage-1 shared HTTP MCP and Stage-2 object-store remain later stages (strategy doc).
+Publish the index once as an **immutable bundle** (Chroma dir + FTS5 `.db` + a manifest stamping **embedding model + dim**, commit-SHA versioned); teammates `vecs pull` and read locally. **Hard requirement = the manifest model/dim stamp + the content-hash cache** (both from Inc 1); per-chunk `version_id` is a later enhancement for *incremental* bundle rebuilds. **The first team-wide publish is gated on Increment 4a's freshness filter** (see §6 Inc 5) — we do not amplify a stale index across the team. Stage-1 shared HTTP MCP and Stage-2 object-store remain later stages (strategy doc).
 
 ---
 
 ## 6. Increment program
 
-Seven increments, dependency- and ROI-ordered. Each is a feature run through the workflow profile (`docs/features/<name>/` with `acceptance.md`, dry-run, Phase-4 review, retro). Larger increments (2, 4) **decompose into sub-features** with their own acceptance — they are not single features. **[v1-fix: v1's "each is one feature" framing was violated by increments bundling ~8 deliverables.]** Scope items marked **(contingent: §7)** depend on an unresolved decision and must not be frozen into acceptance until resolved.
+**Seven increments**, dependency- and ROI-ordered. Each is a feature run through the workflow profile (`docs/features/<name>/` with `acceptance.md`, dry-run, Phase-4 review, retro). **Larger increments decompose into independently-gated sub-features, each with its own `acceptance.md`** (separate Phase-4 review + sign-off) — not one coupled gate.
 
-### Increment 1 — Foundations & no-regret wins
+**Order rationale:** cheap no-regret foundations → bother-closing facts → docs/coverage → freshness (so a clean+fresh index exists) → *then* team-share → boldest transcript change → quality amplifier last.
 
-**Goal:** the cheap, safe, no-hot-path-LLM base everything else needs.
-**Scope (in):**
-- **Metering spike** — instrument extraction/judge cost (default extraction model **Sonnet**, with `MAX_CALLS_PER_DAY` cap). This is the **gate for all later LLM work (Inc 2, 5, 6).**
-- **voyage-3 → voyage-3.5** for docs/sessions after a dim-compat check (code stays voyage-code-3). Cheap recall lift, independent of corpus cleanliness.
-- **`version_id` stamp + content-hash embedding cache** — prereqs that make every later reindex cheap and enable the Stage-0 bundle.
-- **RRF per-collection weight contract + facts FTS5 sidecar** — design the per-collection weighting (sessions down-weighted) and give `-prose-facts` a BM25 sidecar so it fuses symmetrically (satisfies the `src/vecs/CLAUDE.md` "BM25 in lockstep" invariant).
-- **Measurement-harness seed** — a `stale-retrieval-rate` metric + a small local eval-set scaffold, so Inc 4/5 gates can actually fire.
-- **`.md` → docs reroute (decided: now)** — remove `.md` from all `code_dirs`, and route in-repo `.md` into the docs collection (heading-chunked), including for `bloomly`/`eric` which have no `docs_dir` (auto-create or multi-path). **No coverage gap.**
+### Increment 1 — Foundations & no-regret wins  → **3 independent sub-features**
 
-**Scope (out):** populating/searching facts (→ Inc 2, needs metered extraction); near-dup dedup (→ Inc 4, needs ownership model); recency, tombstones, supersession filter (→ Inc 4).
-**Acceptance outline:** metering report exists with a per-extraction cost + cap; docs/sessions on voyage-3.5 with a recorded dim check; chunks carry `version_id`; re-embedding a project re-embeds only changed chunks; `-prose-facts` has an FTS5 sidecar and per-collection RRF weights are configurable; `.md` absent from `-code` and present in `-docs` for all three projects after reindex; tests per touched module.
-**Risks (corrected):** rerouting `.md`→docs **does** re-embed those files as docs (cheap, voyage-3); dropping `.md` does **not** re-embed remaining code (`indexer.py:799-815`). The genuine risks are the dim-compat check and the config-schema migration for multi-path docs — not a full reindex. **[v1-fix: v1's "reindex required" overstated cost and masked the real risks.]**
-**Files:** `~/.vecs/config.yaml` (remove `.md` from 8 livly code_dirs; add docs sources) **[v1-fix: not a `config.py` "extension default" — extensions are mandatory per code_dir]**, `config.py` (multi-path docs schema), `indexer.py`, `searcher.py`, `bm25_index.py`, `clients.py` (model), tests.
+**[v2-fix: v2 bundled six deliverables under one acceptance, violating the decompose rule. Split into three workflow-profile features, each with its own `acceptance.md`:]**
 
-### Increment 2 — Memory bridge (rest of A)
+- **1-pipeline** (`docs/features/kb-foundations-pipeline/`) — share one reindex:
+  - **F. `.md`→docs reroute.** Remove `.md` from all `code_dirs`; **explicitly sweep `.md`-sourced chunks out of every `-code` collection + BM25 sidecar** (dropping the extension does NOT delete the ~431 already-embedded livly `.md` code chunks; `index_code` only adds — `prune_out_of_scope` may catch them but is unasserted, so add an explicit sweep + a test asserting zero `.md` in `-code`). Route in-repo `.md` under code_dirs into the project `-docs` collection — **this is `index_docs` surgery**: it currently `return 0`s without a `docs_dir` and uses `relative_to(docs_dir)` (raises for code-dir files) with bare-rel_path chunk ids that collide across roots (`indexer.py:1073,1104,1114`). Build **multi-source `docs_dirs` + per-source base dir + source-root-qualified rel_path** so two repos' `README.md` don't mutually delete. **[v2-fix.]**
+  - **B. voyage-3.5 for docs/sessions.** Equal dim ≠ equal vector space — a model swap against an un-re-embedded corpus silently degrades ranking (query vectors from voyage-3.5 vs stored voyage-3 docs). So **re-embed docs/sessions under the content-hash cache** (dim-equality is necessary-not-sufficient); validate with known query→expected-source pairs, not just non-empty results. Code stays voyage-code-3. Note `_voyage_embed` (facts) also reads `SESSIONS_MODEL`. **[v2-fix.]**
+  - **C. `version_id` + content-hash embedding cache.** Stamp every chunk; cache by content-hash; cache hits contribute ids to `succeeded_ids` + idempotent upsert (preserve the `succeeded == expected` invariant — test the **mixed changed+unchanged-chunk file** case explicitly). **[v2-fix: the cache test must change one chunk in a file and assert only it re-embeds — a no-change reindex already does zero embeds via the manifest skip and does NOT test the cache.]**
+- **1-search** (`docs/features/kb-foundations-search/`):
+  - **D. Per-collection RRF refactor + facts FTS5 sidecar.** Restructure `reciprocal_rank_fusion` into per-collection rank lists + weights (sessions down-weighted); acceptance asserts the **new weighted order is correct** (current concatenation order is not a baseline to preserve) and that down-weighting sessions does not spuriously trip the 2×/3× refetch (`searcher.py:154-216`) or `deduplicate_results`. Give `-prose-facts` an FTS5 sidecar via `_sync_bm25` (empty until Inc 2). **[v2-fix.]**
+- **1-instrumentation** (`docs/features/kb-foundations-instrumentation/`):
+  - **A. Metering spike** — per-call cost record (model/tokens/$), `MAX_CALLS_PER_DAY` cap, default extraction model Sonnet. A **prerequisite instrument** that informs (and, via a §7 cost-ceiling decision, can gate) Inc 2/6 — it is not itself an execution gate. **[v2-fix: "gates Inc 2/5/6" overstated.]**
+  - **E. Measurement-harness seed** — `stale-retrieval-rate` (defined against the `version_id`/embed-hash anchor from C, with a graceful "legacy/unknown" bucket for un-restamped chunks) + a small local eval-set scaffold. **Depends on C.** **[v2-fix.]**
 
-**Goal:** populate and surface the team's durable knowledge.
-**Scope:** **enable extraction** (`prose_drift_enabled`, metered/capped per Inc 1) to **populate `-prose-facts`**; promote curated `memory/*.md` + chat-extracted triples; add a **semantic top-k merge gate** on top of the existing exact `chain_key` state machine; **provenance** (source/session, actor/agent, ts) + **scope tier** (private/shared); wire facts into search and **blend into default** (now that facts exist, are gated, and have an FTS5 sidecar). Keep raw transcript addressable via provenance pointer. Offline/scheduled promotion (not hot path).
-**Decompose:** 2a single-machine fact bridge (populate + promote + gate + provenance + search); shared-tier + redaction moves to **Increment 3** (its only consumer is the bundle). **[v1-fix: redaction-to-shared had no destination in v1; now paired with Stage-0.]**
-**Open decisions (contingent: §7):** promotion source-of-truth (curated `.md` authoritative on conflict?); human/critic review gate vs auto-promote.
-**Depends on:** Inc 1 (metering gate, facts FTS5, RRF weights).
-**Risks:** extraction lossy (keep raw); a bad fact pollutes team recall unless the gate + review are real; embedding-model pinning (cosine breaks on model change).
-**Measurement:** LongMemEval-style (knowledge-update, temporal, abstention) on the Inc-1 local set.
+**Phase-7 dry-run (parent):** smallest additive subtask = the **`docs_dirs` back-compat coercion** (config-load migration mirroring `sessions_dir`→`sessions_dirs`, `config.py:89-95,213-217`), with a clean "existing `docs_dir`-only config behaves identically" assertion. **[v2-fix: the prior choice (per-collection RRF weight) is a refactor whose "ranking unchanged" criterion is unsatisfiable.]**
 
-### Increment 3 — Stage-0 team-share bundle + shared tier (decided: A)
+### Increment 2 — Memory bridge
 
-**Goal:** the literal Pillar-2 deliverable — make the index team-shared.
-**Scope:** `vecs publish` → immutable bundle (Chroma dir + FTS5 + manifest with **embedding model+dim** stamp, commit-SHA versioned); `vecs pull` → verify manifest model/dim, read locally. Decoupled from per-chunk `version_id` (§5.4). **Shared-tier + redaction** (from Inc 2) lands here, now that the bundle is its consumer.
-**Depends on:** Inc 1 (manifest stamp + content-hash cache), Inc 2a (facts to include).
-**Open decisions (contingent: §7):** publish target (S3 / GitHub release / Git-LFS); redaction policy for the shared tier.
-**Risks:** bundle size; pull-time model/dim mismatch must hard-fail. Re-publish cadence as later increments improve the index.
+Enable extraction (metered/capped, Sonnet) to **populate `-prose-facts`**; promote curated `memory/*.md` + chat triples; **semantic top-k merge gate** atop the existing exact `chain_key` machine; provenance + scope tier; wire facts into search incl. the `is_current` pre-retrieval predicate and default blend. Keep raw transcript addressable. Offline/scheduled. **Sub-features:** 2a single-machine fact bridge (populate + gate + provenance + search). Shared-tier + redaction move to Increment 5 (their consumer is the bundle). **Contingent (§7):** promotion source-of-truth; human/critic gate. **Risks:** lossy extraction (keep raw); embedding-model pinning.
+
+### Increment 3 — Docs & chunking completion  **[v2-fix: restored]**
+
+Owns the rest of G4 + G9. **Scope:** **per-repo `docs/` discovery** — extend the multi-path `docs_dirs` from Inc 1 to auto-discover/configure per-repo `docs/` dirs beyond in-repo `.md` (contract-first config change). Small-chunk tuning (~200–400 tok) + **parent-document / sentence-window fetch**, **gated on a measured precision→answer-quality win** (G9 is Low; build the storage machinery only if the eval shows end-to-end gain). **Depends on:** Inc 1 (docs_dirs, source-root rel_path), Inc 1-instrumentation (eval harness).
 
 ### Increment 4 — Freshness
 
-**Goal:** defend the strongest empirical finding (stale = harmful). **Split by confidence:**
-- **4a (default-ON, high-confidence):** `valid_from`/`valid_to` + **pre-retrieval supersession/validity hard-filter**; tombstones on file/doc delete; **fix the `is_full=False` append-cleanup** (`indexer.py:942-943`); git-driven incremental reindex (Cursor Merkle pattern; `version_id` + cache from Inc 1).
-- **4b (default-OFF, eval-gated):** kind-aware recency prior — ships off; turns on only when the Inc-1 harness shows stale-retrieval-rate / version-alignment improves with **no relevance regression**. Bind a metric + threshold (mirrors Inc-5's kill criterion).
-- **4c:** near-dup **MinHash** dedup **with a chunk-ownership/refcount model + tombstones** (so deleting a shared near-dup can't corrupt another owner's recall). **[v1-fix: exact dedup was a verified corruption hazard in Inc 1 (breaks the `succeeded==expected` manifest invariant, `indexer.py:604-611`; no content-hash store exists); near-dup work moved here with the ownership model it requires.]**
-**Depends on:** clean corpus (1, 2), measurement harness (1).
-**Risks:** over-weighting recency (keep α low; §4.8); no unsupervised clustering for canonical-version (§4.9).
+- **4a (default-ON, high-confidence):** `valid_from`/`valid_to` + **pre-retrieval supersession/validity hard-filter**; tombstones on delete; **fix the `is_full=False` append-cleanup** (`indexer.py:942-943`); git-driven incremental reindex (Merkle pattern; uses Inc-1 `version_id` + cache).
+- **4b (default-OFF, eval-gated):** kind-aware recency prior; turns on only if the Inc-1 harness shows stale-retrieval-rate/version-alignment improves with no relevance regression (bound a metric + threshold).
+- **4c:** near-dup MinHash dedup **with a chunk-ownership/refcount model + tombstones**, so deleting a shared near-dup can't corrupt another owner's recall (also closes the byte-exact G2a redundancy).
 
-### Increment 5 — Transcript inversion (boldest)
+**Intra-increment order: 4a before 4c** (4c's safe-deletion reuses 4a's tombstone+refcount machinery); 4b is order-independent. **[v2-fix.]** **Depends on:** clean corpus (1–3), harness (1).
 
-**Goal:** stop indexing the noisiest corpus verbatim as primary.
-**Scope:** add a **per-session distiller** (distinct from Inc-2's triple extractor) that distills durable facts/decisions per session into the fact store **with a provenance pointer to the raw jsonl**; demote raw to lower-ranked/flagged fallback.
-**Depends on:** Inc 2 (gate/provenance), Inc 1 (metering + measurement).
-**Kill criterion (quantified):** if end-to-end recall on the temporal/coreference subset drops ≥ a set threshold vs raw-primary, do **not** flip the default — keep raw primary. **[v1-fix: "drops materially" was unquantified; and the distiller is a *new* component, not Inc-2's extractor — so Inc 2 only partially de-risks 5.]**
-**Risks:** boldest behavior change; only safe if raw stays addressable; added LLM cost (gated by Inc-1 metering).
+### Increment 5 — Stage-0 team-share + shared tier  **[v2-fix: moved after Freshness]**
 
-### Increment 6 — Quality layer
+The Pillar-2 deliverable. `vecs publish` → immutable bundle (Chroma dir + FTS5 + manifest model/dim stamp, commit-SHA); `vecs pull` → verify model/dim (hard-fail on mismatch), read locally. **Shared-tier + redaction** (from Inc 2) land here, now that the bundle is the consumer. **Gated on Inc 4a** — the first team-wide publish must carry the freshness filter so we don't multiply stale-harm across N teammates (§4.2, G5 High). **[v2-fix: v2 placed Stage-0 before freshness.]** **Contingent (§7):** publish target — **S3 / GitHub release** (out-of-repo object transport, embedded-clean); **Git-LFS-into-the-code-repo is excluded** (~4 GB into repo history violates the "never inside the repo" constraint).
 
-**Goal:** frontier retrieval quality on a now-clean index.
-**Scope:** Anthropic **Contextual Retrieval** (≈100-token blurb per chunk → embed + FTS5, prompt-cache the doc body) + **Voyage reranker** (rerank-2.5-lite over fused top-30–50, flag, off by default). (voyage-3.5 already shipped in Inc 1.)
-**Depends on:** curation (1, 2) + freshness (4) — it amplifies whatever is indexed.
-**Risks:** build-time LLM per chunk (cost, gated by Inc-1 metering); reranker ~200–800 ms/query (flag, off by default); worth it above ~200k tokens.
+### Increment 6 — Transcript inversion (boldest)
+
+A **per-session distiller** (distinct from Inc-2's triple extractor) distills durable facts/decisions per session into the fact store **with a provenance pointer to the raw jsonl**; demote raw to lower-ranked fallback (subsumes G2a/G2b). **Kill criterion (quantified):** if end-to-end recall on the temporal/coreference subset drops ≥ a set threshold vs raw-primary, do not flip the default. **Depends on:** Inc 2 (gate/provenance), Inc 1 (metering + measurement).
+
+### Increment 7 — Quality layer
+
+Anthropic **Contextual Retrieval** (≈100-token blurb per chunk → embed + FTS5, prompt-cache the doc body) + **Voyage reranker** (flag, off by default). (voyage-3.5 already in Inc 1.) Amplifier-last. **Risks:** build-time LLM per chunk (metered); reranker latency (flag).
 
 ---
 
@@ -222,54 +202,45 @@ Seven increments, dependency- and ROI-ordered. Each is a feature run through the
 
 | Decision | Resolved in | Status / recommendation |
 |---|---|---|
-| `.md`: drop / reroute / defer | 1 | **RESOLVED — reroute now** (drop + route to docs, all 3 projects) |
-| Stage-0: own increment vs strategy-doc | 3 | **RESOLVED — A, own increment (Inc 3)** |
-| Facts: explicit vs default-blended | 2 | blend once gate exists (Inc 2) |
-| Promotion source-of-truth (curated `.md` vs chat triples) | 2 | curated `.md` authoritative on conflict (open) |
-| Human/critic review gate vs auto-promote | 2 | staged review queue + LLM merge; human/critic gate for shared tier (open) |
-| Publish target (S3 / GH release / Git-LFS) | 3 | open |
-| Redaction policy for shared tier | 3 | open |
-| Recency prior default-off threshold | 4b | open — bind metric+threshold from Inc-1 harness |
-| `docs_dir` auto-create vs multi-path for `bloomly`/`eric` `.md` | 1 | open (small) |
-| Transcript default-flip threshold | 5 | open — quantified kill criterion |
+| `.md`: drop / reroute / defer | 1 | **RESOLVED — reroute now (all 3 projects)** |
+| docs sources: auto-create vs multi-path | 1 | **RESOLVED — multi-path `docs_dirs` (auto-create rejected)** **[v2-fix: was stale-open]** |
+| Stage-0: own increment vs strategy-doc | 5 | **RESOLVED — own increment, after Freshness** |
+| Facts: explicit vs default-blended | 2 | blend once gate exists |
+| Promotion source-of-truth (curated `.md` vs triples) | 2 | curated `.md` authoritative on conflict (open) |
+| Human/critic review gate vs auto-promote | 2 | review queue + LLM merge; human gate for shared tier (open) |
+| Publish target | 5 | S3 or GitHub release; Git-LFS-into-repo excluded (open between the two) |
+| Cost ceiling for fact population (gates Inc 2?) | 1/2 | open — bind a $ threshold from the Inc-1 metering report **[v2-fix]** |
+| Recency prior default-off threshold | 4b | open |
+| Transcript default-flip threshold | 6 | open |
 
 ---
 
 ## 8. Risks, unknowns, and what is NOT verified
 
-**Resolved-in-review (were v1 defects):** fact store empty/disabled (premise corrected, §2); index-time exact dedup is a corruption hazard (moved to Inc 4 with ownership model); benchmark IDs fixed (§9); `.md`-drop coverage gap closed by reroute-now; team-sharing transport now an increment (Inc 3); validity-filter moved pre-retrieval; voyage-3.5 and version_id+cache pulled forward.
+**Resolved across review rounds (do not re-introduce):** fact store empty/disabled; index-time exact dedup corruption hazard (→ 4c with ownership model); benchmark IDs corrected (§9, all three now confirmed to resolve); the dropped "Docs & chunking" increment (restored as Inc 3); validity filter pre-retrieval; voyage-3.5 needs re-embed (not a model flip); `.md` reroute needs an explicit `-code` sweep + `index_docs` multi-source surgery; per-collection RRF is a fusion refactor; Stage-0 gated behind freshness; "4.7×"→~2× (no equal-recall claim); MinHash ≠ byte-exact zero-loss; 80/24 are our estimates; α convention; vendor blog illustrative; Git-LFS-into-repo excluded.
 
-**Citation corrections folded in (do not re-introduce v1's numbers):** "4.7× chunking precision" → ~2× (3.6→7.0); semantic-chunker "not worth it" → only the LLM-prompted one (ClusterSemanticChunker is cheap + best); byte-exact zero-loss does **not** extend to MinHash; the ~80%/24% dedup figures are **our estimates**, not from the cited infra sources; "corpus quality dominates size" downgraded (its cited sources don't support dominance); recency α convention is inverted in the source and "collapse" was a ~0.667 drop.
+**Still not independently verified (caveats):** recency-decay magnitudes (event-log, won't transfer to code/doc — tie-breaker only); stale-code-harm pp (n=17 — direction load-bearing); extraction lossiness (version/category-sensitive; ~7 pt on PersonaMem-v2); Power-of-Noise / IGP (PDF-summarized, medium); prose-drift extraction cost **unmetered** (Inc-1 spike gates any cost claim for 2/6); monorepo scale vs the ~7M single-node ceiling **unvalidated** (gates Stage-1/2).
 
-**Still not independently verified (treat as caveats):**
-- Recency-decay magnitudes are from time-stamped *event logs* — technique high-confidence, magnitude **won't transfer** to code/doc; use as a tie-breaker only.
-- Stale-code-harm percentages (+76–88 pp) are from **n=17** samples — direction load-bearing, not the exact pp.
-- Extraction lossiness (33–35 pt; ~7 pt on PersonaMem-v2) and vendor memory leaderboard scores (66–72% peer-reviewed vs 92%+ vendor) are version/method-sensitive.
-- "Power of Noise" / IGP figures were PDF-summarized, not line-verified (medium).
-- prose-drift extraction cost is **unmetered** — the Inc-1 metering spike gates any team-scale/cost claim for Inc 2/5/6.
-- Monorepo scale vs the ~7M-embedding single-node ceiling is **unvalidated** — gates whether sharing stays embedded (Stage-0/1) or needs object-store (Stage-2).
-- Replacement benchmark IDs (LoCoMo `2402.17753`, BEAM `2510.27246`) came from reviewer convergence; confirm at edit-time of any text that cites them.
-
-**Measurement plan:** track stale-retrieval-rate / version-alignment (not just relevance/faithfulness); memory bridge on LongMemEval + LoCoMo; chunking/transcript changes measured **end-to-end**, since retrieval-precision gains don't reliably translate to better answers.
+**Measurement plan:** stale-retrieval-rate / version-alignment (not just relevance); memory on LongMemEval + LoCoMo; chunking/transcript changes measured **end-to-end**.
 
 ---
 
-## 9. References (audited)
+## 9. References (audited twice)
 
-Confidence + scope reflect the Phase-4 audit. No fabricated arXiv IDs were found in v1; the defects were one wrong ID and several over-broad scopes, fixed here.
+No fabricated arXiv IDs. **All three benchmark IDs confirmed to resolve** in the v2 evidence audit (LongMemEval `2410.10813`; LoCoMo `2402.17753` = "Evaluating Very Long-Term Conversational Memory of LLM Agents"; BEAM `2510.27246` = "Beyond a Million Tokens…"); the prior wrong ID `2507.05257` (MemoryAgentBench) is removed. **[v1-fix.]**
 
-**Curation:** Distracting Effect — arXiv 2505.06914 (high; *distractor harm only*, NQ setting). Less LLM, More Documents — arXiv 2510.02657 (high; *coverage helps only*, used for G4). Zero-RAG redundancy pruning — arXiv 2511.00505 (high). HoH outdated-worse-than-no-retrieval — arXiv 2503.04800 (high). Byte-exact dedup zero-loss — arXiv 2605.09611 (high; **byte-exact only**, inference-time RAG). MinHash-LSH infra — Milvus 2.6 + LSHBloom arXiv 2411.04257 (qualitative "standard infra" only; **no** 80/24 figures, **no** zero-quality claim).
+**Curation:** Distracting Effect `2505.06914` (high; distractor-only, NQ). Less LLM More Documents `2510.02657` (high; coverage-only, G4). Zero-RAG `2511.00505` (high). HoH `2503.04800` (high). Byte-exact dedup `2605.09611` (high; **byte-exact only**). MinHash infra — Milvus 2.6 + LSHBloom `2411.04257` (qualitative only; no 80/24, no zero-quality).
 
-**Freshness:** stale-code harmful — arXiv 2605.14478 (direction high; n=17). Time-decay / kind-aware recency — arXiv 2509.19376 + temporal-rag (technique high; α weights the *semantic* term in source). Bi-temporal supersede (Zep) — arXiv 2501.13956 (high). No unsupervised clustering 0.08 F1 — arXiv 2509.19376 (topic-clustering only; version-selection is our inference). Cursor Merkle incremental reindex — engineerscodex / turbopuffer (high, eng reports).
+**Freshness:** stale-code harmful `2605.14478` (direction high; n=17). Time-decay/recency `2509.19376` + temporal-rag (technique high; α weights the semantic term). Bi-temporal supersede (Zep) `2501.13956` (high). No-clustering 0.08 F1 `2509.19376` (topic-only; version-selection is our inference). Cursor Merkle incremental — engineerscodex/turbopuffer (high, eng reports).
 
-**Condensation:** Contextual Retrieval −49%/−67% — anthropic.com/news/contextual-retrieval (high, verbatim). Small chunks ~2× precision + ClusterSemanticChunker cheapest-best — trychroma.com/research/evaluating-chunking (high). RAPTOR — arXiv 2401.18059 (high, conditional). Proposition/Dense-X — arXiv 2312.06648 (high, low priority). IndexRAG — arXiv 2603.16415 (medium, watch).
+**Condensation:** Contextual Retrieval −49/−67% — anthropic.com/news/contextual-retrieval (high). Small chunks ~2× (recall trades down) + ClusterSemanticChunker cheapest-best — trychroma.com chunking eval (high). RAPTOR `2401.18059` (high, conditional). Proposition/Dense-X `2312.06648` (high, low priority). IndexRAG `2603.16415` (medium, watch).
 
-**Memory:** Mem0 extract + ADD/UPDATE/DELETE/NOOP + top-k — arXiv 2504.19413 (high). Extraction lossy — arXiv 2603.04814 (medium; penalty non-uniform). Bi-temporal supersede — arXiv 2501.13956 (high). Naive-accumulation failure mode — hindsight.vectorize.io 2026-05 (**illustrative vendor blog**; backed by the two papers above). Sleep-time/async consolidation — Letta, Mem0 (high). Collaborative Memory (private→shared, provenance, redaction) — arXiv 2505.18279 (high). Benchmarks — **LongMemEval arXiv 2410.10813, LoCoMo arXiv 2402.17753, BEAM arXiv 2510.27246** (high). **[v1-fix — BLOCKER: v1 cited `2507.05257` for LoCoMo/BEAM; that ID is MemoryAgentBench, a different paper. Corrected.]**
+**Memory:** Mem0 `2504.19413` (high). Extraction lossy `2603.04814` (medium; non-uniform). Bi-temporal supersede `2501.13956` (high). Naive-accumulation — hindsight.vectorize.io (illustrative vendor blog; backed by the two papers). Sleep-time/async — Letta, Mem0 (high). Collaborative Memory `2505.18279` (high). Benchmarks — LongMemEval `2410.10813`, LoCoMo `2402.17753`, BEAM `2510.27246` (high, all confirmed).
 
 ---
 
 ## 10. How this runs through the workflow framework
 
-This document is the **program parent**. Each increment is a feature executed via `docs/workflow-vecs-profile-v0.1.md`: Phase 1 acceptance (`docs/features/<increment>/acceptance.md`, checklist) → Phase 7 dry-run (smallest real subtask; pipeline-pass + review-loop-satisfied) → build (TDD, commit per task, new tests per touched module) → Phase 4 multi-agent review (architect → critical-sinker → reviewer) → Phase 8 retro (`gaps.md`). Larger increments (2, 4) split into sub-features, each with its own acceptance.
+Program parent. Each increment (and each Inc-1 sub-feature) is a feature via `docs/workflow-vecs-profile-v0.1.md`: Phase 1 acceptance → Phase 7 dry-run → build (TDD, commit per task, new tests per touched module) → Phase 4 multi-agent review → Phase 8 retro. Larger increments (1, 2, 4) split into independently-gated sub-features.
 
-**Next step:** spec **Increment 1 (Foundations & no-regret wins)** — resolve its small open items (§7: docs-dir auto-create vs multi-path), then write its `acceptance.md` and run the dry-run.
+**Next step:** build **Increment 1-pipeline** first (sub-features F+B+C share one reindex) — its `acceptance.md` is `docs/features/kb-foundations-pipeline/acceptance.md`.
