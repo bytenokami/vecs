@@ -20,7 +20,7 @@ from typing import Any
 import chromadb
 
 from vecs.clients import get_voyage_client
-from vecs.config import CHROMADB_DIR, SESSIONS_MODEL
+from vecs.config import CHROMADB_DIR, FACTS_MODEL
 
 PROSE_EXTRACTION_MODEL = "claude-opus-4-7"
 EXTRACTION_PROMPT_VERSION = "v2"
@@ -487,7 +487,7 @@ def find_prose_drift(project) -> dict:
 
 def _voyage_embed(text: str) -> list[float]:
     vo = get_voyage_client()
-    result = vo.embed([text], model=SESSIONS_MODEL, input_type="document")
+    result = vo.embed([text], model=FACTS_MODEL, input_type="document")
     return result.embeddings[0]
 
 
@@ -499,14 +499,14 @@ def _voyage_embed_cached(text: str, project: str) -> list[float]:
     try:
         row = conn.execute(
             "SELECT embedding_json FROM embed_cache WHERE text_sha=? AND model=?",
-            (text_sha, SESSIONS_MODEL),
+            (text_sha, FACTS_MODEL),
         ).fetchone()
         if row is not None:
             return json.loads(row[0])
         emb = list(_voyage_embed(text))
         conn.execute(
             "INSERT OR REPLACE INTO embed_cache VALUES (?, ?, ?)",
-            (text_sha, SESSIONS_MODEL, json.dumps(emb)),
+            (text_sha, FACTS_MODEL, json.dumps(emb)),
         )
         conn.commit()
         return emb

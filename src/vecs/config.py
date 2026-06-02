@@ -19,6 +19,11 @@ CODEX_ROUTING_PATH = MANIFESTS_DIR / "_codex_routing.json"
 CODE_MODEL = "voyage-code-3"
 SESSIONS_MODEL = "voyage-3"
 DOCS_MODEL = "voyage-3"
+# Facts (prose-drift) embedding model. Pinned separately from SESSIONS_MODEL so
+# the Inc 1-B docs/sessions re-embed cannot silently restrand fact vectors into
+# a different vector space. Facts are empty until Inc 2, so this can be set to
+# the current frontier with no migration.
+FACTS_MODEL = "voyage-4"
 
 # Chunking defaults
 CODE_CHUNK_LINES = 200

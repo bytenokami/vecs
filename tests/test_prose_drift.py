@@ -164,6 +164,35 @@ def test_prose_extraction_model_constant_is_pinned():
     assert PROSE_EXTRACTION_MODEL == "claude-opus-4-7"
 
 
+def test_voyage_embed_uses_pinned_facts_model(monkeypatch):
+    """Facts embedding uses the dedicated FACTS_MODEL, decoupled from
+    SESSIONS_MODEL, so the Inc 1-B docs/sessions model swap cannot strand
+    fact vectors (Inc 1-B acceptance)."""
+    from vecs.config import FACTS_MODEL
+
+    captured = {}
+
+    class _Result:
+        embeddings = [[0.1, 0.2]]
+
+    class _Vo:
+        def embed(self, texts, model, input_type):
+            captured["model"] = model
+            return _Result()
+
+    monkeypatch.setattr(prose_drift, "get_voyage_client", lambda: _Vo())
+    prose_drift._voyage_embed("hello")
+    assert captured["model"] == FACTS_MODEL
+
+
+def test_facts_model_decoupled_from_sessions_model():
+    """FACTS_MODEL is its own constant, not an alias of SESSIONS_MODEL."""
+    import vecs.config as cfg
+    assert hasattr(cfg, "FACTS_MODEL")
+    # Distinct module-level name; changing SESSIONS_MODEL must not move facts.
+    assert "FACTS_MODEL" in cfg.__dict__
+
+
 # ----- extraction cache (acceptance lines 411-413, 421) ------------------
 
 
@@ -262,11 +291,14 @@ def test_insert_noop_supersede_sequence(fake_voyage):
 
 
 def test_voyage_embed_uses_correct_model(fake_voyage):
+    from vecs.config import FACTS_MODEL
+
     add_fact_with_state_machine(
         Triple("x", "y", "z"), "src", "vecs-voyage-test"
     )
     assert len(fake_voyage) >= 1
-    assert fake_voyage[0]["model"] == "voyage-3"
+    # Facts embed with the pinned FACTS_MODEL, decoupled from SESSIONS_MODEL.
+    assert fake_voyage[0]["model"] == FACTS_MODEL
 
 
 def test_per_project_scoping_isolates_collections(fake_voyage):
