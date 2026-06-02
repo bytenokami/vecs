@@ -1,3 +1,7 @@
+import os
+
+import pytest
+
 from vecs.searcher import format_results, deduplicate_results, reciprocal_rank_fusion
 
 
@@ -158,3 +162,51 @@ def test_deduplicate_returns_fewer_when_heavy_overlap():
     ]
     deduped = deduplicate_results(results)
     assert len(deduped) == 1
+
+
+# --- Inc 1-B: post-re-embed quality check (acceptance line 18) --------------
+# "known query -> expected-source pairs return the expected source post-re-embed
+# (not merely non-empty)." This needs a LIVE Voyage embed + a store actually
+# re-embedded under voyage-4, so it is gated exactly like
+# tests/test_prose_drift.py::test_integration_real_anthropic and DEFAULT-SKIPPED.
+# Run it AFTER the migrating reindex on the machine that owns the live store:
+#     VECS_TEST_REAL_LLM=1 uv run pytest -q tests/test_searcher.py -k reembed_quality
+# The pairs target the `vecs` repo's own docs; edit them if your docs_dir differs.
+REEMBED_EVAL_SET = [
+    # (query, project, collection, expected file_path substring)
+    ("content-addressable embedding cache keyed by content hash", "vecs", "docs", "kb-foundations"),
+    ("prose staleness detector stage 2 semantic recall", "vecs", "docs", "prose-staleness-detector"),
+    ("hybrid search reciprocal rank fusion across collections", "vecs", "docs", "vecs"),
+]
+
+
+@pytest.mark.skipif(
+    os.environ.get("VECS_TEST_REAL_LLM") != "1"
+    or not os.environ.get("VOYAGE_API_KEY"),
+    reason="Set VECS_TEST_REAL_LLM=1 and VOYAGE_API_KEY to run the live post-re-embed quality check.",
+)
+def test_reembed_quality_expected_sources_returned():
+    """Each eval query must surface its EXPECTED docs source in the top results
+    once docs are re-embedded under voyage-4 (B). Catches the silent ranking
+    degradation a non-empty smoke test misses (querying a voyage-3 store with
+    voyage-4 query vectors would still return results -- just wrong ones)."""
+    from vecs.searcher import search
+    from vecs.config import load_config
+
+    config = load_config()
+    checked = 0
+    for query, project, collection, expected in REEMBED_EVAL_SET:
+        if project not in config.projects:
+            continue
+        proj = config.projects[project]
+        if collection == "docs" and not proj.docs_dir:
+            continue
+        results = search(query, collection_name=collection, n_results=5, project=project)
+        sources = [(r.get("metadata") or {}).get("file_path", "") for r in results]
+        assert any(expected in s for s in sources), (
+            f"expected a source containing {expected!r} in top-5 for query "
+            f"{query!r}; got {sources!r}"
+        )
+        checked += 1
+    if checked == 0:
+        pytest.skip("No eval pairs matched a configured project/collection; adjust REEMBED_EVAL_SET.")

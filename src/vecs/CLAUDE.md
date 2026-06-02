@@ -18,7 +18,7 @@ Targets workflow profile at `docs/workflow-vecs-profile-v0.1.md` (Phase 2 `conte
 | `indexer.py` | Main indexing loop. Adaptive batching, manifest updates, sync between vector and BM25 stores. |
 | `searcher.py` | Hybrid search: vector + BM25, fused output. |
 | `bm25_index.py` | SQLite FTS5 BM25 index — one `.db` per collection. |
-| `embed_cache.py` | Content-addressable embedding cache (SQLite at `~/.vecs/embed_cache.db`), keyed by `(model, content_hash)`. Lets the indexer skip Voyage calls for byte-identical chunks across runs. |
+| `embed_cache.py` | Content-addressable embedding cache (SQLite at `~/.vecs/embed_cache.db`), keyed by `(model, content_hash)`. Lets the indexer skip Voyage calls for byte-identical chunks across runs. Also holds the `collection_models` marker table (per-collection last-embedded model) that drives the model-change re-embed trigger. |
 | `chunkers.py` | Dispatch routing files to language-specific chunkers. |
 | `ast_chunker.py` | Tree-sitter chunking (C#, TypeScript, plus generic). |
 | `doc_chunker.py` | Markdown / PDF / plain doc chunking. |
@@ -30,7 +30,8 @@ Targets workflow profile at `docs/workflow-vecs-profile-v0.1.md` (Phase 2 `conte
 
 ## Invariants
 
-- Embedding models: `voyage-code-3` (free) for code; `voyage-3` ($0.06/1M tokens) for sessions and docs. Wired in `config.py`.
+- Embedding models (`config.py`): `voyage-code-3` for code; `voyage-4` for sessions and docs (Inc 1-B, current frontier); `FACTS_MODEL = voyage-4` for prose-drift facts, pinned separately so a sessions/docs model swap cannot strand fact vectors. All three default to a **1024-dim** vector (`EMBED_DIMS`; we never send an `output_dimension` override), so a model change re-embeds in place over the same chunk ids — no collection recreate.
+- Embedding-model change ⇒ re-embed, not a bare constant flip. `run_index` runs a PRE-pass (`_remodel_clear`) and POST-pass (`_remodel_record`): if the model recorded for a collection (`EmbedCache.get_collection_model`) differs from the configured `DOCS_MODEL`/`SESSIONS_MODEL` and the collection is non-empty, it clears that source's manifest entries (docs file-keys under `docs_dirs`; all `session:` keys) so the indexers re-embed every chunk under the new model; the new marker is written only after all indexers run. Centralized in `run_index` (NOT per-indexer) because `index_sessions` and `index_codex_sessions` share the `-sessions` collection — a per-indexer marker would be flipped by whichever ran first and strand the other agent's chunks. **Code has no trigger** (it stays `voyage-code-3`), so code chunks are never needlessly recomputed. The marker lives in `EmbedCache` (`collection_models` table), NOT the Manifest, because `Manifest.prune()` would delete a non-path key. **Operational note:** a model flip takes effect at import (search embeds queries with the new model immediately), but the store is re-embedded only by the next `run_index` — so a reindex must be run promptly after deploying a model change to close the transient window where new-model query vectors hit old-model stored vectors (the silent ranking degradation). The clear pass only invalidates files `index_docs`/the session indexers actually re-scan (today `docs_dir`, i.e. `docs_dirs[0]`); F widens both together. Deleted-source orphan chunks are not re-embedded and remain in the old vector space until the Inc 4a orphan sweep.
 - Vector store: ChromaDB. Collections per project: `<project>-code`, `<project>-sessions`, `<project>-docs`.
 - BM25 sidecar: SQLite FTS5; one `.db` per collection. Kept in lockstep with Chroma via `_sync_bm25` in `indexer.py`.
 - Sessions are agent-tagged (`metadata.agent ∈ {claude_code, codex}`). Same collection, single query covers both.

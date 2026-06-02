@@ -1449,6 +1449,126 @@ def get_status(project_name: str | None = None) -> dict:
     return status
 
 
+def _collection_count(db: chromadb.ClientAPI, name: str) -> int:
+    """Chunk count for a collection, or 0 if it does not exist yet."""
+    try:
+        return db.get_collection(name).count()
+    except Exception:
+        return 0
+
+
+def _model_changed(
+    cache: EmbedCache, db: chromadb.ClientAPI, collection: str, model: str
+) -> bool:
+    """True if `collection` must be re-embedded under `model`.
+
+    Re-embed is needed when the model recorded for the collection differs from
+    the configured `model` AND the collection actually holds vectors (count>0).
+    A never-recorded collection reads None != model, so the first post-deploy
+    reindex migrates an existing live store in place; an empty/absent collection
+    reads count 0 and is skipped (the next index pass embeds it fresh anyway).
+    """
+    if cache.get_collection_model(collection) == model:
+        return False
+    return _collection_count(db, collection) > 0
+
+
+def _clear_docs_manifest_entries(manifest: Manifest, docs_dirs: list[Path]) -> int:
+    """Drop docs file-path manifest keys so the next index_docs pass re-embeds.
+
+    Docs file-keys are bare absolute paths under a docs_dir. Code file-keys are
+    ALSO bare absolute paths but live under code_dirs (distinct roots), so
+    matching by docs_dir cannot touch them; session: keys are skipped. Returns
+    the number of keys removed.
+    """
+    resolved = [d.resolve() for d in docs_dirs]
+    if not resolved:
+        return 0
+    stale: list[str] = []
+    for key in list(manifest.data):
+        if key.startswith("session:"):
+            continue
+        try:
+            key_resolved = Path(key).resolve()
+        except OSError:
+            continue
+        for root in resolved:
+            try:
+                key_resolved.relative_to(root)
+            except ValueError:
+                continue
+            stale.append(key)
+            break
+    for key in stale:
+        del manifest.data[key]
+    return len(stale)
+
+
+def _clear_session_manifest_entries(manifest: Manifest) -> int:
+    """Drop every session: manifest key so each session re-embeds in FULL.
+
+    `_get_session_new_content` returns is_full=True when a session's manifest
+    info is None, so a cleared key forces a full (not incremental-append)
+    re-embed under the new model. Returns the number of keys removed.
+    """
+    stale = [k for k in manifest.data if k.startswith("session:")]
+    for k in stale:
+        del manifest.data[k]
+    return len(stale)
+
+
+def _remodel_clear(
+    project: ProjectConfig, db: chromadb.ClientAPI, cache: EmbedCache
+) -> dict[str, int]:
+    """run_index PRE-pass: clear manifest entries when the docs/sessions model changed.
+
+    Centralized here, NOT inside the per-indexer functions, because the
+    -sessions collection is written by BOTH index_sessions and
+    index_codex_sessions: the clear must run ONCE before both, else whichever
+    indexer runs first would re-mark sessions and strand the other agent's
+    chunks in the old vector space. Docs are folded into the same pass for
+    uniformity. Code has no re-embed trigger, so code chunks are never
+    needlessly recomputed. The new marker is written AFTER all indexers by
+    `_remodel_record`.
+    """
+    cleared = {"docs": 0, "sessions": 0}
+    docs_stale = _model_changed(cache, db, project.docs_collection, DOCS_MODEL)
+    sess_stale = _model_changed(cache, db, project.sessions_collection, SESSIONS_MODEL)
+    if not docs_stale and not sess_stale:
+        return cleared
+
+    manifest = Manifest(project.name)
+    if docs_stale:
+        # Clear ONLY under the dirs index_docs actually re-scans, so we never
+        # invalidate a key the indexer won't re-embed (which would strand that
+        # file's old-model vectors after the marker advances). index_docs scans
+        # project.docs_dir (docs_dirs[0]) only today; multi-source docs is F,
+        # which widens this clear and index_docs together.
+        scan_dirs = [project.docs_dir] if project.docs_dir else []
+        cleared["docs"] = _clear_docs_manifest_entries(manifest, scan_dirs)
+    if sess_stale:
+        cleared["sessions"] = _clear_session_manifest_entries(manifest)
+    if cleared["docs"] or cleared["sessions"]:
+        manifest.save()
+        _log(
+            f"[{project.name}] Embedding-model change: cleared "
+            f"{cleared['docs']} docs + {cleared['sessions']} session manifest "
+            f"entries to force a re-embed."
+        )
+    return cleared
+
+
+def _remodel_record(project: ProjectConfig, cache: EmbedCache) -> None:
+    """run_index POST-pass: record docs+sessions as embedded under the current model.
+
+    Recorded only for docs and sessions (code has no re-embed trigger). Set
+    unconditionally per project so the next run reads marker == configured model
+    and the pre-pass is a no-op.
+    """
+    cache.set_collection_model(project.docs_collection, DOCS_MODEL)
+    cache.set_collection_model(project.sessions_collection, SESSIONS_MODEL)
+
+
 def run_index(project_name: str | None = None) -> None:
     """Run incremental index for one or all projects."""
     VECS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1504,12 +1624,19 @@ def run_index(project_name: str | None = None) -> None:
         for name, project in projects.items():
             proj_start = time.monotonic()
             _log(f"Project: {name}")
+            # B2 PRE-pass: detect a docs/sessions embedding-model change and
+            # clear the affected manifest entries so the indexers below re-embed
+            # every file under the new model. Runs once, before both session
+            # indexers share the -sessions collection.
+            _remodel_clear(project, db, cache)
             total_code += index_code(project, vo, db, cache=cache)
             total_sessions += index_sessions(project, vo, db, cache=cache)
             codex_files = codex_routing.get(name, [])
             if codex_files:
                 total_sessions += index_codex_sessions(project, codex_files, vo, db, cache=cache)
             total_docs += index_docs(project, vo, db, cache=cache)
+            # B2 POST-pass: record the model docs+sessions are now embedded under.
+            _remodel_record(project, cache)
             _log(f"[{name}] project finished in {time.monotonic() - proj_start:.1f}s")
     finally:
         cache.close()

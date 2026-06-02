@@ -11,10 +11,12 @@ Sub-features share one reindex. Build order within: C → B → F.
 - [ ] Cache test: in a file with ≥2 chunks where only one chunk's content changed, re-indexing makes a Voyage call for exactly the changed chunk; the unchanged chunks are cache hits.
 - [ ] Invariant test: in that same mixed-chunk file, cache-hit chunk ids are counted toward `succeeded_ids`, the file reaches `succeeded == expected`, and is marked indexed in one pass (no perpetual reprocessing).
 
-## B — voyage-3.5 re-embed for docs/sessions
+## B — voyage-4 re-embed for docs/sessions
 
-- [ ] voyage-3.5 dim recorded vs voyage-3 (equal-dim is necessary, not sufficient).
-- [ ] docs + sessions are RE-EMBEDDED under voyage-3.5 via the C cache (not a model-constant flip against stored voyage-3 vectors). Code stays voyage-code-3.
+> Model decision: the re-embed target is **voyage-4**, not the originally-specced voyage-3.5. voyage-4 is the current Voyage frontier (verified live 2026-06-02) and shares voyage-3's 1024-dim default, so it fits the existing Chroma collections in place with no recreate. All "voyage-3.5" references below mean voyage-4.
+
+- [ ] voyage-4 dim recorded vs voyage-3 (equal-dim is necessary, not sufficient).
+- [ ] docs + sessions are RE-EMBEDDED under voyage-4 via the C cache (not a model-constant flip against stored voyage-3 vectors). Code stays voyage-code-3.
 - [ ] Quality check: a set of known query→expected-source pairs returns the expected source post-re-embed (not merely non-empty results).
 - [ ] The facts embedding model is pinned/stamped so swapping `SESSIONS_MODEL` cannot strand facts (note `_voyage_embed` shares it; facts are empty until Inc 2).
 

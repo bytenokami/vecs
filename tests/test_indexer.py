@@ -1890,7 +1890,11 @@ def test_run_index_threads_one_cache_to_all_indexers(tmp_path, monkeypatch):
     )
     monkeypatch.setattr("vecs.indexer.migrate_global_manifest", lambda *a, **kw: None)
     monkeypatch.setattr("vecs.indexer.get_voyage_client", lambda: MagicMock())
-    monkeypatch.setattr("vecs.indexer.get_chromadb_client", lambda: MagicMock())
+    # Fresh project: collections are empty, so the B2 pre-pass finds nothing to
+    # re-embed. count() must be a real int (the pre-pass compares it > 0).
+    db = MagicMock()
+    db.get_collection.return_value.count.return_value = 0
+    monkeypatch.setattr("vecs.indexer.get_chromadb_client", lambda: db)
     monkeypatch.setattr("vecs.indexer.VECS_DIR", tmp_path)
     monkeypatch.setattr("vecs.indexer.CHROMADB_DIR", tmp_path / "chromadb")
     monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
@@ -1913,6 +1917,263 @@ def test_run_index_threads_one_cache_to_all_indexers(tmp_path, monkeypatch):
     assert seen["code"] is not None
     assert seen["code"] is seen["sessions"]
     assert seen["code"] is seen["docs"]
+
+
+# --- B2: model-change re-embed trigger (run_index pre/post pass) -----------
+
+def _seed_manifest_with_doc_code_session(tmp_path, doc_f, code_f, sess_f):
+    manifest = Manifest("p", manifests_dir=tmp_path / "manifests")
+    manifest.mark_indexed(doc_f, "hdoc")
+    manifest.mark_indexed(code_f, "hcode")
+    manifest.mark_session_indexed(sess_f, byte_offset=2, chunk_count=1)
+    manifest.save()
+
+
+def _remodel_fixture(tmp_path):
+    """Build (project, doc_f, code_f, sess_f) sharing one manifest namespace."""
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    code_dir = tmp_path / "code"
+    code_dir.mkdir()
+    doc_f = docs_dir / "a.md"
+    doc_f.write_text("doc body")
+    code_f = code_dir / "m.py"
+    code_f.write_text("print(1)")
+    sess_f = tmp_path / "sess.jsonl"
+    sess_f.write_text("{}")
+    project = ProjectConfig(
+        name="p",
+        code_dirs=[CodeDir(path=code_dir, extensions={".py"})],
+        docs_dirs=[docs_dir],
+    )
+    return project, doc_f, code_f, sess_f
+
+
+def test_remodel_clears_docs_and_session_keys_leaves_code_on_model_change(tmp_path, monkeypatch):
+    """Model change (recorded != configured) + non-empty collection: the pre-pass
+    drops docs file-keys and session: keys so the next pass re-embeds them, but
+    leaves code file-keys (code has no re-embed trigger)."""
+    from vecs.embed_cache import EmbedCache
+    from vecs.indexer import _remodel_clear
+
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+    monkeypatch.setattr("vecs.indexer.DOCS_MODEL", "voyage-4")
+    monkeypatch.setattr("vecs.indexer.SESSIONS_MODEL", "voyage-4")
+
+    project, doc_f, code_f, sess_f = _remodel_fixture(tmp_path)
+    _seed_manifest_with_doc_code_session(tmp_path, doc_f, code_f, sess_f)
+
+    cache = EmbedCache(tmp_path / "embed_cache.db")
+    cache.set_collection_model("p-docs", "voyage-3")      # stale
+    cache.set_collection_model("p-sessions", "voyage-3")  # stale
+
+    db = MagicMock()
+    db.get_collection.return_value.count.return_value = 5  # non-empty
+
+    _remodel_clear(project, db, cache)
+
+    reloaded = Manifest("p", manifests_dir=tmp_path / "manifests")
+    assert str(doc_f) not in reloaded.data          # docs cleared -> re-embed
+    assert f"session:{sess_f}" not in reloaded.data  # sessions cleared
+    assert str(code_f) in reloaded.data              # code untouched
+    cache.close()
+
+
+def test_remodel_clear_scope_matches_index_docs_scan_not_extra_docs_dirs(tmp_path, monkeypatch):
+    """The clear pass must only drop docs keys for files index_docs will re-embed.
+
+    index_docs scans project.docs_dir (== docs_dirs[0]) only; multi-source docs
+    is deferred to F. So a model change must NOT clear keys for files under
+    docs_dirs[1..] -- clearing a key index_docs won't re-scan would strand that
+    file's old-model vectors in a collection whose marker just advanced. Clear
+    and re-embed scopes must agree."""
+    from vecs.embed_cache import EmbedCache
+    from vecs.indexer import _remodel_clear
+
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+    monkeypatch.setattr("vecs.indexer.DOCS_MODEL", "voyage-4")
+    monkeypatch.setattr("vecs.indexer.SESSIONS_MODEL", "voyage-4")
+
+    docs0 = tmp_path / "docs0"
+    docs0.mkdir()
+    docs1 = tmp_path / "docs1"
+    docs1.mkdir()
+    f0 = docs0 / "a.md"
+    f0.write_text("x")
+    f1 = docs1 / "b.md"
+    f1.write_text("y")
+
+    manifest = Manifest("p", manifests_dir=tmp_path / "manifests")
+    manifest.mark_indexed(f0, "h0")
+    manifest.mark_indexed(f1, "h1")
+    manifest.save()
+
+    project = ProjectConfig(name="p", docs_dirs=[docs0, docs1])
+
+    cache = EmbedCache(tmp_path / "embed_cache.db")
+    cache.set_collection_model("p-docs", "voyage-3")  # stale
+
+    db = MagicMock()
+    db.get_collection.return_value.count.return_value = 5
+
+    _remodel_clear(project, db, cache)
+
+    reloaded = Manifest("p", manifests_dir=tmp_path / "manifests")
+    assert str(f0) not in reloaded.data, "docs_dir[0] file (index_docs re-scans it) must be cleared"
+    assert str(f1) in reloaded.data, "docs_dirs[1..] file (index_docs won't re-scan it yet) must NOT be cleared"
+    cache.close()
+
+
+def test_remodel_noop_when_model_unchanged(tmp_path, monkeypatch):
+    """Recorded == configured: nothing cleared even though collection is non-empty."""
+    from vecs.embed_cache import EmbedCache
+    from vecs.indexer import _remodel_clear
+
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+    monkeypatch.setattr("vecs.indexer.DOCS_MODEL", "voyage-4")
+    monkeypatch.setattr("vecs.indexer.SESSIONS_MODEL", "voyage-4")
+
+    project, doc_f, code_f, sess_f = _remodel_fixture(tmp_path)
+    _seed_manifest_with_doc_code_session(tmp_path, doc_f, code_f, sess_f)
+
+    cache = EmbedCache(tmp_path / "embed_cache.db")
+    cache.set_collection_model("p-docs", "voyage-4")      # matches
+    cache.set_collection_model("p-sessions", "voyage-4")  # matches
+    cache.close()
+    cache = EmbedCache(tmp_path / "embed_cache.db")
+
+    db = MagicMock()
+    db.get_collection.return_value.count.return_value = 5
+
+    _remodel_clear(project, db, cache)
+
+    reloaded = Manifest("p", manifests_dir=tmp_path / "manifests")
+    assert str(doc_f) in reloaded.data
+    assert f"session:{sess_f}" in reloaded.data
+    assert str(code_f) in reloaded.data
+    cache.close()
+
+
+def test_remodel_noop_when_collection_empty(tmp_path, monkeypatch):
+    """Recorded differs but collection is empty (count==0): no re-embed needed."""
+    from vecs.embed_cache import EmbedCache
+    from vecs.indexer import _remodel_clear
+
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+    monkeypatch.setattr("vecs.indexer.DOCS_MODEL", "voyage-4")
+    monkeypatch.setattr("vecs.indexer.SESSIONS_MODEL", "voyage-4")
+
+    project, doc_f, code_f, sess_f = _remodel_fixture(tmp_path)
+    _seed_manifest_with_doc_code_session(tmp_path, doc_f, code_f, sess_f)
+
+    cache = EmbedCache(tmp_path / "embed_cache.db")
+    cache.set_collection_model("p-docs", "voyage-3")      # stale...
+    cache.set_collection_model("p-sessions", "voyage-3")
+
+    db = MagicMock()
+    db.get_collection.return_value.count.return_value = 0  # ...but empty
+
+    _remodel_clear(project, db, cache)
+
+    reloaded = Manifest("p", manifests_dir=tmp_path / "manifests")
+    assert str(doc_f) in reloaded.data
+    assert f"session:{sess_f}" in reloaded.data
+    cache.close()
+
+
+def test_remodel_treats_missing_collection_as_empty(tmp_path, monkeypatch):
+    """A collection that does not exist yet (get_collection raises) is empty -> no clear."""
+    from vecs.embed_cache import EmbedCache
+    from vecs.indexer import _remodel_clear
+
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+    monkeypatch.setattr("vecs.indexer.DOCS_MODEL", "voyage-4")
+    monkeypatch.setattr("vecs.indexer.SESSIONS_MODEL", "voyage-4")
+
+    project, doc_f, code_f, sess_f = _remodel_fixture(tmp_path)
+    _seed_manifest_with_doc_code_session(tmp_path, doc_f, code_f, sess_f)
+
+    cache = EmbedCache(tmp_path / "embed_cache.db")
+    cache.set_collection_model("p-docs", "voyage-3")
+    cache.set_collection_model("p-sessions", "voyage-3")
+
+    db = MagicMock()
+    db.get_collection.side_effect = Exception("collection not found")
+
+    _remodel_clear(project, db, cache)  # must not raise
+
+    reloaded = Manifest("p", manifests_dir=tmp_path / "manifests")
+    assert str(doc_f) in reloaded.data
+    assert f"session:{sess_f}" in reloaded.data
+    cache.close()
+
+
+def test_run_index_remodel_migrates_docs_manifest_and_records_marker(tmp_path, monkeypatch):
+    """End-to-end migration: an existing voyage-3 docs collection (recorded
+    voyage-3, non-empty) under configured voyage-4 has its docs manifest entry
+    cleared by the pre-pass, and the post-pass records voyage-4 as the new
+    marker so the next run is a no-op."""
+    from vecs.config import _clear_config_cache
+    from vecs.embed_cache import EmbedCache
+
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    doc_f = docs_dir / "a.md"
+    doc_f.write_text("doc body")
+
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump({
+        "projects": {"p": {
+            "code_dirs": [{"path": str(tmp_path / "code"), "extensions": [".py"]}],
+            "docs_dirs": [str(docs_dir)],
+        }},
+        "codex_disabled": True,
+    }))
+    (tmp_path / "code").mkdir()
+    _clear_config_cache()
+
+    monkeypatch.setattr(
+        "vecs.indexer.load_config",
+        lambda: __import__("vecs.config", fromlist=["load_config"]).load_config(config_file),
+    )
+    monkeypatch.setattr("vecs.indexer.migrate_global_manifest", lambda *a, **kw: None)
+    monkeypatch.setattr("vecs.indexer.get_voyage_client", lambda: MagicMock())
+    monkeypatch.setattr("vecs.indexer.VECS_DIR", tmp_path)
+    monkeypatch.setattr("vecs.indexer.CHROMADB_DIR", tmp_path / "chromadb")
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+    monkeypatch.setattr("vecs.indexer.DOCS_MODEL", "voyage-4")
+
+    # Existing voyage-3 docs collection: non-empty, recorded under the old model.
+    db = MagicMock()
+    db.get_collection.return_value.count.return_value = 12
+    monkeypatch.setattr("vecs.indexer.get_chromadb_client", lambda: db)
+
+    # Pre-seed: a docs manifest entry + the old marker (simulates pre-B2 state).
+    m = Manifest("p", manifests_dir=tmp_path / "manifests")
+    m.mark_indexed(doc_f, "h")
+    m.save()
+    seed = EmbedCache(tmp_path / "embed_cache.db")
+    seed.set_collection_model("p-docs", "voyage-3")
+    seed.close()
+
+    # Indexers are no-ops: we are testing the orchestration pre/post pass only.
+    monkeypatch.setattr("vecs.indexer.index_code", lambda *a, **kw: 0)
+    monkeypatch.setattr("vecs.indexer.index_sessions", lambda *a, **kw: 0)
+    monkeypatch.setattr("vecs.indexer.index_docs", lambda *a, **kw: 0)
+    monkeypatch.setattr("vecs.indexer.index_codex_sessions", lambda *a, **kw: 0)
+
+    from vecs.indexer import run_index
+    run_index()
+
+    reloaded = Manifest("p", manifests_dir=tmp_path / "manifests")
+    assert str(doc_f) not in reloaded.data, "pre-pass should clear the stale docs entry"
+
+    chk = EmbedCache(tmp_path / "embed_cache.db")
+    assert chk.get_collection_model("p-docs") == "voyage-4", "post-pass should record new marker"
+    # _remodel_record stamps BOTH docs and sessions; assert sessions too so a
+    # dropped session set_collection_model line cannot pass unnoticed.
+    assert chk.get_collection_model("p-sessions") == "voyage-4", "post-pass should record sessions marker"
+    chk.close()
 
 
 def test_index_session_files_empty_input_returns_zero(tmp_path, monkeypatch):

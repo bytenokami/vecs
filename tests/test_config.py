@@ -580,3 +580,26 @@ def test_codex_top_level_settings_save_and_reload(tmp_path):
     assert reloaded.codex_sessions_root == tmp_path / "custom" / "codex"
     assert reloaded.codex_disabled is True
     assert reloaded.codex_ignore_cwds == [Path("/tmp/scratch"), Path("/etc")]
+
+
+# --- Inc 1-B: voyage-4 re-embed target + dim safety -------------------------
+
+def test_docs_and_sessions_models_are_voyage_4():
+    """B1: docs + sessions re-embed target is voyage-4 (current frontier). The
+    in-place migration is delivered by the run_index model-change trigger (B2),
+    so flipping the constant is safe. Code stays on voyage-code-3 (no trigger)."""
+    from vecs.config import DOCS_MODEL, SESSIONS_MODEL, CODE_MODEL
+    assert DOCS_MODEL == "voyage-4"
+    assert SESSIONS_MODEL == "voyage-4"
+    assert CODE_MODEL == "voyage-code-3"
+
+
+def test_voyage4_dim_matches_voyage3_for_in_place_reembed():
+    """B3: record voyage-4 dim vs voyage-3. Equal dim (both 1024) is NECESSARY
+    so re-embedded vectors overwrite existing chunk ids in the same Chroma
+    collection with no recreate -- but NOT SUFFICIENT: a different vector space
+    still requires a real re-embed (delivered by B2)."""
+    from vecs.config import EMBED_DIMS, DOCS_MODEL, SESSIONS_MODEL, CODE_MODEL
+    assert EMBED_DIMS["voyage-4"] == EMBED_DIMS["voyage-3"] == 1024
+    # Every configured model resolves to the same dim -> in-place overwrite safe.
+    assert EMBED_DIMS[DOCS_MODEL] == EMBED_DIMS[SESSIONS_MODEL] == EMBED_DIMS[CODE_MODEL] == 1024

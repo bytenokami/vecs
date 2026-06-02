@@ -17,13 +17,30 @@ CODEX_ROUTING_PATH = MANIFESTS_DIR / "_codex_routing.json"
 
 # Embedding models
 CODE_MODEL = "voyage-code-3"
-SESSIONS_MODEL = "voyage-3"
-DOCS_MODEL = "voyage-3"
+# Inc 1-B: docs + sessions re-embed target is voyage-4 (current frontier). The
+# voyage-3 -> voyage-4 migration is NOT a bare constant flip against stored
+# voyage-3 vectors -- the run_index model-change trigger (indexer._remodel_clear)
+# detects the change and re-embeds every docs/sessions chunk under voyage-4.
+SESSIONS_MODEL = "voyage-4"
+DOCS_MODEL = "voyage-4"
 # Facts (prose-drift) embedding model. Pinned separately from SESSIONS_MODEL so
 # the Inc 1-B docs/sessions re-embed cannot silently restrand fact vectors into
 # a different vector space. Facts are empty until Inc 2, so this can be set to
 # the current frontier with no migration.
 FACTS_MODEL = "voyage-4"
+
+# Embedding output dimensions (model DEFAULT -- we never send an
+# output_dimension override, so each model emits its default-width vector).
+# Recorded so the Inc 1-B in-place re-embed is provably dim-safe: voyage-4's
+# default 1024 == voyage-3's 1024 == voyage-code-3's 1024, so re-embedded
+# vectors overwrite existing chunk ids in the same Chroma collection with no
+# recreate. Equal dim is NECESSARY (vectors fit) but NOT SUFFICIENT -- a
+# different vector space still requires the real re-embed the trigger delivers.
+EMBED_DIMS = {
+    "voyage-3": 1024,
+    "voyage-4": 1024,
+    "voyage-code-3": 1024,
+}
 
 # Chunking defaults
 CODE_CHUNK_LINES = 200

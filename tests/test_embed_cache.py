@@ -87,6 +87,51 @@ def test_put_empty_items_noop(tmp_path):
     cache.close()
 
 
+def test_collection_model_absent_returns_none(tmp_path):
+    """No marker recorded yet -> None. Existing (pre-B2) collections read None,
+    which the run_index pre-pass treats as 'differs from configured model'."""
+    cache = EmbedCache(tmp_path / "c.db")
+    assert cache.get_collection_model("proj-docs") is None
+    cache.close()
+
+
+def test_set_then_get_collection_model_roundtrip(tmp_path):
+    cache = EmbedCache(tmp_path / "c.db")
+    cache.set_collection_model("proj-docs", "voyage-4")
+    assert cache.get_collection_model("proj-docs") == "voyage-4"
+    cache.close()
+
+
+def test_set_collection_model_overwrites(tmp_path):
+    """The marker is updated in place when a collection is re-embedded."""
+    cache = EmbedCache(tmp_path / "c.db")
+    cache.set_collection_model("proj-docs", "voyage-3")
+    cache.set_collection_model("proj-docs", "voyage-4")
+    assert cache.get_collection_model("proj-docs") == "voyage-4"
+    cache.close()
+
+
+def test_collection_model_persists_across_instances(tmp_path):
+    """The post-pass marker must survive process exit (cron run -> next run)."""
+    db = tmp_path / "c.db"
+    c1 = EmbedCache(db)
+    c1.set_collection_model("proj-sessions", "voyage-4")
+    c1.close()
+    c2 = EmbedCache(db)
+    assert c2.get_collection_model("proj-sessions") == "voyage-4"
+    c2.close()
+
+
+def test_collection_model_isolated_per_collection(tmp_path):
+    """Per-collection key: a docs re-embed must not flip the sessions marker."""
+    cache = EmbedCache(tmp_path / "c.db")
+    cache.set_collection_model("a-docs", "voyage-4")
+    cache.set_collection_model("b-sessions", "voyage-3")
+    assert cache.get_collection_model("a-docs") == "voyage-4"
+    assert cache.get_collection_model("b-sessions") == "voyage-3"
+    cache.close()
+
+
 def test_uses_wal_and_busy_timeout(tmp_path):
     """Concurrency: overlapping reindex runs write the same db. WAL lets a
     reader proceed during a write; busy_timeout makes a competing writer wait

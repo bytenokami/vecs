@@ -56,6 +56,20 @@ class EmbedCache:
             )
             """
         )
+        # B2: per-collection embedding-model marker. Records which model a
+        # collection was last embedded under so run_index can detect a model
+        # change (e.g. docs/sessions voyage-3 -> voyage-4) and trigger a
+        # re-embed. Kept here, NOT in the Manifest: the Manifest's prune()
+        # iterates its keys and deletes any whose path is missing, so a
+        # non-path marker key would be silently dropped.
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS collection_models (
+                collection TEXT PRIMARY KEY,
+                model      TEXT NOT NULL
+            )
+            """
+        )
         self._conn.commit()
 
     @staticmethod
@@ -98,6 +112,28 @@ class EmbedCache:
             "INSERT OR REPLACE INTO embeddings (model, content_hash, embedding) "
             "VALUES (?, ?, ?)",
             rows,
+        )
+        self._conn.commit()
+
+    def get_collection_model(self, collection: str) -> str | None:
+        """Return the model a collection was last embedded under, or None.
+
+        None means no marker recorded (a pre-B2 / never-indexed collection).
+        run_index treats None as 'differs from the configured model' so the
+        first post-deploy reindex re-embeds an existing collection in place.
+        """
+        row = self._conn.execute(
+            "SELECT model FROM collection_models WHERE collection = ?",
+            (collection,),
+        ).fetchone()
+        return row[0] if row else None
+
+    def set_collection_model(self, collection: str, model: str) -> None:
+        """Record (overwrite) the model a collection is now embedded under."""
+        self._conn.execute(
+            "INSERT OR REPLACE INTO collection_models (collection, model) "
+            "VALUES (?, ?)",
+            (collection, model),
         )
         self._conn.commit()
 
