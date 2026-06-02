@@ -269,7 +269,7 @@ def test_migrate_matches_docs_dir(tmp_path):
     config = VecsConfig(path=tmp_path / "config.yaml")
     config.projects["proj"] = ProjectConfig(
         name="proj",
-        docs_dir=Path("/docs/proj"),
+        docs_dirs=[Path("/docs/proj")],
     )
 
     migrate_global_manifest(global_manifest, manifests_dir, config)

@@ -242,6 +242,119 @@ def test_load_config_no_sessions_dirs(tmp_path):
     assert p.sessions_dirs == []
 
 
+# --- docs_dirs multi-path coercion (Inc 1-pipeline, Phase-7 dry-run) ---
+# ProjectConfig gains canonical docs_dirs: list[Path]; legacy singular docs_dir
+# is coerced into the list (mirrors the sessions_dir -> sessions_dirs precedent).
+# docs_dir survives as a get/set property so every downstream read site
+# (searcher, indexer) and the add_document auto-configure writes (cli, mcp_server)
+# behave identically.
+
+def test_load_config_singular_docs_dir_coerced_to_list(tmp_path):
+    """Legacy singular docs_dir loads as a single-element docs_dirs list."""
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump({
+        "projects": {
+            "proj": {
+                "code_dirs": [{"path": "/tmp/code", "extensions": [".cs"]}],
+                "docs_dir": "/tmp/docs",
+            }
+        }
+    }))
+    p = load_config(config_file).projects["proj"]
+    assert p.docs_dirs == [Path("/tmp/docs")]
+    # downstream back-compat: the singular accessor still resolves identically
+    assert p.docs_dir == Path("/tmp/docs")
+
+
+def test_load_config_multi_docs_dirs(tmp_path):
+    """Multiple docs_dirs load as a list; singular accessor returns the first."""
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump({
+        "projects": {
+            "proj": {
+                "code_dirs": [{"path": "/tmp/code", "extensions": [".cs"]}],
+                "docs_dirs": ["/tmp/docs1", "/tmp/docs2"],
+            }
+        }
+    }))
+    p = load_config(config_file).projects["proj"]
+    assert p.docs_dirs == [Path("/tmp/docs1"), Path("/tmp/docs2")]
+    assert p.docs_dir == Path("/tmp/docs1")
+
+
+def test_load_config_no_docs_dirs(tmp_path):
+    """No docs config -> empty docs_dirs list and None singular accessor."""
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump({
+        "projects": {
+            "proj": {
+                "code_dirs": [{"path": "/tmp/code", "extensions": [".cs"]}],
+            }
+        }
+    }))
+    p = load_config(config_file).projects["proj"]
+    assert p.docs_dirs == []
+    assert p.docs_dir is None
+
+
+def test_docs_dir_setter_writes_through_to_docs_dirs():
+    """Assigning docs_dir (the cli/mcp_server auto-configure path) updates docs_dirs."""
+    p = ProjectConfig(name="proj")
+    assert p.docs_dirs == []
+    assert p.docs_dir is None
+    p.docs_dir = Path("/tmp/auto/docs")
+    assert p.docs_dirs == [Path("/tmp/auto/docs")]
+    assert p.docs_dir == Path("/tmp/auto/docs")
+    p.docs_dir = None
+    assert p.docs_dirs == []
+
+
+def test_save_and_reload_docs_dir_roundtrip(tmp_path):
+    """A single docs_dir set via add_project survives save/load identically."""
+    config_file = tmp_path / "config.yaml"
+    config = load_config(config_file)
+    config.add_project(
+        "test",
+        code_dirs=[CodeDir(path=Path("/tmp/code"), extensions={".cs"})],
+        docs_dir=Path("/tmp/docs"),
+    )
+    config.save()
+    p = load_config(config_file).projects["test"]
+    assert p.docs_dirs == [Path("/tmp/docs")]
+    assert p.docs_dir == Path("/tmp/docs")
+
+
+def test_save_and_reload_multi_docs_dirs(tmp_path):
+    """Multi docs_dirs round-trip through save/load with no data loss."""
+    from vecs.config import VecsConfig, _clear_config_cache
+
+    config_file = tmp_path / "config.yaml"
+    config = VecsConfig(path=config_file)
+    config.projects["test"] = ProjectConfig(
+        name="test",
+        code_dirs=[CodeDir(path=Path("/tmp/code"), extensions={".cs"})],
+        docs_dirs=[Path("/tmp/d1"), Path("/tmp/d2")],
+    )
+    config.save()
+    _clear_config_cache()
+    p = load_config(config_file).projects["test"]
+    assert p.docs_dirs == [Path("/tmp/d1"), Path("/tmp/d2")]
+
+
+def test_save_empty_docs_dirs_omitted(tmp_path):
+    """Empty docs_dirs writes neither the plural nor the legacy singular key."""
+    config_file = tmp_path / "config.yaml"
+    config = load_config(config_file)
+    config.add_project(
+        "test",
+        code_dirs=[CodeDir(path=Path("/tmp/code"), extensions={".cs"})],
+    )
+    config.save()
+    raw = yaml.safe_load(config_file.read_text())
+    assert "docs_dirs" not in raw["projects"]["test"]
+    assert "docs_dir" not in raw["projects"]["test"]
+
+
 # --- Config caching tests (M1) ---
 
 def test_config_cache_returns_same_object(tmp_path):

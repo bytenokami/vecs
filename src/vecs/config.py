@@ -46,12 +46,26 @@ class ProjectConfig:
     name: str
     code_dirs: list[CodeDir] = field(default_factory=list)
     sessions_dirs: list[Path] = field(default_factory=list)
-    docs_dir: Path | None = None
+    docs_dirs: list[Path] = field(default_factory=list)
     # Explicit Codex routing cwds: any session whose session_meta.cwd resolves
     # under one of these is routed to this project. Bypasses bidirectional
     # containment matching against code_dirs.
     codex_cwds: list[Path] = field(default_factory=list)
     prose_drift_enabled: bool = False
+
+    @property
+    def docs_dir(self) -> Path | None:
+        """Legacy singular accessor: the first configured docs dir, or None.
+
+        `docs_dirs` is the canonical store; this property keeps existing read
+        sites (searcher, indexer) and the add_document auto-configure writes
+        (cli, mcp_server) working unchanged. Multi-source docs land in Inc 1-F.
+        """
+        return self.docs_dirs[0] if self.docs_dirs else None
+
+    @docs_dir.setter
+    def docs_dir(self, value: Path | None) -> None:
+        self.docs_dirs = [value] if value is not None else []
 
     @property
     def code_collection(self) -> str:
@@ -97,7 +111,7 @@ class VecsConfig:
             name=name,
             code_dirs=code_dirs or [],
             sessions_dirs=resolved_dirs,
-            docs_dir=docs_dir,
+            docs_dirs=[docs_dir] if docs_dir else [],
             codex_cwds=codex_cwds or [],
         )
 
@@ -135,8 +149,8 @@ class VecsConfig:
                     proj["code_dirs"].append(cd_dict)
             if p.sessions_dirs:
                 proj["sessions_dirs"] = [str(d) for d in p.sessions_dirs]
-            if p.docs_dir:
-                proj["docs_dir"] = str(p.docs_dir)
+            if p.docs_dirs:
+                proj["docs_dirs"] = [str(d) for d in p.docs_dirs]
             if p.codex_cwds:
                 proj["codex_cwds"] = [str(c) for c in p.codex_cwds]
             data["projects"][name] = proj
@@ -216,6 +230,12 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> VecsConfig:
             sessions_dirs_raw = [proj["sessions_dir"]]
         sessions_dirs = [Path(s) for s in sessions_dirs_raw]
 
+        # Support both plural docs_dirs (list) and legacy singular docs_dir
+        docs_dirs_raw = proj.get("docs_dirs", [])
+        if not docs_dirs_raw and proj.get("docs_dir"):
+            docs_dirs_raw = [proj["docs_dir"]]
+        docs_dirs = [Path(d) for d in docs_dirs_raw]
+
         codex_cwds_raw = proj.get("codex_cwds", []) or []
         codex_cwds = [Path(c) for c in codex_cwds_raw]
 
@@ -223,7 +243,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> VecsConfig:
             name=name,
             code_dirs=code_dirs,
             sessions_dirs=sessions_dirs,
-            docs_dir=Path(proj["docs_dir"]) if proj.get("docs_dir") else None,
+            docs_dirs=docs_dirs,
             codex_cwds=codex_cwds,
             prose_drift_enabled=bool(proj.get("prose_drift_enabled", False)),
         )
