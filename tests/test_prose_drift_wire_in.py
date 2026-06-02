@@ -299,7 +299,7 @@ def _prep_indexer(monkeypatch, tmp_path, enabled):
                         lambda msgs, sid, n, overlap: [
                             {"text": "[user]: x", "metadata": {"chunk_index": 0}}])
     monkeypatch.setattr(indexer, "_make_chunk_id", lambda a, b: f"{a}#{b}")
-    monkeypatch.setattr(indexer, "_embed_and_store", lambda chunks, c, m, vo: {ch["id"] for ch in chunks})
+    monkeypatch.setattr(indexer, "_embed_and_store", lambda chunks, c, m, vo, batcher=None, cache=None: {ch["id"] for ch in chunks})
     monkeypatch.setattr(indexer, "_track_embed_success",
                         lambda ids, c2f, fec, fc, coll: set(c2f.values()))
     monkeypatch.setattr(indexer, "_sync_bm25", lambda *a, **k: None)

@@ -1,5 +1,6 @@
 import hashlib
 import json
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -337,6 +338,185 @@ def test_embed_and_store_empty_returns_empty_list():
     vo = MagicMock()
     result = _embed_and_store([], collection, "voyage-code-3", vo)
     assert result == []
+
+
+# --- C: content-hash embedding cache wired into _embed_and_store ---
+
+def _embedded_texts(call):
+    """Extract the `texts` arg from a vo.embed(...) call (positional or kw)."""
+    if call.args:
+        return call.args[0]
+    return call.kwargs.get("texts")
+
+
+def test_embed_and_store_caches_unchanged_chunks(tmp_path):
+    """Re-indexing a file where one chunk changed embeds ONLY the changed chunk;
+    the unchanged chunk is served from the cache (no Voyage call)."""
+    from vecs.embed_cache import EmbedCache
+
+    cache = EmbedCache(tmp_path / "c.db")
+    collection = MagicMock()
+    vo = MagicMock()
+
+    chunks_v1 = [
+        {"id": "code:f.cs:0", "text": "AAA", "metadata": {"file_path": "f.cs", "chunk_index": 0}},
+        {"id": "code:f.cs:1", "text": "BBB", "metadata": {"file_path": "f.cs", "chunk_index": 1}},
+    ]
+    vo.embed.return_value = FakeEmbedResult(2)
+    ids1 = _embed_and_store(chunks_v1, collection, "voyage-code-3", vo, cache=cache)
+    assert set(ids1) == {"code:f.cs:0", "code:f.cs:1"}
+    assert vo.embed.call_count == 1
+    assert _embedded_texts(vo.embed.call_args) == ["AAA", "BBB"]
+
+    # chunk 0 changes; chunk 1 is byte-identical -> cache hit
+    vo.embed.reset_mock()
+    vo.embed.return_value = FakeEmbedResult(1)
+    chunks_v2 = [
+        {"id": "code:f.cs:0", "text": "AAA-changed", "metadata": {"file_path": "f.cs", "chunk_index": 0}},
+        {"id": "code:f.cs:1", "text": "BBB", "metadata": {"file_path": "f.cs", "chunk_index": 1}},
+    ]
+    ids2 = _embed_and_store(chunks_v2, collection, "voyage-code-3", vo, cache=cache)
+
+    # exactly the changed chunk hit Voyage
+    assert vo.embed.call_count == 1
+    assert _embedded_texts(vo.embed.call_args) == ["AAA-changed"]
+    # both chunks are reported succeeded (hit + miss)
+    assert set(ids2) == {"code:f.cs:0", "code:f.cs:1"}
+    cache.close()
+
+
+def test_cache_hit_preserves_succeeded_equals_expected_invariant(tmp_path):
+    """Trap #4: a cache-hit chunk MUST count toward succeeded_ids so the file
+    reaches succeeded == expected and is marked indexed in one pass, instead of
+    being reprocessed forever."""
+    from vecs.embed_cache import EmbedCache
+
+    cache = EmbedCache(tmp_path / "c.db")
+    collection = MagicMock()
+    vo = MagicMock()
+    f = Path("/repo/f.cs")
+
+    def meta(i):
+        return {"file_path": "f.cs", "chunk_index": i}
+
+    vo.embed.return_value = FakeEmbedResult(2)
+    _embed_and_store(
+        [
+            {"id": "code:f.cs:0", "text": "AAA", "metadata": meta(0)},
+            {"id": "code:f.cs:1", "text": "BBB", "metadata": meta(1)},
+        ],
+        collection, "voyage-code-3", vo, cache=cache,
+    )
+
+    # re-index: chunk 0 changed, chunk 1 is a cache hit
+    vo.embed.return_value = FakeEmbedResult(1)
+    succeeded = _embed_and_store(
+        [
+            {"id": "code:f.cs:0", "text": "AAA2", "metadata": meta(0)},
+            {"id": "code:f.cs:1", "text": "BBB", "metadata": meta(1)},
+        ],
+        collection, "voyage-code-3", vo, cache=cache,
+    )
+
+    chunk_to_file = {"code:f.cs:0": f, "code:f.cs:1": f}
+    fully = _track_embed_success(succeeded, chunk_to_file, {f: 2}, {}, collection)
+    assert f in fully  # one pass marks it indexed despite a cache-hit chunk
+    cache.close()
+
+
+def test_embed_and_store_cache_keys_on_embedded_text_not_full_text(tmp_path, monkeypatch):
+    """Truncation safety (Phase-4 finding): an oversized chunk is truncated by
+    _make_batches before embedding, so the cache must key on the EMBEDDED
+    (post-truncation) text. Keying on the full text would false-hit on a later
+    run and pair the full document with a truncated-text vector."""
+    from vecs.embed_cache import EmbedCache
+
+    cache = EmbedCache(tmp_path / "c.db")
+    collection = MagicMock()
+    vo = MagicMock()
+    vo.embed.return_value = FakeEmbedResult(1)
+
+    full = "X" * 1000
+    truncated = "X" * 10
+    chunk = {"id": "code:f.cs:0", "text": full, "metadata": {"file_path": "f.cs", "chunk_index": 0}}
+
+    # Simulate _make_batches truncating the oversized chunk before embed.
+    monkeypatch.setattr(
+        "vecs.indexer._make_batches",
+        lambda chunks, batcher=None: iter([[{**chunk, "text": truncated}]]) if chunks else iter([]),
+    )
+    _embed_and_store([chunk], collection, "voyage-code-3", vo, cache=cache)
+
+    # The embedded (truncated) text is cached; the full text is NOT, so a later
+    # run re-embeds rather than serving a wrong-doc vector.
+    assert cache.get("voyage-code-3", [EmbedCache.content_hash(truncated)])
+    assert cache.get("voyage-code-3", [EmbedCache.content_hash(full)]) == {}
+    cache.close()
+
+
+def test_embed_and_store_survives_cache_get_and_put_errors():
+    """A cache whose get/put raise (e.g. 'database is locked' under overlapping
+    reindex) MUST NOT abort indexing: chunks still embed and all ids return, so
+    the caller can mark the manifest and avoid a reprocess-forever loop."""
+    class BrokenCache:
+        def get(self, model, hashes):
+            raise Exception("database is locked")
+
+        def put(self, model, items):
+            raise Exception("database is locked")
+
+    chunks = [
+        {"id": "code:f.cs:0", "text": "AAA", "metadata": {"file_path": "f.cs", "chunk_index": 0}},
+        {"id": "code:f.cs:1", "text": "BBB", "metadata": {"file_path": "f.cs", "chunk_index": 1}},
+    ]
+    collection = MagicMock()
+    vo = MagicMock()
+    vo.embed.return_value = FakeEmbedResult(2)
+
+    result = _embed_and_store(chunks, collection, "voyage-code-3", vo, cache=BrokenCache())
+    assert set(result) == {"code:f.cs:0", "code:f.cs:1"}
+    assert vo.embed.call_count == 1  # cache read failed -> all chunks embedded
+
+
+def test_index_single_doc_stamps_mtime_version_id(tmp_path, monkeypatch):
+    """index_single_doc (vecs add-document / MCP add_document) must stamp the
+    same mtime version_id as index_docs on the shared -docs collection."""
+    from vecs.indexer import index_single_doc
+    from vecs.config import VecsConfig
+
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    md = docs / "note.md"
+    md.write_text("# Note\n\nBody text long enough to chunk into something useful.\n")
+    expected = str(md.stat().st_mtime)
+
+    cfg = VecsConfig(path=tmp_path / "config.yaml")
+    cfg.projects["p"] = ProjectConfig(name="p", docs_dirs=[docs])
+    monkeypatch.setattr("vecs.indexer.load_config", lambda: cfg)
+    monkeypatch.setattr("vecs.indexer.get_voyage_client", lambda: MagicMock())
+    db, _collection = _make_index_db(tmp_path)
+    monkeypatch.setattr("vecs.indexer.get_chromadb_client", lambda: db)
+
+    captured = _capture_chunks_via_index_collection(monkeypatch)
+    index_single_doc("p", md)
+
+    assert captured["chunks"]
+    assert all(c["metadata"]["version_id"] == expected for c in captured["chunks"])
+
+
+def test_embed_and_store_no_cache_unchanged_behavior():
+    """With cache=None (default), behavior is identical to pre-cache: all embed."""
+    chunks = [
+        {"id": f"code:f.cs:{i}", "text": f"chunk {i}", "metadata": {"file_path": "f.cs", "chunk_index": i}}
+        for i in range(3)
+    ]
+    collection = MagicMock()
+    vo = MagicMock()
+    vo.embed.return_value = FakeEmbedResult(3)
+    result = _embed_and_store(chunks, collection, "voyage-code-3", vo)
+    assert set(result) == {"code:f.cs:0", "code:f.cs:1", "code:f.cs:2"}
+    assert vo.embed.call_count == 1
 
 
 def test_embed_and_store_treats_voyage_timeout_as_transient():
@@ -1419,7 +1599,7 @@ def test_index_session_files_stamps_agent_metadata(tmp_path, monkeypatch):
 
     captured: dict = {}
 
-    def fake_embed(chunks, collection, model, vo, batcher=None):
+    def fake_embed(chunks, collection, model, vo, batcher=None, cache=None):
         captured["chunks"] = chunks
         return [c["id"] for c in chunks]
 
@@ -1471,7 +1651,7 @@ def test_index_session_files_codex_path_tags_codex(tmp_path, monkeypatch):
 
     captured: dict = {}
 
-    def fake_embed(chunks, collection, model, vo, batcher=None):
+    def fake_embed(chunks, collection, model, vo, batcher=None, cache=None):
         captured["chunks"] = chunks
         return [c["id"] for c in chunks]
 
@@ -1492,6 +1672,247 @@ def test_index_session_files_codex_path_tags_codex(tmp_path, monkeypatch):
 
     assert stored >= 1
     assert all(c["metadata"]["agent"] == "codex" for c in captured["chunks"])
+
+
+# --- C: version_id stamping (git SHA for code, mtime for docs, session id) ---
+
+
+def _git_init_commit(repo: Path, relfile: str, content: str) -> str:
+    """Init a git repo with one committed file; return the HEAD sha."""
+    repo.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+    fp = repo / relfile
+    fp.parent.mkdir(parents=True, exist_ok=True)
+    fp.write_text(content)
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "init"],
+        cwd=repo, check=True,
+    )
+    out = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True,
+    )
+    return out.stdout.strip()
+
+
+def _capture_chunks_via_index_collection(monkeypatch):
+    """Patch _index_collection to capture the chunks passed in (code/docs path)."""
+    captured: dict = {}
+
+    def fake_index_collection(*, chunks, manifest, files_to_process, file_hashes, **kw):
+        captured["chunks"] = chunks
+        for f in files_to_process:
+            manifest.mark_indexed(f, file_hashes[f])
+        manifest.save()
+        return len(chunks)
+
+    monkeypatch.setattr("vecs.indexer._index_collection", fake_index_collection)
+    monkeypatch.setattr("vecs.indexer._sync_bm25", lambda *a, **kw: None)
+    return captured
+
+
+def test_git_sha_returns_head_for_repo(tmp_path):
+    from vecs.indexer import _git_sha
+    repo = tmp_path / "r"
+    sha = _git_init_commit(repo, "a.cs", "class A{}")
+    assert _git_sha(repo) == sha
+    sub = repo / "sub"
+    sub.mkdir()
+    assert _git_sha(sub) == sha  # resolves from a subdir too
+
+
+def test_git_sha_none_for_non_git_dir(tmp_path):
+    from vecs.indexer import _git_sha
+    d = tmp_path / "nogit"
+    d.mkdir()
+    assert _git_sha(d) is None
+
+
+def test_index_code_stamps_git_sha_version_id(tmp_path, monkeypatch):
+    """Each stored code chunk carries version_id == the repo HEAD sha."""
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+    repo = tmp_path / "repo"
+    sha = _git_init_commit(repo, "Main.cs", "public class Main { void M() { int x = 1; } }")
+
+    project = ProjectConfig(name="p", code_dirs=[CodeDir(path=repo, extensions={".cs"})])
+    captured = _capture_chunks_via_index_collection(monkeypatch)
+    db, _collection = _make_index_db(tmp_path)
+    index_code(project, vo=MagicMock(), db=db)
+
+    assert captured["chunks"]
+    assert all(c["metadata"]["version_id"] == sha for c in captured["chunks"])
+
+
+def test_index_docs_stamps_mtime_version_id(tmp_path, monkeypatch):
+    """Each stored docs chunk carries version_id == the file mtime."""
+    from vecs.indexer import index_docs
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    md = docs / "readme.md"
+    md.write_text("# Title\n\nSome documentation body text that is long enough to chunk.\n")
+    expected = str(md.stat().st_mtime)
+
+    project = ProjectConfig(name="p", docs_dirs=[docs])
+    captured = _capture_chunks_via_index_collection(monkeypatch)
+    db, _collection = _make_index_db(tmp_path)
+    index_docs(project, vo=MagicMock(), db=db)
+
+    assert captured["chunks"]
+    assert all(c["metadata"]["version_id"] == expected for c in captured["chunks"])
+
+
+def test_index_session_files_stamps_version_id(tmp_path, monkeypatch):
+    """Each stored session chunk carries version_id == the session id (file stem)."""
+    from vecs.indexer import _index_session_files
+    from vecs.chunkers import preprocess_session
+
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+    monkeypatch.setattr("vecs.indexer._sync_bm25", lambda *a, **kw: None)
+
+    raw = (
+        '{"type": "user", "message": {"role": "user", "content": "hello there friend"}}\n'
+        '{"type": "assistant", "message": {"role": "assistant", "content": "hi back"}}\n'
+    )
+    sess = tmp_path / "rollout-abc.jsonl"
+    sess.write_text(raw)
+
+    captured: dict = {}
+
+    def fake_embed(chunks, collection, model, vo, batcher=None, cache=None):
+        captured["chunks"] = chunks
+        return [c["id"] for c in chunks]
+
+    monkeypatch.setattr("vecs.indexer._embed_and_store", fake_embed)
+    db = MagicMock()
+    db.get_or_create_collection.return_value = MagicMock()
+
+    _index_session_files(
+        ProjectConfig(name="p"),
+        files=[sess],
+        parser_fn=preprocess_session,
+        agent_tag="claude_code",
+        vo=MagicMock(),
+        db=db,
+        log_label="t",
+    )
+
+    assert captured["chunks"]
+    assert all(c["metadata"]["version_id"] == "rollout-abc" for c in captured["chunks"])
+
+
+# --- C: production wiring of the EmbedCache through run_index / indexers ---
+
+def test_index_code_uses_embed_cache_end_to_end(tmp_path, monkeypatch):
+    """A cache passed to index_code is threaded down to _embed_and_store: a
+    second index of unchanged files makes zero Voyage calls."""
+    from vecs.embed_cache import EmbedCache
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+    monkeypatch.setattr("vecs.indexer._sync_bm25", lambda *a, **kw: None)
+
+    repo = tmp_path / "repo"
+    _git_init_commit(repo, "A.cs", "public class A { void M() { int x = 1; } }")
+    project = ProjectConfig(name="p", code_dirs=[CodeDir(path=repo, extensions={".cs"})])
+
+    cache = EmbedCache(tmp_path / "c.db")
+    db, _collection = _make_index_db(tmp_path)
+    vo = MagicMock()
+    vo.embed.side_effect = lambda texts, model, input_type: FakeEmbedResult(len(texts))
+
+    n1 = index_code(project, vo=vo, db=db, cache=cache)
+    assert n1 >= 1
+    assert vo.embed.call_count >= 1
+
+    # Force a re-index (drop the manifest) but keep the cache warm.
+    (tmp_path / "manifests" / "p.json").unlink()
+    vo.embed.reset_mock()
+    n2 = index_code(project, vo=vo, db=db, cache=cache)
+    assert n2 >= 1                    # same chunks re-stored
+    assert vo.embed.call_count == 0   # all served from cache -> wiring intact
+    cache.close()
+
+
+def test_index_session_files_forwards_cache(tmp_path, monkeypatch):
+    """_index_session_files passes its cache through to _embed_and_store."""
+    from vecs.indexer import _index_session_files
+    from vecs.chunkers import preprocess_session
+    from vecs.embed_cache import EmbedCache
+
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+    monkeypatch.setattr("vecs.indexer._sync_bm25", lambda *a, **kw: None)
+
+    sess = tmp_path / "rollout-z.jsonl"
+    sess.write_text('{"type": "user", "message": {"role": "user", "content": "hi there friend"}}\n')
+
+    captured: dict = {}
+
+    def fake_embed(chunks, collection, model, vo, batcher=None, cache=None):
+        captured["cache"] = cache
+        return [c["id"] for c in chunks]
+
+    monkeypatch.setattr("vecs.indexer._embed_and_store", fake_embed)
+    db = MagicMock()
+    db.get_or_create_collection.return_value = MagicMock()
+    cache = EmbedCache(tmp_path / "c.db")
+
+    _index_session_files(
+        ProjectConfig(name="p"),
+        files=[sess],
+        parser_fn=preprocess_session,
+        agent_tag="claude_code",
+        vo=MagicMock(),
+        db=db,
+        log_label="t",
+        cache=cache,
+    )
+    assert captured["cache"] is cache
+    cache.close()
+
+
+def test_run_index_threads_one_cache_to_all_indexers(tmp_path, monkeypatch):
+    """run_index constructs a single EmbedCache and hands it to every indexer."""
+    from vecs.config import _clear_config_cache
+
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump({
+        "projects": {"p": {"code_dirs": [{"path": str(tmp_path / "code"), "extensions": [".cs"]}]}},
+        "codex_disabled": True,
+    }))
+    (tmp_path / "code").mkdir()
+    _clear_config_cache()
+
+    monkeypatch.setattr(
+        "vecs.indexer.load_config",
+        lambda: __import__("vecs.config", fromlist=["load_config"]).load_config(config_file),
+    )
+    monkeypatch.setattr("vecs.indexer.migrate_global_manifest", lambda *a, **kw: None)
+    monkeypatch.setattr("vecs.indexer.get_voyage_client", lambda: MagicMock())
+    monkeypatch.setattr("vecs.indexer.get_chromadb_client", lambda: MagicMock())
+    monkeypatch.setattr("vecs.indexer.VECS_DIR", tmp_path)
+    monkeypatch.setattr("vecs.indexer.CHROMADB_DIR", tmp_path / "chromadb")
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+
+    seen: dict = {}
+
+    def cap(name):
+        def f(*a, cache=None, **kw):
+            seen[name] = cache
+            return 0
+        return f
+
+    monkeypatch.setattr("vecs.indexer.index_code", cap("code"))
+    monkeypatch.setattr("vecs.indexer.index_sessions", cap("sessions"))
+    monkeypatch.setattr("vecs.indexer.index_docs", cap("docs"))
+
+    from vecs.indexer import run_index
+    run_index()
+
+    assert seen["code"] is not None
+    assert seen["code"] is seen["sessions"]
+    assert seen["code"] is seen["docs"]
 
 
 def test_index_session_files_empty_input_returns_zero(tmp_path, monkeypatch):

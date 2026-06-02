@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import subprocess
 import sys
 import time
 from collections.abc import Iterator
@@ -36,6 +37,7 @@ from vecs.config import (
     load_config,
 )
 from vecs.doc_chunker import chunk_doc, extract_pdf_text
+from vecs.embed_cache import EmbedCache
 
 
 # Module-level set: payload types we logged-once-per-run as unrecognized.
@@ -348,6 +350,27 @@ def _make_chunk_id(source_key: str, chunk_index: int) -> str:
     return f"{source_key}:{chunk_index}"
 
 
+def _git_sha(path: Path) -> str | None:
+    """Best-effort current commit SHA of the git work tree containing `path`.
+
+    Returns None when `path` is not inside a git repo or git is unavailable.
+    Used as the code `version_id` (C): the repo HEAD at index time, so a later
+    HEAD lets stale-retrieval detection (E) tell when a chunk is out of date.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.strip() or None
+
+
 def _delete_stale_chunks_after_embed(
     collection: chromadb.Collection,
     metadata_key: str,
@@ -388,11 +411,18 @@ def _embed_and_store(
     model: str,
     vo: voyageai.Client,
     batcher: AdaptiveBatcher | None = None,
+    cache: EmbedCache | None = None,
 ) -> list[str]:
     """Embed and store chunks. Returns list of successfully stored chunk IDs.
 
     Uses AdaptiveBatcher for token estimation when provided. Calibrates
     from Voyage API response usage data.
+
+    When a `cache` is supplied (C), byte-identical chunks already embedded under
+    this `model` are served from the cache without a Voyage call -- but they are
+    STILL upserted and counted in the returned ids, so the caller's
+    `succeeded == expected` manifest invariant holds (see _track_embed_success).
+    Freshly-embedded (cache-miss) vectors are written back to the cache.
     """
     if not chunks:
         return []
@@ -401,7 +431,43 @@ def _embed_and_store(
         batcher = AdaptiveBatcher()
 
     succeeded_ids: list[str] = []
-    for batch in _make_batches(chunks, batcher):
+
+    # C: partition into cache hits (served + upserted, no Voyage call) and
+    # misses (embedded below, then written back to the cache). A cache READ
+    # failure (e.g. "database is locked" under overlapping reindex) degrades to
+    # embedding everything this run -- it must never abort indexing.
+    chunks_to_embed = chunks
+    if cache is not None:
+        cached: dict[str, list[float]] = {}
+        hashes: list[str] = []
+        try:
+            hashes = [EmbedCache.content_hash(c["text"]) for c in chunks]
+            cached = cache.get(model, hashes)
+        except Exception as e:
+            _log(f"  Cache read failed ({e}); embedding all chunks this run.")
+            cached = {}
+        if cached:
+            hit_chunks: list[dict] = []
+            hit_embeddings: list[list[float]] = []
+            misses: list[dict] = []
+            for c, h in zip(chunks, hashes):
+                if h in cached:
+                    hit_chunks.append(c)
+                    hit_embeddings.append(cached[h])
+                else:
+                    misses.append(c)
+            if hit_chunks:
+                collection.upsert(
+                    ids=[c["id"] for c in hit_chunks],
+                    embeddings=hit_embeddings,
+                    documents=[c["text"] for c in hit_chunks],
+                    metadatas=[c["metadata"] for c in hit_chunks],
+                )
+                succeeded_ids.extend(c["id"] for c in hit_chunks)
+                _log(f"  Cache: {len(hit_chunks)} hit, {len(misses)} to embed")
+            chunks_to_embed = misses
+
+    for batch in _make_batches(chunks_to_embed, batcher):
         texts = [c["text"] for c in batch]
         batch_chars = sum(len(t) for t in texts)
 
@@ -453,6 +519,22 @@ def _embed_and_store(
             metadatas=metadatas,
         )
         succeeded_ids.extend(ids)
+        # C: write freshly-embedded vectors back to the cache, keyed by
+        # (model, content_hash of the EMBEDDED text). Hashing the post-batch
+        # text -- not the pre-truncation original -- keeps the key aligned with
+        # the bytes actually embedded (_make_batches may truncate an oversized
+        # chunk). Never fatal: a failed write only costs a re-embed next run.
+        if cache is not None:
+            try:
+                cache.put(
+                    model,
+                    [
+                        (EmbedCache.content_hash(t), emb)
+                        for t, emb in zip(texts, result.embeddings)
+                    ],
+                )
+            except Exception as e:
+                _log(f"  Cache write failed ({e}); continuing.")
         _log(f"  Indexed {len(succeeded_ids)}/{len(chunks)} chunks")
 
     return succeeded_ids
@@ -624,6 +706,7 @@ def _index_collection(
     file_cleanup: dict[Path, tuple[str, str, set[str]]],
     files_to_process: list[Path],
     file_hashes: dict[Path, str],
+    cache: EmbedCache | None = None,
 ) -> int:
     """Shared indexing pipeline: embed, track success, cleanup orphans, save manifest.
 
@@ -645,7 +728,7 @@ def _index_collection(
     if not chunks:
         return 0
 
-    succeeded_ids = _embed_and_store(chunks, collection, model, vo)
+    succeeded_ids = _embed_and_store(chunks, collection, model, vo, cache=cache)
 
     fully_succeeded = _track_embed_success(
         succeeded_ids, chunk_to_file, file_expected_count, file_cleanup, collection,
@@ -658,7 +741,12 @@ def _index_collection(
     return len(succeeded_ids)
 
 
-def index_code(project: ProjectConfig, vo: voyageai.Client, db: chromadb.ClientAPI) -> int:
+def index_code(
+    project: ProjectConfig,
+    vo: voyageai.Client,
+    db: chromadb.ClientAPI,
+    cache: EmbedCache | None = None,
+) -> int:
     """Index code files for a project. Returns count of new chunks."""
     if not project.code_dirs:
         _log(f"[{project.name}] No code_dirs configured, skipping.")
@@ -735,6 +823,10 @@ def index_code(project: ProjectConfig, vo: voyageai.Client, db: chromadb.ClientA
 
         _log(f"[{project.name}] {code_dir.path}: {len(to_index)} files to index ({len(files)} total)")
 
+        # C: version_id for code = repo HEAD sha at index time (one git call per
+        # code_dir). Falls back to the file content hash for non-git trees.
+        code_dir_sha = _git_sha(code_dir.path)
+
         for f in to_index:
             content = f.read_text(errors="replace")
             dir_prefix = code_dir.path.name
@@ -742,9 +834,11 @@ def index_code(project: ProjectConfig, vo: voyageai.Client, db: chromadb.ClientA
             chunks = chunk_code_file_ast(
                 content, rel_path, chunk_lines=CODE_CHUNK_LINES, overlap=CODE_CHUNK_OVERLAP
             )
+            file_version = code_dir_sha or file_hashes[f]
             chunk_ids_for_file: set[str] = set()
             for c in chunks:
                 c["id"] = _make_chunk_id(f"code:{rel_path}", c["metadata"]["chunk_index"])
+                c["metadata"]["version_id"] = file_version
                 chunk_to_file[c["id"]] = f
                 chunk_ids_for_file.add(c["id"])
             file_expected_count[f] = len(chunks)
@@ -807,6 +901,7 @@ def index_code(project: ProjectConfig, vo: voyageai.Client, db: chromadb.ClientA
         file_cleanup=file_cleanup,
         files_to_process=files_to_process,
         file_hashes=file_hashes,
+        cache=cache,
     )
 
     if total_stored > 0:
@@ -862,6 +957,7 @@ def _index_session_files(
     *,
     log_label: str,
     manifest: Manifest | None = None,
+    cache: EmbedCache | None = None,
 ) -> int:
     """Shared session indexing pipeline.
 
@@ -931,6 +1027,8 @@ def _index_session_files(
         for c in chunks:
             c["metadata"]["chunk_index"] += chunk_index_offset
             c["metadata"]["agent"] = agent_tag
+            # C: version_id for sessions = the session/run id (file stem).
+            c["metadata"]["version_id"] = session_id
             c["id"] = _make_chunk_id(f"session:{session_id}", c["metadata"]["chunk_index"])
             chunk_to_file[c["id"]] = f
             chunk_ids_for_file.add(c["id"])
@@ -953,7 +1051,7 @@ def _index_session_files(
         manifest.save()
         return 0
 
-    succeeded_ids = _embed_and_store(all_chunks, collection, SESSIONS_MODEL, vo)
+    succeeded_ids = _embed_and_store(all_chunks, collection, SESSIONS_MODEL, vo, cache=cache)
 
     fully_succeeded = _track_embed_success(
         succeeded_ids, chunk_to_file, file_expected_count, file_cleanup, collection,
@@ -1007,7 +1105,12 @@ def _index_session_files(
     return len(succeeded_ids)
 
 
-def index_sessions(project: ProjectConfig, vo: voyageai.Client, db: chromadb.ClientAPI) -> int:
+def index_sessions(
+    project: ProjectConfig,
+    vo: voyageai.Client,
+    db: chromadb.ClientAPI,
+    cache: EmbedCache | None = None,
+) -> int:
     """Index Claude Code session transcripts for a project.
 
     Thin wrapper around `_index_session_files` for backward-compat.
@@ -1031,6 +1134,7 @@ def index_sessions(project: ProjectConfig, vo: voyageai.Client, db: chromadb.Cli
             db=db,
             log_label=f"Sessions ({sessions_dir})",
             manifest=manifest,
+            cache=cache,
         )
     return total
 
@@ -1052,6 +1156,7 @@ def index_codex_sessions(
     files: list[Path],
     vo: voyageai.Client,
     db: chromadb.ClientAPI,
+    cache: EmbedCache | None = None,
 ) -> int:
     """Index Codex CLI session transcripts already routed to this project."""
     if not files:
@@ -1065,10 +1170,16 @@ def index_codex_sessions(
         vo=vo,
         db=db,
         log_label="Codex sessions",
+        cache=cache,
     )
 
 
-def index_docs(project: ProjectConfig, vo: voyageai.Client, db: chromadb.ClientAPI) -> int:
+def index_docs(
+    project: ProjectConfig,
+    vo: voyageai.Client,
+    db: chromadb.ClientAPI,
+    cache: EmbedCache | None = None,
+) -> int:
     """Index documentation files for a project. Returns count of new chunks."""
     if not project.docs_dir or not project.docs_dir.exists():
         return 0
@@ -1109,9 +1220,12 @@ def index_docs(project: ProjectConfig, vo: voyageai.Client, db: chromadb.ClientA
             content = f.read_text(errors="replace")
 
         chunks = chunk_doc(content, rel_path)
+        # C: version_id for docs = file mtime (revision proxy).
+        file_version = str(f.stat().st_mtime)
         chunk_ids_for_file: set[str] = set()
         for c in chunks:
             c["id"] = _make_chunk_id(f"docs:{rel_path}", c["metadata"]["chunk_index"])
+            c["metadata"]["version_id"] = file_version
             chunk_to_file[c["id"]] = f
             chunk_ids_for_file.add(c["id"])
         file_expected_count[f] = len(chunks)
@@ -1132,6 +1246,7 @@ def index_docs(project: ProjectConfig, vo: voyageai.Client, db: chromadb.ClientA
         file_cleanup=file_cleanup,
         files_to_process=to_index,
         file_hashes=file_hashes,
+        cache=cache,
     )
 
     if total_stored > 0:
@@ -1242,10 +1357,14 @@ def index_single_doc(project_name: str, file_path: Path) -> int:
         content = file_path.read_text(errors="replace")
 
     chunks = chunk_doc(content, rel_path)
+    # C: stamp the same mtime version_id index_docs uses, so add-document and a
+    # later full reindex agree on the version_id for this -docs file.
+    file_version = str(file_path.stat().st_mtime)
     chunk_to_file: dict[str, Path] = {}
     chunk_ids: set[str] = set()
     for c in chunks:
         c["id"] = _make_chunk_id(f"docs:{rel_path}", c["metadata"]["chunk_index"])
+        c["metadata"]["version_id"] = file_version
         chunk_to_file[c["id"]] = file_path
         chunk_ids.add(c["id"])
 
@@ -1378,16 +1497,22 @@ def run_index(project_name: str | None = None) -> None:
     total_code = 0
     total_sessions = 0
     total_docs = 0
-    for name, project in projects.items():
-        proj_start = time.monotonic()
-        _log(f"Project: {name}")
-        total_code += index_code(project, vo, db)
-        total_sessions += index_sessions(project, vo, db)
-        codex_files = codex_routing.get(name, [])
-        if codex_files:
-            total_sessions += index_codex_sessions(project, codex_files, vo, db)
-        total_docs += index_docs(project, vo, db)
-        _log(f"[{name}] project finished in {time.monotonic() - proj_start:.1f}s")
+    # C: one content-hash embedding cache shared across every project and source
+    # this run, so unchanged chunks skip the Voyage call. Closed in finally.
+    cache = EmbedCache(VECS_DIR / "embed_cache.db")
+    try:
+        for name, project in projects.items():
+            proj_start = time.monotonic()
+            _log(f"Project: {name}")
+            total_code += index_code(project, vo, db, cache=cache)
+            total_sessions += index_sessions(project, vo, db, cache=cache)
+            codex_files = codex_routing.get(name, [])
+            if codex_files:
+                total_sessions += index_codex_sessions(project, codex_files, vo, db, cache=cache)
+            total_docs += index_docs(project, vo, db, cache=cache)
+            _log(f"[{name}] project finished in {time.monotonic() - proj_start:.1f}s")
+    finally:
+        cache.close()
 
     if _codex_unknown_payload_seen:
         _log(

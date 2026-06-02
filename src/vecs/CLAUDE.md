@@ -18,6 +18,7 @@ Targets workflow profile at `docs/workflow-vecs-profile-v0.1.md` (Phase 2 `conte
 | `indexer.py` | Main indexing loop. Adaptive batching, manifest updates, sync between vector and BM25 stores. |
 | `searcher.py` | Hybrid search: vector + BM25, fused output. |
 | `bm25_index.py` | SQLite FTS5 BM25 index — one `.db` per collection. |
+| `embed_cache.py` | Content-addressable embedding cache (SQLite at `~/.vecs/embed_cache.db`), keyed by `(model, content_hash)`. Lets the indexer skip Voyage calls for byte-identical chunks across runs. |
 | `chunkers.py` | Dispatch routing files to language-specific chunkers. |
 | `ast_chunker.py` | Tree-sitter chunking (C#, TypeScript, plus generic). |
 | `doc_chunker.py` | Markdown / PDF / plain doc chunking. |
@@ -35,6 +36,8 @@ Targets workflow profile at `docs/workflow-vecs-profile-v0.1.md` (Phase 2 `conte
 - Sessions are agent-tagged (`metadata.agent ∈ {claude_code, codex}`). Same collection, single query covers both.
 - Index storage lives under `~/.vecs/` only. Never write inside the repo.
 - Codex routing state is locked via `fcntl.flock` — concurrent indexers do not corrupt it.
+- Each stored chunk carries a `version_id` in metadata (set at chunk construction in `indexer.py`): git HEAD sha for code (per code_dir, falls back to file content hash for non-git trees), file mtime for docs, session id for sessions. Anchor for stale-retrieval detection.
+- Embedding cache key MUST include the model. A cache hit returns a stored vector verbatim, so serving a `voyage-3` vector for a `voyage-3.5` request would silently corrupt ranking. Changing the embedding model invalidates the cache by construction (all misses → full re-embed). Cache hits are still upserted and counted in `succeeded_ids`, so the manifest's `succeeded == expected` mark-indexed invariant (`_track_embed_success`) holds — a hit that skipped upsert would leave the file reprocessed forever.
 
 ## Tests
 
