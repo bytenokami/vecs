@@ -79,7 +79,7 @@ Severity = impact on the north star.
 | G2b | **Chat-transcript topical noise** (verbatim dialogue competes with answers) | Med | 6 (transcript inversion) | distractor harm (analogy) |
 | G3 | **`.md` indexed AS code** | Med | 1 (reroute) | distractor harm (analogy) |
 | G4 | **Scattered docs** — only `docs_dir` indexed; per-repo `docs/` dirs missed | Med | **1 (in-repo `.md` under code_dirs) + 3 (per-repo `docs/` dirs)** | coverage helps ("Less LLM, More Documents") |
-| G5 | **No freshness defense** — no version stamp, no pre-retrieval supersession filter, no tombstones; incremental appends never clean superseded chunks | High | 4 | stale worse than no retrieval (code-RAG; HoH) |
+| G5 | **No freshness defense** — no version stamp, no pre-retrieval supersession filter, no tombstones; incremental appends never clean superseded chunks; **`Manifest.prune()` orphans chunks on delete (verified)** | High | 4a | stale worse than no retrieval (code-RAG; HoH) |
 | G6 | **No index-time dedup** | Med | 4c (with ownership model) | MinHash-LSH standard infra (qualitative) |
 | G7 | **Fact store has no actor/scope/valid-time** | Med | 2 | bi-temporal valid-time + provenance |
 | G8 | **No *semantic* promotion gate** (exact `chain_key` merge exists; no top-k semantic merge) | Med | 2 | Mem0 ADD/UPDATE/DELETE/NOOP top-k |
@@ -178,7 +178,7 @@ Owns the rest of G4 + G9. **Scope:** **per-repo `docs/` discovery** — extend t
 
 ### Increment 4 — Freshness
 
-- **4a (default-ON, high-confidence):** `valid_from`/`valid_to` + **pre-retrieval supersession/validity hard-filter**; tombstones on delete; **fix the `is_full=False` append-cleanup** (`indexer.py:942-943`); git-driven incremental reindex (Merkle pattern; uses Inc-1 `version_id` + cache).
+- **4a (default-ON, high-confidence):** `valid_from`/`valid_to` + **pre-retrieval supersession/validity hard-filter**; tombstones on delete — **including the verified `Manifest.prune()` orphan bug** (`prune()` at `indexer.py:179-187` clears the manifest for deleted files but returns only a count; its caller at `:1405-1411` never deletes the chunks, so deleted docs resurface in search forever — contrast `prune_out_of_scope` `:189-227`/`:758-780`, which returns keys and does delete; the 4×/day launchd reindex prunes the manifest but not the vectors. Fix: `prune()` returns stale keys → caller classifies each by collection [code vs docs] and deletes chunks + BM25; plus a one-time orphan purge); **fix the `is_full=False` append-cleanup** (`indexer.py:942-943`); git-driven incremental reindex (Merkle pattern; uses Inc-1 `version_id` + cache). **[v3-fix: prune() orphan bug verified 2026-06-02; it is a live correctness defect (deleted docs resurface), candidate for an early standalone hotfix ahead of the rest of 4a.]**
 - **4b (default-OFF, eval-gated):** kind-aware recency prior; turns on only if the Inc-1 harness shows stale-retrieval-rate/version-alignment improves with no relevance regression (bound a metric + threshold).
 - **4c:** near-dup MinHash dedup **with a chunk-ownership/refcount model + tombstones**, so deleting a shared near-dup can't corrupt another owner's recall (also closes the byte-exact G2a redundancy).
 
