@@ -1,3 +1,5 @@
+Authored by Claude
+
 # Acceptance — Increment 1.5 (freshness/correctness hotfix: 1.5a + 1.5b + 1.5c)
 
 Format: checklist. Pass threshold: all-pass. Parent: `docs/vecs-kb-curation-design-2026-06.md` §6 (Increment 1.5); direction review `docs/vecs-direction-review-2026-06.md`.
