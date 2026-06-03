@@ -48,6 +48,10 @@ _codex_unknown_payload_seen: set[str] = set()
 MAX_BATCH_TOKENS = 80_000  # Voyage limit is 120K; char-based estimation is unreliable, so leave wide margin
 MAX_BATCH_SIZE = 128
 
+# Doc source extensions for the -docs collection. .md / .txt / .pdf under a
+# docs_dir; only .md is routed from inside code_dirs (F).
+DOC_EXTENSIONS = {".md", ".txt", ".pdf"}
+
 
 class AdaptiveBatcher:
     """Estimates token counts using EMA-calibrated char-to-token ratio.
@@ -188,13 +192,27 @@ class Manifest:
             del self.data[key]
         return len(stale)
 
-    def prune_out_of_scope(self, in_scope: set[Path], roots: list[Path]) -> list[str]:
+    def prune_out_of_scope(
+        self,
+        in_scope: set[Path],
+        roots: list[Path],
+        extensions: set[str] | None = None,
+    ) -> list[str]:
         """Remove code-file entries that are under any of `roots` but not in `in_scope`.
 
         Used after exclude_dirs filtering: a file may still exist on disk but be
         out of scope for indexing. Only entries beneath one of the supplied
         `roots` are considered -- code files for unrelated projects/code_dirs
         sharing this manifest must be left alone.
+
+        When `extensions` is given, only keys whose file suffix is in that set
+        are eligible for pruning. F relies on this: an in-repo `.md` under a
+        code_dir is a DOCS source (its key is owned by `index_docs`), so scoping
+        the code prune to the code extensions stops it from deleting that key
+        every run -- which would otherwise make `index_docs` re-embed the `.md`
+        perpetually (the manifest namespace is shared by bare absolute path).
+        `.md` code chunks are removed by the explicit `_sweep_md_code_chunks`
+        instead, not by this manifest prune.
 
         Returns the list of removed manifest keys (string paths) so callers can
         delete the corresponding chunks from chromadb.
@@ -212,6 +230,8 @@ class Manifest:
             if key.startswith("session:"):
                 continue
             if key in in_scope_str:
+                continue
+            if extensions is not None and Path(key).suffix not in extensions:
                 continue
             try:
                 key_resolved = Path(key).resolve()
@@ -630,6 +650,30 @@ def _sync_bm25(collection: chromadb.Collection, project_name: str, suffix: str) 
         bm25.close()
 
 
+def _delete_ids_from_bm25(project_name: str, suffix: str, ids: list[str]) -> None:
+    """Delete specific `doc_id`s from a project's BM25 FTS5 sidecar.
+
+    Used by the targeted F sweeps (`-code` `.md` sweep, `-docs` orphan sweep) to
+    keep the sidecar in lockstep with chroma when the run's end-of-pass
+    `_sync_bm25` would not fire -- it only runs when `total_stored > 0`, so a
+    sweep-only run (nothing new to embed, but chunks deleted) would otherwise
+    leave stale BM25 rows behind. No-op when `ids` is empty or no `.db` exists.
+    """
+    if not ids:
+        return
+    db_path = VECS_DIR / "bm25" / f"{project_name}_{suffix}.db"
+    if not db_path.exists():
+        return
+    bm25 = BM25Index(db_path)
+    try:
+        bm25.load()
+        bm25.delete(ids)
+    except Exception as e:
+        _log(f"  Warning: BM25 targeted delete failed for {project_name}_{suffix}: {e}")
+    finally:
+        bm25.close()
+
+
 def _sweep_excluded_chunks(
     collection: chromadb.Collection,
     code_dir: CodeDir,
@@ -665,6 +709,82 @@ def _sweep_excluded_chunks(
         return 0
 
     return len(orphan_ids)
+
+
+def _sweep_md_code_chunks(collection: chromadb.Collection) -> list[str]:
+    """Delete chunks whose source file is a `.md` from a `-code` collection.
+
+    F drops `.md` from `code_dirs` extensions (`.md` routes to the `-docs`
+    collection instead), so `index_code` stops emitting `.md` chunks -- but the
+    already-embedded `.md` code chunks remain, because `index_code` only adds.
+    This metadata-only sweep removes them: it scans every chunk and drops any
+    whose `file_path` ends in `.md` (code chunk `file_path` =
+    `{code_dir.path.name}/{rel}`). Returns the deleted ids so the caller can
+    mirror the deletion into the BM25 sidecar. Failures are logged + swallowed.
+    """
+    md_ids: list[str] = []
+    try:
+        for page in _paginated_get(collection, include=["metadatas"]):
+            for cid, meta in zip(page["ids"], page["metadatas"]):
+                fp = (meta or {}).get("file_path")
+                if isinstance(fp, str) and fp.endswith(".md"):
+                    md_ids.append(cid)
+        if md_ids:
+            _paginated_delete(collection, md_ids)
+    except Exception as e:
+        _log(f"  Warning: .md code-chunk sweep failed: {e}")
+        return []
+
+    return md_ids
+
+
+def _partition_docs_by_root(
+    collection: chromadb.Collection,
+    valid_root_names: set[str],
+) -> tuple[list[str], set[str]]:
+    """Single scan of a `-docs` collection, partitioning chunks by source root.
+
+    F qualifies docs chunk ids/file_paths as `{root.name}/{rel}` for every source
+    root (docs_dirs + code_dirs). Returns `(orphan_ids, present_file_paths)`:
+
+    - `orphan_ids`: chunks whose `file_path` is NOT under any current source-root
+      prefix -- legacy pre-F chunks (bare `relative_to` paths, e.g. `HQ/x.md`)
+      and chunks whose source root was removed from config. The caller deletes
+      these (chroma + BM25).
+    - `present_file_paths`: the set of `file_path` values that ARE source-root-
+      qualified under a current root. `index_docs` uses this to force a re-embed
+      of any source file whose qualified chunks are ABSENT -- the half of the
+      id-scheme migration that the delete alone cannot do, since the shared
+      bare-abs-path manifest key still carries a matching content hash (so
+      `needs_indexing` would otherwise skip the file and the content would be
+      lost, not migrated). This makes the migration self-converge WITHOUT
+      depending on a coincident embedding-model change.
+
+    Empty `valid_root_names` -> `([], set())` WITHOUT scanning: a degenerate
+    empty prefix set must never classify every chunk as an orphan (which would
+    wipe the collection). Failures logged + swallowed.
+    """
+    valid_prefixes = tuple(f"{name}/" for name in valid_root_names)
+    if not valid_prefixes:
+        return [], set()
+
+    orphan_ids: list[str] = []
+    present: set[str] = set()
+    try:
+        for page in _paginated_get(collection, include=["metadatas"]):
+            for cid, meta in zip(page["ids"], page["metadatas"]):
+                fp = (meta or {}).get("file_path")
+                if not isinstance(fp, str):
+                    continue
+                if fp.startswith(valid_prefixes):
+                    present.add(fp)
+                else:
+                    orphan_ids.append(cid)
+    except Exception as e:
+        _log(f"  Warning: -docs partition scan failed: {e}")
+        return [], set()
+
+    return orphan_ids, present
 
 
 def _track_embed_success(
@@ -741,6 +861,53 @@ def _index_collection(
     return len(succeeded_ids)
 
 
+def _scan_code_dir(code_dir: CodeDir, extensions: set[str]) -> list[Path]:
+    """Discover files under `code_dir` matching `extensions`, applying the
+    code_dir's include_dirs / exclude_dirs filters (exclude wins on overlap).
+
+    Extracted so `index_code` and `index_docs` scope a code_dir scan identically:
+    F routes in-repo `.md` to the -docs collection using the SAME include/exclude
+    scope the code scan uses, so no in-scope `.md` is dropped in the move and no
+    third-party `.md` (under an excluded subdir) is pulled in.
+    """
+    if code_dir.include_dirs:
+        files: list[Path] = []
+        for subdir in code_dir.include_dirs:
+            d = code_dir.path / subdir
+            if d.exists():
+                files.extend(
+                    f for f in d.rglob("*")
+                    if f.suffix in extensions and f.is_file()
+                )
+    else:
+        files = [
+            f for f in code_dir.path.rglob("*")
+            if f.suffix in extensions and f.is_file()
+        ]
+
+    # exclude_dirs: drop files whose path is under any excluded subdir.
+    if code_dir.exclude_dirs:
+        excluded_roots = [
+            (code_dir.path / sub).resolve() for sub in code_dir.exclude_dirs
+        ]
+        kept: list[Path] = []
+        for f in files:
+            f_resolved = f.resolve()
+            drop = False
+            for ex in excluded_roots:
+                try:
+                    f_resolved.relative_to(ex)
+                    drop = True
+                    break
+                except ValueError:
+                    continue
+            if not drop:
+                kept.append(f)
+        files = kept
+
+    return files
+
+
 def index_code(
     project: ProjectConfig,
     vo: voyageai.Client,
@@ -762,52 +929,32 @@ def index_code(
     file_cleanup: dict[Path, tuple[str, str, set[str]]] = {}
     file_hashes: dict[Path, str] = {}
 
-    # Track in-scope files per code_dir so we can compute proper chromadb
-    # rel_paths when pruning out-of-scope manifest entries.
-    in_scope_by_root: list[tuple[Path, set[Path]]] = []
+    # Track in-scope files (+ code extensions) per code_dir so we can compute
+    # proper chromadb rel_paths when pruning out-of-scope manifest entries, and
+    # so the prune stays scoped to code extensions (it must not touch in-repo
+    # .md keys, which index_docs owns).
+    in_scope_by_root: list[tuple[Path, set[Path], set[str]]] = []
 
     for code_dir in project.code_dirs:
         if not code_dir.path.exists():
             _log(f"[{project.name}] {code_dir.path}: directory not found, skipping.")
             continue
 
-        if code_dir.include_dirs:
-            files: list[Path] = []
-            for subdir in code_dir.include_dirs:
-                d = code_dir.path / subdir
-                if d.exists():
-                    files.extend(
-                        f for f in d.rglob("*")
-                        if f.suffix in code_dir.extensions and f.is_file()
-                    )
-        else:
-            files = [
-                f for f in code_dir.path.rglob("*")
-                if f.suffix in code_dir.extensions and f.is_file()
-            ]
+        # F: .md is a -docs source, never a code extension. Strip it defensively
+        # so a stale config (.md still listed) cannot make index_code embed .md
+        # as code and fight the .md sweep (embed-then-sweep thrash + dual store).
+        code_exts = set(code_dir.extensions)
+        if ".md" in code_exts:
+            code_exts.discard(".md")
+            _log(
+                f"[{project.name}] {code_dir.path}: '.md' routes to the -docs "
+                f"collection (F), not -code -- ignoring it as a code extension. "
+                f"Remove '.md' from this code_dir's extensions in config.yaml."
+            )
 
-        # exclude_dirs: drop files whose path is under any excluded subdir.
-        # Excludes apply on top of includes -- exclude wins on overlap.
-        if code_dir.exclude_dirs:
-            excluded_roots = [
-                (code_dir.path / sub).resolve() for sub in code_dir.exclude_dirs
-            ]
-            kept: list[Path] = []
-            for f in files:
-                f_resolved = f.resolve()
-                drop = False
-                for ex in excluded_roots:
-                    try:
-                        f_resolved.relative_to(ex)
-                        drop = True
-                        break
-                    except ValueError:
-                        continue
-                if not drop:
-                    kept.append(f)
-            files = kept
+        files = _scan_code_dir(code_dir, code_exts)
 
-        in_scope_by_root.append((code_dir.path, set(files)))
+        in_scope_by_root.append((code_dir.path, set(files), code_exts))
 
         # H6: needs_indexing returns (bool, hash) -- hash computed once
         to_index: list[Path] = []
@@ -850,8 +997,8 @@ def index_code(
     # We iterate per code_dir so we can compute the same rel_path that was
     # used as chromadb metadata, enabling targeted chunk deletion.
     total_pruned = 0
-    for root, in_scope in in_scope_by_root:
-        stale_keys = manifest.prune_out_of_scope(in_scope, [root])
+    for root, in_scope, extensions in in_scope_by_root:
+        stale_keys = manifest.prune_out_of_scope(in_scope, [root], extensions)
         if not stale_keys:
             continue
         total_pruned += len(stale_keys)
@@ -886,6 +1033,18 @@ def index_code(
                 f"[{project.name}] swept {swept} orphan chromadb chunks "
                 f"under excluded subdirs of {code_dir.path}."
             )
+
+    # F: .md is no longer a code extension (it routes to -docs). Sweep any
+    # already-embedded .md chunks out of the -code collection + its BM25
+    # sidecar. Runs unconditionally (idempotent no-op once clean), because the
+    # residue persists even on runs with nothing new to index.
+    swept_md = _sweep_md_code_chunks(collection)
+    if swept_md:
+        _delete_ids_from_bm25(project.name, "code", swept_md)
+        _log(
+            f"[{project.name}] swept {len(swept_md)} .md-sourced chunks out of "
+            f"the -code collection (.md now routes to -docs)."
+        )
 
     if not all_chunks:
         return 0
@@ -1174,45 +1333,139 @@ def index_codex_sessions(
     )
 
 
+def _docs_source_root_names(project: ProjectConfig) -> set[str]:
+    """Configured source-root basenames for the -docs collection.
+
+    Drawn from config (not disk), so a transiently-missing dir is not treated
+    as removed. Used by the -docs orphan sweep to decide which chunks are still
+    rooted in a current source.
+    """
+    names = {d.name for d in project.docs_dirs}
+    names |= {cd.path.name for cd in project.code_dirs}
+    return names
+
+
+def _docs_sources(project: ProjectConfig) -> list[tuple[Path, Path]]:
+    """Enumerate (source_root, file) for every doc file `index_docs` will index.
+
+    Sources, de-duplicated by resolved path (docs_dirs win on overlap):
+      - every `.md`/`.txt`/`.pdf` under each `docs_dir` (root = that docs_dir)
+      - every in-repo `.md` under each `code_dir`, using the code_dir's own
+        include/exclude scope (root = that `code_dir.path`)
+
+    `root.name` is the rel_path qualifier (mirrors `index_code`). This is the
+    single source of truth shared by `index_docs` and `_remodel_clear`, so the
+    model-change clear scope can never drift from what `index_docs` re-scans.
+    """
+    sources: list[tuple[Path, Path]] = []
+    seen: set[Path] = set()
+
+    def _add(root: Path, f: Path) -> None:
+        rf = f.resolve()
+        if rf not in seen:
+            seen.add(rf)
+            sources.append((root, f))
+
+    for d in project.docs_dirs:
+        if not d.exists():
+            continue
+        for f in d.rglob("*"):
+            if f.suffix in DOC_EXTENSIONS and f.is_file():
+                _add(d, f)
+
+    for code_dir in project.code_dirs:
+        if not code_dir.path.exists():
+            continue
+        for f in _scan_code_dir(code_dir, {".md"}):
+            _add(code_dir.path, f)
+
+    return sources
+
+
+def _owning_doc_root(project: ProjectConfig, file_path: Path) -> Path | None:
+    """The source root a doc file belongs to, for rel_path qualification.
+
+    Mirrors `_docs_sources` precedence (docs_dirs win over code_dirs on overlap)
+    so `index_single_doc` (add-document) qualifies a file the SAME way a full
+    `index_docs` reindex would -- otherwise add + reindex would disagree on the
+    chunk id and double-store the file. Returns None if the file is under no
+    configured root.
+    """
+    for root in [*project.docs_dirs, *(cd.path for cd in project.code_dirs)]:
+        try:
+            file_path.relative_to(root)
+            return root
+        except ValueError:
+            continue
+    return None
+
+
 def index_docs(
     project: ProjectConfig,
     vo: voyageai.Client,
     db: chromadb.ClientAPI,
     cache: EmbedCache | None = None,
 ) -> int:
-    """Index documentation files for a project. Returns count of new chunks."""
-    if not project.docs_dir or not project.docs_dir.exists():
-        return 0
+    """Index documentation files for a project. Returns count of new chunks.
 
+    F: multi-source. Doc files come from every `docs_dir` AND in-repo `.md`
+    under each `code_dir`; each chunk's id/file_path is qualified with its
+    source-root basename (`docs:{root.name}/{rel}`) so two roots' `README.md`
+    cannot collide. Every pass also sweeps `-docs` chunks no longer rooted in a
+    current source (legacy bare-id chunks, removed roots).
+    """
     manifest = Manifest(project.name)
     collection = db.get_or_create_collection(project.docs_collection)
 
-    files = [
-        f for f in project.docs_dir.rglob("*")
-        if f.suffix in {".md", ".txt", ".pdf"} and f.is_file()
-    ]
+    # One scan partitions the collection into orphans (not under any current
+    # source root) and the set of currently-present qualified file_paths.
+    orphan_ids, present_paths = _partition_docs_by_root(
+        collection, _docs_source_root_names(project)
+    )
+    if orphan_ids:
+        _paginated_delete(collection, orphan_ids)
+        _delete_ids_from_bm25(project.name, "docs", orphan_ids)
+        _log(
+            f"[{project.name}] swept {len(orphan_ids)} -docs chunks not under any "
+            f"current source root (legacy/removed-root cleanup)."
+        )
 
-    to_index: list[Path] = []
+    sources = _docs_sources(project)
+    if not sources:
+        return 0
+
+    # Migration self-heal: a source file whose qualified chunks are ABSENT from
+    # the collection must be re-embedded even when its (shared, possibly
+    # code-era) manifest hash matches. Clearing the key forces needs_indexing
+    # True. This converges the .md->docs move and the bare->qualified id-scheme
+    # change in the SAME run, independent of any embedding-model change.
+    for root, f in sources:
+        qualified_rel = f"{root.name}/{f.relative_to(root)}"
+        if qualified_rel not in present_paths:
+            manifest.data.pop(str(f), None)
+
+    to_index: list[tuple[Path, Path]] = []
     file_hashes: dict[Path, str] = {}
-    for f in files:
+    for root, f in sources:
         needs, fhash = manifest.needs_indexing(f)
         if needs:
-            to_index.append(f)
+            to_index.append((root, f))
             file_hashes[f] = fhash
 
     if not to_index:
         _log(f"[{project.name}] Docs: nothing new to index.")
         return 0
 
-    _log(f"[{project.name}] Docs: {len(to_index)} files to index ({len(files)} total)")
+    _log(f"[{project.name}] Docs: {len(to_index)} files to index ({len(sources)} total)")
 
     all_chunks: list[dict] = []
     chunk_to_file: dict[str, Path] = {}
     file_expected_count: dict[Path, int] = {}
     file_cleanup: dict[Path, tuple[str, str, set[str]]] = {}
+    files_to_process: list[Path] = []
 
-    for f in to_index:
-        rel_path = str(f.relative_to(project.docs_dir))
+    for root, f in to_index:
+        rel_path = f"{root.name}/{f.relative_to(root)}"
 
         if f.suffix == ".pdf":
             content = extract_pdf_text(str(f))
@@ -1231,6 +1484,7 @@ def index_docs(
         file_expected_count[f] = len(chunks)
         file_cleanup[f] = ("file_path", rel_path, chunk_ids_for_file)
         all_chunks.extend(chunks)
+        files_to_process.append(f)
 
     if not all_chunks:
         return 0
@@ -1244,7 +1498,7 @@ def index_docs(
         chunk_to_file=chunk_to_file,
         file_expected_count=file_expected_count,
         file_cleanup=file_cleanup,
-        files_to_process=to_index,
+        files_to_process=files_to_process,
         file_hashes=file_hashes,
         cache=cache,
     )
@@ -1338,8 +1592,15 @@ def index_single_doc(project_name: str, file_path: Path) -> int:
         raise ValueError(f"Project '{project_name}' not found.")
 
     project = config.projects[project_name]
-    if not project.docs_dir:
-        raise ValueError(f"Project '{project_name}' has no docs_dir configured.")
+    # F: qualify by the file's OWN source root (any docs_dir, or a code_dir for
+    # an in-repo .md), matching index_docs -- so add-document and a later full
+    # reindex agree on the chunk id rather than double-storing the file.
+    root = _owning_doc_root(project, file_path)
+    if root is None:
+        raise ValueError(
+            f"Project '{project_name}': {file_path} is under no configured "
+            f"docs_dir or code_dir."
+        )
 
     vo = get_voyage_client()
     db = get_chromadb_client()
@@ -1349,7 +1610,7 @@ def index_single_doc(project_name: str, file_path: Path) -> int:
     # H6: compute hash once
     _, file_hash = manifest.needs_indexing(file_path)
 
-    rel_path = str(file_path.relative_to(project.docs_dir))
+    rel_path = f"{root.name}/{file_path.relative_to(root)}"
 
     if file_path.suffix == ".pdf":
         content = extract_pdf_text(str(file_path))
@@ -1473,35 +1734,24 @@ def _model_changed(
     return _collection_count(db, collection) > 0
 
 
-def _clear_docs_manifest_entries(manifest: Manifest, docs_dirs: list[Path]) -> int:
-    """Drop docs file-path manifest keys so the next index_docs pass re-embeds.
+def _clear_docs_manifest_entries(manifest: Manifest, docs_files: list[Path]) -> int:
+    """Drop the manifest key for each doc source file so index_docs re-embeds it.
 
-    Docs file-keys are bare absolute paths under a docs_dir. Code file-keys are
-    ALSO bare absolute paths but live under code_dirs (distinct roots), so
-    matching by docs_dir cannot touch them; session: keys are skipped. Returns
-    the number of keys removed.
+    F: keyed on the EXACT files index_docs will re-scan (`_docs_sources`:
+    docs_dirs ∪ in-repo `.md` under code_dirs), NOT on a directory list. This
+    makes clear-scope ≡ rescan-scope by construction -- clearing a key index_docs
+    would not re-create strands that file's old-model vectors after the marker
+    advances. It also auto-protects code keys: `_docs_sources` enumerates only
+    `.md` under code_dirs, never `.cs`, so a code file's key is never cleared.
+    Returns the number of keys removed.
     """
-    resolved = [d.resolve() for d in docs_dirs]
-    if not resolved:
-        return 0
-    stale: list[str] = []
-    for key in list(manifest.data):
-        if key.startswith("session:"):
-            continue
-        try:
-            key_resolved = Path(key).resolve()
-        except OSError:
-            continue
-        for root in resolved:
-            try:
-                key_resolved.relative_to(root)
-            except ValueError:
-                continue
-            stale.append(key)
-            break
-    for key in stale:
-        del manifest.data[key]
-    return len(stale)
+    cleared = 0
+    for f in docs_files:
+        key = str(f)
+        if key in manifest.data:
+            del manifest.data[key]
+            cleared += 1
+    return cleared
 
 
 def _clear_session_manifest_entries(manifest: Manifest) -> int:
@@ -1539,13 +1789,13 @@ def _remodel_clear(
 
     manifest = Manifest(project.name)
     if docs_stale:
-        # Clear ONLY under the dirs index_docs actually re-scans, so we never
+        # Clear ONLY the files index_docs will actually re-scan, so we never
         # invalidate a key the indexer won't re-embed (which would strand that
-        # file's old-model vectors after the marker advances). index_docs scans
-        # project.docs_dir (docs_dirs[0]) only today; multi-source docs is F,
-        # which widens this clear and index_docs together.
-        scan_dirs = [project.docs_dir] if project.docs_dir else []
-        cleared["docs"] = _clear_docs_manifest_entries(manifest, scan_dirs)
+        # file's old-model vectors after the marker advances). F: index_docs
+        # scans ALL docs_dirs ∪ in-repo .md under code_dirs (`_docs_sources`);
+        # clear and re-embed share that one enumerator, so they cannot drift.
+        docs_files = [f for _root, f in _docs_sources(project)]
+        cleared["docs"] = _clear_docs_manifest_entries(manifest, docs_files)
     if sess_stale:
         cleared["sessions"] = _clear_session_manifest_entries(manifest)
     if cleared["docs"] or cleared["sessions"]:
