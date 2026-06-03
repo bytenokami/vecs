@@ -1,4 +1,5 @@
 import os
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -162,6 +163,51 @@ def test_deduplicate_returns_fewer_when_heavy_overlap():
     ]
     deduped = deduplicate_results(results)
     assert len(deduped) == 1
+
+
+# --- Inc 1.5b: -docs searched even without a configured docs_dir -------------
+
+
+def test_search_queries_docs_collection_without_docs_dir(monkeypatch):
+    """A project with NO docs_dir but a populated -docs collection (F routed its
+    in-repo .md there) must still be searched -- the -docs target must not be
+    gated on proj.docs_dir, mirroring code/sessions' skip-on-miss."""
+    from vecs import searcher
+    from vecs.config import VecsConfig, ProjectConfig
+
+    cfg = VecsConfig(path="/tmp/x.yaml")
+    cfg.projects["bloomly"] = ProjectConfig(name="bloomly")  # docs_dirs empty -> docs_dir None
+    assert cfg.projects["bloomly"].docs_dir is None
+    monkeypatch.setattr(searcher, "load_config", lambda: cfg)
+    monkeypatch.setattr(searcher, "get_voyage_client", lambda: MagicMock())
+    monkeypatch.setattr(searcher, "_cached_embed", lambda vo, q, m: [0.1, 0.2, 0.3, 0.4])
+    monkeypatch.setattr(searcher, "get_bm25", lambda path: None)  # skip BM25
+
+    queried: list[str] = []
+
+    def fake_get_collection(name):
+        queried.append(name)
+        if name == "bloomly-docs":
+            col = MagicMock()
+            col.query.return_value = {
+                "ids": [["bloomly-docs:bloomly/README.md:0"]],
+                "documents": [["doc body"]],
+                "metadatas": [[{"file_path": "bloomly/README.md"}]],
+                "distances": [[0.12]],
+            }
+            return col
+        raise Exception("empty/absent collection")  # code/sessions skip-on-miss
+
+    db = MagicMock()
+    db.get_collection.side_effect = fake_get_collection
+    monkeypatch.setattr(searcher, "get_chromadb_client", lambda: db)
+
+    results = searcher.search("anything", collection_name="docs", project="bloomly")
+
+    assert "bloomly-docs" in queried  # the -docs target was attempted
+    assert any(
+        (r.get("metadata") or {}).get("file_path") == "bloomly/README.md" for r in results
+    )
 
 
 # --- Inc 1-B: post-re-embed quality check (acceptance line 18) --------------

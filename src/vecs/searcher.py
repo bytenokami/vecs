@@ -147,8 +147,11 @@ def search(
         if collection_name is None or collection_name == "sessions":
             targets.append((proj.sessions_collection, SESSIONS_MODEL, proj_name))
         if collection_name is None or collection_name == "docs":
-            if proj.docs_dir:
-                targets.append((proj.docs_collection, DOCS_MODEL, proj_name))
+            # Always attempt -docs (skip-on-miss at get_collection below, like
+            # code/sessions). F populates -docs from in-repo .md even for
+            # projects with no configured docs_dir (bloomly/eric), so gating on
+            # proj.docs_dir would leave those collections permanently unsearched.
+            targets.append((proj.docs_collection, DOCS_MODEL, proj_name))
 
     # Fetch with escalating multiplier: try 2x first, then 3x if dedup eats too many
     for fetch_multiplier in (2, 3):
