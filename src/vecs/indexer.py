@@ -182,15 +182,24 @@ class Manifest:
             "chunk_count": chunk_count,
         }
 
-    def prune(self) -> int:
-        """Remove entries for files that no longer exist on disk. Returns count removed."""
-        stale = [
-            key for key in self.data
-            if not key.startswith("session:") and not Path(key).exists()
-        ]
+    def prune(self) -> list[str]:
+        """Remove entries whose source file no longer exists on disk.
+
+        Returns the REMOVED KEYS (was a bare count) so the caller can delete the
+        corresponding chunks from chroma + BM25 -- without that, a deleted file's
+        vectors live forever and keep ranking against current content (the
+        prune-orphan bug, Inc 1.5a). Handles both bare-path code/docs keys and
+        `session:{path}` keys (the latter were previously skipped, so deleted
+        sessions leaked their manifest entry + chunks indefinitely).
+        """
+        stale: list[str] = []
+        for key in self.data:
+            path_str = key[len("session:"):] if key.startswith("session:") else key
+            if not Path(path_str).exists():
+                stale.append(key)
         for key in stale:
             del self.data[key]
-        return len(stale)
+        return stale
 
     def prune_out_of_scope(
         self,
@@ -787,6 +796,91 @@ def _partition_docs_by_root(
     return orphan_ids, present
 
 
+def _sweep_deleted_source_chunks(
+    collection: chromadb.Collection,
+    root_map: dict[str, Path],
+) -> list[str]:
+    """Delete chunks whose source-root-qualified `file_path` is gone on disk.
+
+    The prune-orphan fix for code/docs (Inc 1.5a): a deleted file's chunks keep
+    their `file_path` (`{root.name}/{rel}`), so we resolve it back to disk via
+    `root_map` (root basename -> root path) and drop the chunk when the source no
+    longer exists. Catches BOTH newly-deleted files and the backlog the buggy
+    `prune()` leaked (their manifest entry is already gone, so a manifest diff
+    can't find them). Returns the deleted ids so the caller mirrors the deletion
+    into the BM25 sidecar.
+
+    Conservative on unknown roots: a `file_path` whose first segment is not a
+    current root is LEFT ALONE -- legacy bare-scheme `-docs` chunks are owned by
+    `_partition_docs_by_root`, and an unknown code root is out of scope here.
+    Empty `root_map` -> no scan, no deletes (a degenerate/misconfigured root set
+    must never be read as "every chunk is an orphan" and wipe the collection).
+    Failures logged + swallowed.
+    """
+    if not root_map:
+        return []
+
+    orphan_ids: list[str] = []
+    # Cache existence by file_path: many chunks share one source file, so we
+    # stat each distinct file at most once (keeps the every-reindex sweep cheap
+    # on large collections). True = "source present, keep"; False = "gone, drop".
+    present: dict[str, bool] = {}
+
+    def _source_present(fp: str) -> bool:
+        if fp in present:
+            return present[fp]
+        root_name, rel = fp.split("/", 1)
+        root = root_map.get(root_name)
+        if root is None:
+            present[fp] = True  # unknown root -> not this sweep's job, keep
+        else:
+            try:
+                present[fp] = (root / rel).exists()
+            except OSError:
+                present[fp] = True  # unstattable -> keep (never delete live data)
+        return present[fp]
+
+    try:
+        for page in _paginated_get(collection, include=["metadatas"]):
+            for cid, meta in zip(page["ids"], page["metadatas"]):
+                fp = (meta or {}).get("file_path")
+                if not isinstance(fp, str) or "/" not in fp:
+                    continue
+                if not _source_present(fp):
+                    orphan_ids.append(cid)
+        if orphan_ids:
+            _paginated_delete(collection, orphan_ids)
+    except Exception as e:
+        _log(f"  Warning: deleted-source orphan sweep failed: {e}")
+        return []
+
+    return orphan_ids
+
+
+def _sweep_deleted_session_chunks(
+    collection: chromadb.Collection,
+    session_ids: list[str],
+) -> list[str]:
+    """Delete `-sessions` chunks for session ids whose source file is gone.
+
+    Session chunks carry no `file_path` metadata (they key on `session_id` = the
+    file stem), so the manifest is the only signal that a session file was
+    deleted; the caller passes the stems of pruned `session:{path}` keys. Returns
+    the deleted ids. Per-id failures logged + swallowed.
+    """
+    deleted: list[str] = []
+    for sid in session_ids:
+        try:
+            existing = collection.get(where={"session_id": sid})
+            ids = existing.get("ids") or []
+            if ids:
+                _paginated_delete(collection, ids)
+                deleted.extend(ids)
+        except Exception as e:
+            _log(f"  Warning: session orphan sweep failed for session_id={sid}: {e}")
+    return deleted
+
+
 def _track_embed_success(
     succeeded_ids: list[str],
     chunk_to_file: dict[str, Path],
@@ -1345,6 +1439,29 @@ def _docs_source_root_names(project: ProjectConfig) -> set[str]:
     return names
 
 
+def _safe_sweep_root_map(roots: list[Path]) -> dict[str, Path]:
+    """Root-basename -> root path for the deleted-source orphan sweep, including
+    ONLY roots that are present on disk AND have a unique basename among `roots`.
+
+    Two guards against false-positive deletion of LIVE chunks (the worst outcome
+    per the north star — an orphan is strictly safer than deleting live data);
+    both degrade to "leave the chunk", matching the index passes:
+      - **transiently-missing root** (unmounted volume / renamed dir): without
+        this, every `(root/rel).exists()` would be False and the sweep would wipe
+        the whole collection for that root. `index_code` / `_docs_sources` skip a
+        missing root (`if not path.exists(): continue`); the sweep must too.
+      - **basename collision** (two roots share `.name`): the qualified file_path
+        `{root.name}/{rel}` can't distinguish them, so a chunk could resolve
+        against the wrong root and a live file be deleted. Such names are dropped
+        from the sweep (the documented unique-roots assumption; current roots are
+        unique). A collision degrades to leaving an orphan, never a false delete.
+    """
+    counts: dict[str, int] = {}
+    for r in roots:
+        counts[r.name] = counts.get(r.name, 0) + 1
+    return {r.name: r for r in roots if counts[r.name] == 1 and r.is_dir()}
+
+
 def _docs_sources(project: ProjectConfig) -> list[tuple[Path, Path]]:
     """Enumerate (source_root, file) for every doc file `index_docs` will index.
 
@@ -1819,6 +1936,99 @@ def _remodel_record(project: ProjectConfig, cache: EmbedCache) -> None:
     cache.set_collection_model(project.sessions_collection, SESSIONS_MODEL)
 
 
+def _prune_and_sweep_orphans(
+    project: ProjectConfig,
+    db: chromadb.ClientAPI,
+) -> dict[str, int]:
+    """Prune deleted files from the manifest AND delete their orphaned chunks.
+
+    The prune-orphan fix (Inc 1.5a): `Manifest.prune()` forgot deleted files but
+    never removed their vectors, so deleted files kept ranking against live
+    content forever. Here we:
+      - prune the manifest (now returns the removed keys);
+      - delete chunks for pruned SESSION files by `session_id` (the only signal,
+        since session chunks carry no `file_path`);
+      - sweep `-code` and `-docs` for chunks whose source-root-qualified
+        `file_path` no longer resolves on disk (this also clears the already-
+        leaked backlog, whose manifest entry is already gone).
+    BM25 sidecars are updated via `_delete_ids_from_bm25` directly -- the prune
+    path never reaches `_sync_bm25` (which only fires when `total_stored > 0`, so
+    a delete-only run would otherwise leave stale BM25 rows). Independent of Inc
+    4a's `valid_from`/`valid_to`.
+    """
+    stats = {"pruned_keys": 0, "code_orphans": 0, "docs_orphans": 0, "session_orphans": 0}
+
+    manifest = Manifest(project.name)
+    pruned = manifest.prune()
+    stats["pruned_keys"] = len(pruned)
+
+    def _col(name: str) -> chromadb.Collection | None:
+        try:
+            return db.get_collection(name)
+        except Exception:
+            return None
+
+    # Sessions FIRST and BEFORE persisting the manifest (crash-safety): session
+    # chunks carry no file_path, so the disk-scan sweep cannot recover them -- if
+    # we saved the pruned manifest and then crashed before deleting, the
+    # `session:` key would be gone and the orphan never retried. Deleting before
+    # save() keeps it idempotent under interruption (a crash leaves the key, so
+    # next run re-prunes and re-sweeps). session_id = the deleted file's stem;
+    # only sweep a stem that NO surviving session key still maps to (the stem is
+    # not path-unique, so a co-stemmed live session must not be swept).
+    surviving_stems = {
+        Path(k[len("session:"):]).stem
+        for k in manifest.data
+        if k.startswith("session:")
+    }
+    session_ids = []
+    for k in pruned:
+        if not k.startswith("session:"):
+            continue
+        stem = Path(k[len("session:"):]).stem
+        if stem not in surviving_stems:
+            session_ids.append(stem)
+    if session_ids:
+        col = _col(project.sessions_collection)
+        if col is not None:
+            ids = _sweep_deleted_session_chunks(col, session_ids)
+            if ids:
+                _delete_ids_from_bm25(project.name, "sessions", ids)
+            stats["session_orphans"] = len(ids)
+
+    # Code: {code_dir.name}/{rel} -> code_dir.path / rel on disk. The map is
+    # liveness- and collision-guarded so a transiently-missing or basename-
+    # colliding root can never be read as "all its files deleted" (see
+    # _safe_sweep_root_map).
+    code_map = _safe_sweep_root_map([cd.path for cd in project.code_dirs])
+    if code_map:
+        col = _col(project.code_collection)
+        if col is not None:
+            ids = _sweep_deleted_source_chunks(col, code_map)
+            if ids:
+                _delete_ids_from_bm25(project.name, "code", ids)
+            stats["code_orphans"] = len(ids)
+
+    # Docs: roots = docs_dirs ∪ code_dirs (in-repo .md), same guards. Unknown-root
+    # chunks are left to _partition_docs_by_root (legacy bare-scheme migration).
+    docs_map = _safe_sweep_root_map(
+        [cd.path for cd in project.code_dirs] + list(project.docs_dirs)
+    )
+    if docs_map:
+        col = _col(project.docs_collection)
+        if col is not None:
+            ids = _sweep_deleted_source_chunks(col, docs_map)
+            if ids:
+                _delete_ids_from_bm25(project.name, "docs", ids)
+            stats["docs_orphans"] = len(ids)
+
+    # Persist the pruned manifest only AFTER the (non-self-healing) session sweep.
+    if pruned:
+        manifest.save()
+
+    return stats
+
+
 def run_index(project_name: str | None = None) -> None:
     """Run incremental index for one or all projects."""
     VECS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1904,13 +2114,25 @@ def run_index(project_name: str | None = None) -> None:
             f"or the codex_orphans MCP tool."
         )
 
-    # Prune manifest entries for deleted files
-    for proj_name in projects:
-        manifest = Manifest(proj_name)
-        pruned = manifest.prune()
-        if pruned > 0:
-            manifest.save()
-            _log(f"Pruned {pruned} stale manifest entries for {proj_name}.")
+    # Prune manifest entries for deleted files AND delete their orphaned chunks
+    # (the prune-orphan fix, Inc 1.5a): a deleted file's vectors must not keep
+    # ranking against live content. Also clears the already-accumulated backlog.
+    for name, project in projects.items():
+        try:
+            stats = _prune_and_sweep_orphans(project, db)
+        except Exception as e:
+            # Isolate per-project failure so one project's prune/save I/O error
+            # can't skip the sweep for the rest of the run (code/docs self-heal
+            # next run; sessions retry because the manifest wasn't saved).
+            _log(f"[{name}] prune+sweep failed: {e}")
+            continue
+        if any(stats.values()):
+            _log(
+                f"[{name}] prune+sweep: pruned {stats['pruned_keys']} manifest "
+                f"entries; deleted {stats['code_orphans']} code + "
+                f"{stats['docs_orphans']} docs + {stats['session_orphans']} "
+                f"session orphan chunks."
+            )
 
     duration = time.monotonic() - run_start
     _log(f"Done. Indexed {total_code} code chunks, {total_sessions} session chunks, "

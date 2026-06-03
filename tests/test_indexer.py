@@ -908,7 +908,7 @@ def test_manifest_prune_removes_deleted_files(tmp_path):
 
     file_b.unlink()
     pruned = m.prune()
-    assert pruned == 1
+    assert pruned == [str(file_b)]
     assert str(file_a) in m.data
     assert str(file_b) not in m.data
 
@@ -927,7 +927,28 @@ def test_manifest_prune_nothing_to_prune(tmp_path):
     m.mark_indexed(file_a, ha)
 
     pruned = m.prune()
-    assert pruned == 0
+    assert pruned == []
+
+
+def test_manifest_prune_includes_deleted_session_keys(tmp_path):
+    """prune() now also returns + removes session:{path} keys whose file is gone
+    (previously skipped, so deleted sessions leaked their manifest entry + chunks
+    forever). A session whose file still exists is kept."""
+    m = Manifest("testproject", manifests_dir=tmp_path)
+
+    gone = tmp_path / "gone.jsonl"
+    keep = tmp_path / "keep.jsonl"
+    gone.write_text("{}")
+    keep.write_text("{}")
+    m.mark_session_indexed(gone, byte_offset=2, chunk_count=1)
+    m.mark_session_indexed(keep, byte_offset=2, chunk_count=1)
+
+    gone.unlink()
+    pruned = m.prune()
+
+    assert pruned == [f"session:{gone}"]
+    assert f"session:{keep}" in m.data
+    assert f"session:{gone}" not in m.data
 
 
 # --- _sync_bm25 tests ---
@@ -3238,3 +3259,547 @@ def test_purge_session_handles_missing_collection_gracefully(tmp_path, monkeypat
         session_ids=["nonexistent"],
     )
     assert result["chunks_deleted"] == 0
+
+
+# --- Inc 1.5a: prune-orphan fix (delete chunks for deleted sources) ---------
+
+
+class _FakeChromaCollection:
+    """Minimal in-memory chroma collection: supports the get/delete/count the
+    orphan sweeps use (paginated get, where={session_id}, id delete)."""
+
+    def __init__(self, rows):  # rows: list[(id, metadata-dict)]
+        self._rows = {cid: dict(meta) for cid, meta in rows}
+
+    def get(self, limit=None, offset=0, where=None, include=None):
+        items = list(self._rows.items())
+        if where is not None:
+            key, val = next(iter(where.items()))
+            items = [(c, m) for c, m in items if m.get(key) == val]
+        elif limit is not None:
+            items = items[offset:offset + limit]
+        # Honor `include` like real chromadb: only the requested keys are
+        # returned (ids always present). include=None defaults to all.
+        inc = include if include is not None else ["metadatas", "documents"]
+        out = {"ids": [c for c, _ in items]}
+        if "metadatas" in inc:
+            out["metadatas"] = [m for _, m in items]
+        if "documents" in inc:
+            out["documents"] = ["" for _ in items]
+        return out
+
+    def delete(self, ids=None):
+        for cid in ids or []:
+            self._rows.pop(cid, None)
+
+    def count(self):
+        return len(self._rows)
+
+
+class _FakeDB:
+    def __init__(self, collections):
+        self._cols = dict(collections)
+
+    def get_collection(self, name):
+        if name not in self._cols:
+            raise ValueError(f"no such collection: {name}")
+        return self._cols[name]
+
+    def get_or_create_collection(self, name):
+        return self._cols.setdefault(name, _FakeChromaCollection([]))
+
+
+def test_sweep_deleted_source_chunks_deletes_when_source_gone(tmp_path):
+    """Chunks whose root-qualified file_path no longer resolves on disk are
+    deleted; chunks of an existing file survive."""
+    from vecs.indexer import _sweep_deleted_source_chunks
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "keep.cs").write_text("// k")  # gone.cs is never created
+
+    col = _FakeChromaCollection([
+        ("code:repo/keep.cs:0", {"file_path": "repo/keep.cs"}),
+        ("code:repo/gone.cs:0", {"file_path": "repo/gone.cs"}),
+        ("code:repo/gone.cs:1", {"file_path": "repo/gone.cs"}),
+    ])
+
+    deleted = _sweep_deleted_source_chunks(col, {"repo": root})
+
+    assert set(deleted) == {"code:repo/gone.cs:0", "code:repo/gone.cs:1"}
+    assert "code:repo/keep.cs:0" in col._rows
+    assert "code:repo/gone.cs:0" not in col._rows
+
+
+def test_sweep_deleted_source_chunks_skips_unknown_root(tmp_path):
+    """A file_path whose first segment is not a current root is LEFT ALONE
+    (legacy bare-scheme -docs chunks are owned by _partition_docs_by_root)."""
+    from vecs.indexer import _sweep_deleted_source_chunks
+
+    root = tmp_path / "repo"
+    root.mkdir()
+
+    col = _FakeChromaCollection([
+        ("docs:HQ/old.md:0", {"file_path": "HQ/old.md"}),       # unknown root
+        ("docs:repo/gone.md:0", {"file_path": "repo/gone.md"}),  # known root, gone
+    ])
+
+    deleted = _sweep_deleted_source_chunks(col, {"repo": root})
+
+    assert deleted == ["docs:repo/gone.md:0"]
+    assert "docs:HQ/old.md:0" in col._rows  # untouched
+
+
+def test_sweep_deleted_source_chunks_empty_root_map_is_noop():
+    """An empty root map must NEVER wipe a collection (degenerate-prefix guard)."""
+    from vecs.indexer import _sweep_deleted_source_chunks
+
+    col = _FakeChromaCollection([
+        ("code:repo/a.cs:0", {"file_path": "repo/a.cs"}),
+    ])
+
+    deleted = _sweep_deleted_source_chunks(col, {})
+
+    assert deleted == []
+    assert "code:repo/a.cs:0" in col._rows
+
+
+def test_sweep_deleted_session_chunks_deletes_by_session_id():
+    """Session chunks (no file_path) are swept by session_id metadata."""
+    from vecs.indexer import _sweep_deleted_session_chunks
+
+    col = _FakeChromaCollection([
+        ("session:gone-sid:0", {"session_id": "gone-sid"}),
+        ("session:gone-sid:1", {"session_id": "gone-sid"}),
+        ("session:keep-sid:0", {"session_id": "keep-sid"}),
+    ])
+
+    deleted = _sweep_deleted_session_chunks(col, ["gone-sid"])
+
+    assert set(deleted) == {"session:gone-sid:0", "session:gone-sid:1"}
+    assert "session:keep-sid:0" in col._rows
+
+
+def test_prune_and_sweep_orphans_deletes_code_docs_and_bm25(tmp_path, monkeypatch):
+    """End-to-end: deleting a code file and a docs file makes a reindex's
+    prune+sweep delete their chunks from chroma AND BM25; siblings survive."""
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+    from vecs.indexer import _prune_and_sweep_orphans
+
+    code_root = tmp_path / "repo"
+    code_root.mkdir()
+    (code_root / "keep.cs").write_text("// k")  # gone.cs absent on disk
+
+    docs_root = tmp_path / "docs"
+    docs_root.mkdir()
+    (docs_root / "keep.md").write_text("# k")  # gone.md absent on disk
+
+    project = ProjectConfig(
+        name="p",
+        code_dirs=[CodeDir(path=code_root, extensions={".cs"})],
+        docs_dirs=[docs_root],
+    )
+
+    code_col = _FakeChromaCollection([
+        ("code:repo/keep.cs:0", {"file_path": "repo/keep.cs"}),
+        ("code:repo/gone.cs:0", {"file_path": "repo/gone.cs"}),
+        ("code:repo/gone.cs:1", {"file_path": "repo/gone.cs"}),
+    ])
+    docs_col = _FakeChromaCollection([
+        ("docs:docs/keep.md:0", {"file_path": "docs/keep.md"}),
+        ("docs:docs/gone.md:0", {"file_path": "docs/gone.md"}),
+    ])
+    db = _FakeDB({
+        "p-code": code_col,
+        "p-docs": docs_col,
+        "p-sessions": _FakeChromaCollection([]),
+    })
+
+    bm25: list[tuple[str, list[str]]] = []
+    monkeypatch.setattr(
+        "vecs.indexer._delete_ids_from_bm25",
+        lambda proj, suffix, ids: bm25.append((suffix, sorted(ids))),
+    )
+
+    stats = _prune_and_sweep_orphans(project, db)
+
+    assert stats["code_orphans"] == 2
+    assert stats["docs_orphans"] == 1
+    assert "code:repo/keep.cs:0" in code_col._rows
+    assert "code:repo/gone.cs:0" not in code_col._rows
+    assert "code:repo/gone.cs:1" not in code_col._rows
+    assert "docs:docs/keep.md:0" in docs_col._rows
+    assert "docs:docs/gone.md:0" not in docs_col._rows
+    assert ("code", ["code:repo/gone.cs:0", "code:repo/gone.cs:1"]) in bm25
+    assert ("docs", ["docs:docs/gone.md:0"]) in bm25
+
+
+def test_prune_and_sweep_orphans_clears_backlog_orphan(tmp_path, monkeypatch):
+    """A chunk whose source is gone is swept even with NO manifest entry --
+    the already-accumulated backlog the buggy prune() leaked."""
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+    from vecs.indexer import _prune_and_sweep_orphans
+
+    code_root = tmp_path / "repo"
+    code_root.mkdir()
+    project = ProjectConfig(
+        name="p", code_dirs=[CodeDir(path=code_root, extensions={".cs"})]
+    )
+
+    code_col = _FakeChromaCollection([
+        ("code:repo/ghost.cs:0", {"file_path": "repo/ghost.cs"}),
+    ])
+    db = _FakeDB({
+        "p-code": code_col,
+        "p-docs": _FakeChromaCollection([]),
+        "p-sessions": _FakeChromaCollection([]),
+    })
+    monkeypatch.setattr("vecs.indexer._delete_ids_from_bm25", lambda *a: None)
+
+    stats = _prune_and_sweep_orphans(project, db)
+
+    assert stats["pruned_keys"] == 0  # manifest empty -> nothing pruned
+    assert stats["code_orphans"] == 1  # ...but the orphan chunk is still swept
+    assert "code:repo/ghost.cs:0" not in code_col._rows
+
+
+def test_prune_and_sweep_orphans_deletes_chunks_for_deleted_session_file(tmp_path, monkeypatch):
+    """A deleted session file is pruned from the manifest AND its session_id
+    chunks are deleted from chroma + BM25; a surviving session is untouched."""
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+    from vecs.indexer import _prune_and_sweep_orphans
+
+    sess_dir = tmp_path / "sess"
+    sess_dir.mkdir()
+    keep = sess_dir / "keep-sid.jsonl"
+    gone = sess_dir / "gone-sid.jsonl"
+    keep.write_text("{}")
+    gone.write_text("{}")
+
+    project = ProjectConfig(name="p")
+    m = Manifest("p")
+    m.mark_session_indexed(keep, byte_offset=2, chunk_count=1)
+    m.mark_session_indexed(gone, byte_offset=2, chunk_count=1)
+    m.save()
+    gone.unlink()
+
+    sess_col = _FakeChromaCollection([
+        ("session:gone-sid:0", {"session_id": "gone-sid"}),
+        ("session:keep-sid:0", {"session_id": "keep-sid"}),
+    ])
+    db = _FakeDB({
+        "p-sessions": sess_col,
+        "p-code": _FakeChromaCollection([]),
+        "p-docs": _FakeChromaCollection([]),
+    })
+    bm25: list[tuple[str, list[str]]] = []
+    monkeypatch.setattr(
+        "vecs.indexer._delete_ids_from_bm25",
+        lambda proj, suffix, ids: bm25.append((suffix, sorted(ids))),
+    )
+
+    stats = _prune_and_sweep_orphans(project, db)
+
+    assert stats["session_orphans"] == 1
+    assert "session:gone-sid:0" not in sess_col._rows
+    assert "session:keep-sid:0" in sess_col._rows
+    assert ("sessions", ["session:gone-sid:0"]) in bm25
+
+
+# --- Inc 1.5a: Phase-4 review hardening (data-loss guards) -------------------
+
+
+def test_safe_sweep_root_map_excludes_missing_and_colliding(tmp_path):
+    """The sweep root map includes only roots present on disk with a UNIQUE
+    basename -- both guards degrade to leaving an orphan (never deleting live)."""
+    from vecs.indexer import _safe_sweep_root_map
+
+    present = tmp_path / "present"
+    present.mkdir()
+    missing = tmp_path / "missing"  # never created
+    a_shared = tmp_path / "a" / "shared"
+    b_shared = tmp_path / "b" / "shared"  # collides with a_shared on basename
+    a_shared.mkdir(parents=True)
+    b_shared.mkdir(parents=True)
+
+    root_map = _safe_sweep_root_map([present, missing, a_shared, b_shared])
+
+    assert root_map == {"present": present}  # missing dropped; "shared" collides -> dropped
+
+
+def test_prune_and_sweep_orphans_skips_transiently_missing_root(tmp_path, monkeypatch):
+    """A configured root that is missing on disk at sweep time (e.g. unmounted)
+    must NOT be read as 'all its files deleted' -- its live chunks survive."""
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+    from vecs.indexer import _prune_and_sweep_orphans
+
+    code_root = tmp_path / "repo"  # deliberately NOT created -> transiently missing
+    project = ProjectConfig(
+        name="p", code_dirs=[CodeDir(path=code_root, extensions={".cs"})]
+    )
+    code_col = _FakeChromaCollection([
+        ("code:repo/a.cs:0", {"file_path": "repo/a.cs"}),
+        ("code:repo/b.cs:0", {"file_path": "repo/b.cs"}),
+    ])
+    db = _FakeDB({
+        "p-code": code_col,
+        "p-docs": _FakeChromaCollection([]),
+        "p-sessions": _FakeChromaCollection([]),
+    })
+    monkeypatch.setattr("vecs.indexer._delete_ids_from_bm25", lambda *a: None)
+
+    stats = _prune_and_sweep_orphans(project, db)
+
+    assert stats["code_orphans"] == 0  # root missing -> presumed transient, not swept
+    assert "code:repo/a.cs:0" in code_col._rows
+    assert "code:repo/b.cs:0" in code_col._rows
+
+
+def test_prune_and_sweep_orphans_skips_colliding_basename_roots(tmp_path, monkeypatch):
+    """Two roots sharing a basename make a chunk resolve against the WRONG root;
+    rather than risk deleting a live file's chunks, colliding roots are skipped."""
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+    from vecs.indexer import _prune_and_sweep_orphans
+
+    a_shared = tmp_path / "a" / "shared"
+    b_shared = tmp_path / "b" / "shared"
+    a_shared.mkdir(parents=True)
+    b_shared.mkdir(parents=True)
+    (a_shared / "keep.cs").write_text("// live")  # exists under /a/shared, NOT /b/shared
+
+    project = ProjectConfig(
+        name="p",
+        code_dirs=[
+            CodeDir(path=a_shared, extensions={".cs"}),
+            CodeDir(path=b_shared, extensions={".cs"}),
+        ],
+    )
+    # Chunk came from /a/shared/keep.cs (live), but code_map would collapse to
+    # the last "shared" (=/b/shared) and falsely delete it without the guard.
+    code_col = _FakeChromaCollection([
+        ("code:shared/keep.cs:0", {"file_path": "shared/keep.cs"}),
+    ])
+    db = _FakeDB({
+        "p-code": code_col,
+        "p-docs": _FakeChromaCollection([]),
+        "p-sessions": _FakeChromaCollection([]),
+    })
+    monkeypatch.setattr("vecs.indexer._delete_ids_from_bm25", lambda *a: None)
+
+    stats = _prune_and_sweep_orphans(project, db)
+
+    assert stats["code_orphans"] == 0
+    assert "code:shared/keep.cs:0" in code_col._rows  # live chunk preserved
+
+
+def test_prune_and_sweep_orphans_saves_manifest_after_session_sweep(tmp_path, monkeypatch):
+    """Crash-safety: the manifest must be persisted only AFTER session chunks are
+    deleted, so an interruption leaves the session: key for next run to retry
+    (session chunks carry no file_path and cannot self-heal via the disk scan)."""
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+    from vecs.indexer import _prune_and_sweep_orphans
+
+    sess_dir = tmp_path / "sess"
+    sess_dir.mkdir()
+    gone = sess_dir / "gone-sid.jsonl"
+    gone.write_text("{}")
+
+    project = ProjectConfig(name="p")
+    m = Manifest("p")
+    m.mark_session_indexed(gone, byte_offset=2, chunk_count=1)
+    m.save()
+    gone.unlink()
+
+    db = _FakeDB({
+        "p-sessions": _FakeChromaCollection([("session:gone-sid:0", {"session_id": "gone-sid"})]),
+        "p-code": _FakeChromaCollection([]),
+        "p-docs": _FakeChromaCollection([]),
+    })
+
+    # The session chunk delete fails partway -> the function must NOT have already
+    # persisted the pruned manifest.
+    def boom(*a, **kw):
+        raise RuntimeError("interrupted mid-sweep")
+
+    monkeypatch.setattr("vecs.indexer._sweep_deleted_session_chunks", boom)
+    monkeypatch.setattr("vecs.indexer._delete_ids_from_bm25", lambda *a: None)
+
+    with pytest.raises(RuntimeError):
+        _prune_and_sweep_orphans(project, db)
+
+    reloaded = Manifest("p")
+    assert f"session:{gone}" in reloaded.data  # key intact on disk -> next run retries
+
+
+def test_prune_and_sweep_orphans_session_stem_collision_keeps_survivor(tmp_path, monkeypatch):
+    """Two session files sharing a stem: deleting one must NOT sweep the
+    survivor's chunks (session_id is the bare stem, shared in the collection)."""
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+    from vecs.indexer import _prune_and_sweep_orphans
+
+    d1 = tmp_path / "a"
+    d2 = tmp_path / "b"
+    d1.mkdir()
+    d2.mkdir()
+    gone = d1 / "run.jsonl"
+    keep = d2 / "run.jsonl"  # SAME stem "run"
+    gone.write_text("{}")
+    keep.write_text("{}")
+
+    project = ProjectConfig(name="p")
+    m = Manifest("p")
+    m.mark_session_indexed(gone, byte_offset=2, chunk_count=1)
+    m.mark_session_indexed(keep, byte_offset=2, chunk_count=1)
+    m.save()
+    gone.unlink()
+
+    sess_col = _FakeChromaCollection([("session:run:0", {"session_id": "run"})])
+    db = _FakeDB({
+        "p-sessions": sess_col,
+        "p-code": _FakeChromaCollection([]),
+        "p-docs": _FakeChromaCollection([]),
+    })
+    monkeypatch.setattr("vecs.indexer._delete_ids_from_bm25", lambda *a: None)
+
+    stats = _prune_and_sweep_orphans(project, db)
+
+    assert stats["session_orphans"] == 0  # stem "run" still has a surviving key
+    assert "session:run:0" in sess_col._rows
+
+
+def test_prune_and_sweep_orphans_no_bm25_when_clean(tmp_path, monkeypatch):
+    """A reindex where every source still exists deletes nothing and never opens
+    the BM25 sidecar (the prune path must not call _delete_ids_from_bm25 with [])."""
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+    from vecs.indexer import _prune_and_sweep_orphans
+
+    code_root = tmp_path / "repo"
+    code_root.mkdir()
+    (code_root / "a.cs").write_text("// a")
+
+    project = ProjectConfig(
+        name="p", code_dirs=[CodeDir(path=code_root, extensions={".cs"})]
+    )
+    code_col = _FakeChromaCollection([("code:repo/a.cs:0", {"file_path": "repo/a.cs"})])
+    db = _FakeDB({
+        "p-code": code_col,
+        "p-docs": _FakeChromaCollection([]),
+        "p-sessions": _FakeChromaCollection([]),
+    })
+    bm25_calls: list = []
+    monkeypatch.setattr(
+        "vecs.indexer._delete_ids_from_bm25",
+        lambda *a: bm25_calls.append(a),
+    )
+
+    stats = _prune_and_sweep_orphans(project, db)
+
+    assert stats == {"pruned_keys": 0, "code_orphans": 0, "docs_orphans": 0, "session_orphans": 0}
+    assert bm25_calls == []
+    assert "code:repo/a.cs:0" in code_col._rows
+
+
+def test_prune_and_sweep_orphans_keeps_unknown_root_docs_end_to_end(tmp_path, monkeypatch):
+    """End-to-end: a legacy bare/unknown-root -docs chunk (owned by
+    _partition_docs_by_root) survives the orphan sweep; only a known-root gone
+    chunk is swept."""
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+    from vecs.indexer import _prune_and_sweep_orphans
+
+    docs_root = tmp_path / "docs"
+    docs_root.mkdir()
+    (docs_root / "keep.md").write_text("# k")  # gone.md absent
+
+    project = ProjectConfig(name="p", docs_dirs=[docs_root])
+    docs_col = _FakeChromaCollection([
+        ("docs:HQ/old.md:0", {"file_path": "HQ/old.md"}),        # unknown root "HQ"
+        ("docs:docs/keep.md:0", {"file_path": "docs/keep.md"}),  # known, present
+        ("docs:docs/gone.md:0", {"file_path": "docs/gone.md"}),  # known, gone
+    ])
+    db = _FakeDB({
+        "p-docs": docs_col,
+        "p-code": _FakeChromaCollection([]),
+        "p-sessions": _FakeChromaCollection([]),
+    })
+    monkeypatch.setattr("vecs.indexer._delete_ids_from_bm25", lambda *a: None)
+
+    stats = _prune_and_sweep_orphans(project, db)
+
+    assert stats["docs_orphans"] == 1
+    assert "docs:HQ/old.md:0" in docs_col._rows       # unknown root left alone
+    assert "docs:docs/keep.md:0" in docs_col._rows
+    assert "docs:docs/gone.md:0" not in docs_col._rows
+
+
+def test_prune_and_sweep_orphans_sweeps_inrepo_md_docs_by_code_dir_root(tmp_path, monkeypatch):
+    """A deleted in-repo .md (a -docs chunk rooted at a CODE_DIR) is swept via
+    the code_dir entry in the docs root map."""
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+    from vecs.indexer import _prune_and_sweep_orphans
+
+    code_root = tmp_path / "repo"
+    code_root.mkdir()
+    (code_root / "KEEP.md").write_text("# k")  # GONE.md absent
+
+    project = ProjectConfig(
+        name="p", code_dirs=[CodeDir(path=code_root, extensions={".cs"})]
+    )
+    docs_col = _FakeChromaCollection([
+        ("docs:repo/KEEP.md:0", {"file_path": "repo/KEEP.md"}),
+        ("docs:repo/GONE.md:0", {"file_path": "repo/GONE.md"}),
+    ])
+    db = _FakeDB({
+        "p-docs": docs_col,
+        "p-code": _FakeChromaCollection([]),
+        "p-sessions": _FakeChromaCollection([]),
+    })
+    monkeypatch.setattr("vecs.indexer._delete_ids_from_bm25", lambda *a: None)
+
+    stats = _prune_and_sweep_orphans(project, db)
+
+    assert stats["docs_orphans"] == 1
+    assert "docs:repo/KEEP.md:0" in docs_col._rows
+    assert "docs:repo/GONE.md:0" not in docs_col._rows
+
+
+def test_prune_and_sweep_orphans_missing_collection_is_noop(tmp_path, monkeypatch):
+    """A never-created collection (get_collection raises) is skipped, not fatal."""
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+    from vecs.indexer import _prune_and_sweep_orphans
+
+    code_root = tmp_path / "repo"
+    code_root.mkdir()
+    project = ProjectConfig(
+        name="p", code_dirs=[CodeDir(path=code_root, extensions={".cs"})]
+    )
+    # _FakeDB has no p-code collection -> get_collection raises -> _col returns None.
+    db = _FakeDB({"p-sessions": _FakeChromaCollection([])})
+    monkeypatch.setattr("vecs.indexer._delete_ids_from_bm25", lambda *a: None)
+
+    stats = _prune_and_sweep_orphans(project, db)
+
+    assert stats["code_orphans"] == 0  # no collection -> skipped, no exception
+
+
+def test_sweep_deleted_source_chunks_keeps_chunk_on_oserror(tmp_path, monkeypatch):
+    """A path whose .exists() raises OSError is KEPT (never deleted) -- the
+    safety-critical guard against deleting a live-but-unstattable file."""
+    from vecs.indexer import _sweep_deleted_source_chunks
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    col = _FakeChromaCollection([("code:repo/x.cs:0", {"file_path": "repo/x.cs"})])
+
+    real_exists = Path.exists
+
+    def boom(self):
+        if self.name == "x.cs":
+            raise OSError("io error")
+        return real_exists(self)
+
+    monkeypatch.setattr(Path, "exists", boom)
+
+    deleted = _sweep_deleted_source_chunks(col, {"repo": root})
+
+    assert deleted == []
+    assert "code:repo/x.cs:0" in col._rows
