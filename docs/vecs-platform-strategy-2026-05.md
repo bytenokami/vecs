@@ -1,3 +1,5 @@
+Authored by Claude
+
 # vecs platform strategy — frontier + team-shared (2026-05)
 
 Owner-level strategy for the mandate: **vecs uses frontier coding tech, and is a shared knowledge + search base for the engineering team's agents — code *and* general info.** Supplements `vecs-roadmap.md` (which covers retrieval shapes) with the two dimensions it omits: team-sharing and the agent-facing tool surface.

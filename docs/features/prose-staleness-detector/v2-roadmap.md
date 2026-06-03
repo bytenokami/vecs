@@ -1,3 +1,5 @@
+Authored by Claude
+
 # prose-staleness-detector — v2 roadmap
 
 Feature-scoped deferrals for **prose-drift**. Platform-level directions (bundle assembly, code graph, hierarchical retrieval) live in `docs/vecs-roadmap.md`.

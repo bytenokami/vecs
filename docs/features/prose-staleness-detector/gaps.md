@@ -1,3 +1,5 @@
+Authored by Claude
+
 # Gap log — prose-staleness-detector v1 (V+)
 
 Schema (per profile `feedback_artifact` row contract): `pass | finding-id | severity | summary | decision | follow-up-link`.

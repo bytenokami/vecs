@@ -1,3 +1,5 @@
+Authored by Claude
+
 # Workflow Framework v0.1
 
 A thin template for AI-driven feature development. The base declares phases and slots; project profiles fill the slots. Composition, not inheritance.

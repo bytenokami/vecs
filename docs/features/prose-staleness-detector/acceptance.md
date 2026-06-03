@@ -1,3 +1,5 @@
+Authored by Claude
+
 # Acceptance — prose-staleness-detector v1 (V+)
 
 Source: `docs/features/prose-staleness-detector-design-v1.md` Phase 1. Format per profile: `acceptance_format: checklist`, `pass_threshold: all-pass`. Runner: `scripts/check_acceptance.py prose-staleness-detector` (interactive) or with `--non-interactive` (treats pre-checked `[x]` as pass).

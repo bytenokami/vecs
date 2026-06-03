@@ -1,3 +1,5 @@
+Authored by Claude
+
 # Workflow Profile: vecs v0.1
 
 Fills the slots declared in `docs/workflow-framework-v0.1.md` for the vecs repository (POC scale, single contributor, no CI, no per-module context docs).

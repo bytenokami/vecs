@@ -1,3 +1,5 @@
+Authored by Claude
+
 # Feature Design: context-staleness-detector v1
 
 Targets the vecs workflow profile at `docs/workflow-vecs-profile-v0.1.md`. Walks Phases 1–8 in profile order. Each phase produced by the role the profile's `agent_roster` designates.

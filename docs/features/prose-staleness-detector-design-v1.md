@@ -1,3 +1,5 @@
+Authored by Claude
+
 # Feature Design: prose-staleness-detector v1 (V+)
 
 Targets the vecs workflow profile at `docs/workflow-vecs-profile-v0.1.md`. Walks Phases 1–8 in profile order. Each phase produced by the role the profile's `roster` designates. This is the **V+ rewrite**: the prior Mem0-based draft was reopened when six sub-agent passes surfaced (a) Mem0 v2.0.2/v3 is officially ADD-only per `docs.mem0.ai/migration/oss-v2-to-v3` (the UPDATE event the prior design depended on is deprecated), and (b) bi-temporal storage (Graphiti/Zep; XTDB/Datomic) is the mature industry pattern. V+ is a vecs-only, bi-temporal, INSERT/NOOP/SUPERSEDE state machine sitting directly on the existing Chroma + Voyage stack. No Mem0 dependency.

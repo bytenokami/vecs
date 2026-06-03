@@ -1,3 +1,5 @@
+Authored by Claude
+
 # Increment 1 — Foundations & No-Regret Wins (parent)
 
 **Parent program:** `docs/vecs-kb-curation-design-2026-06.md` (v3, §6 Increment 1).

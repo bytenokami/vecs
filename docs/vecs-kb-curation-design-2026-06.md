@@ -1,3 +1,5 @@
+Authored by Claude
+
 # vecs Knowledge-Base Curation — End-State Design & Increment Program
 
 **Date:** 2026-06-01 (rev v4: 2026-06-03)

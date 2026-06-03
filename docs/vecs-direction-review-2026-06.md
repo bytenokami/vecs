@@ -1,3 +1,5 @@
+Authored by Claude
+
 # vecs — Phase-4 direction review (2026-06-03)
 
 Adversarial 7-lens critic panel (workflow run `wf_e205def2-b79`, 7 critics + synthesis) on:

@@ -1,3 +1,5 @@
+Authored by Claude
+
 # Prose-Staleness-Detector v1 — Architecture Review & SOTA Research (2026-05-29)
 
 ## Executive summary

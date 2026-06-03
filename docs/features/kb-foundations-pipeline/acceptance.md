@@ -1,3 +1,5 @@
+Authored by Claude
+
 # Acceptance — Increment 1-pipeline (F + B + C)
 
 Format: checklist. Pass threshold: all-pass. Parent: `docs/features/kb-foundations/design.md`; program §6.

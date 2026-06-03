@@ -1,3 +1,5 @@
+Authored by Claude
+
 # Retrospective: prose-staleness-detector v1 (V+) — Phase 7 dry-run
 
 Filled per `docs/workflow-vecs-profile-v0.1.md` Phase 8. Scope: design pipeline (passes 1-4) + Phase 7 dry-run only. A second retro will follow Phase 4 (indexer wire-in) + Phase 5 (full test matrix) + Phase 6 (roster execution).

@@ -1,3 +1,5 @@
+Authored by Claude
+
 # vecs Roadmap
 
 vecs is **code-aware agent memory**: index your code, your AI-agent sessions, and your docs; retrieve what's relevant; and flag what's gone stale. This is the platform view — where vecs goes beyond search. The prose-drift staleness feature's own deferrals live in `docs/features/prose-staleness-detector/v2-roadmap.md`.

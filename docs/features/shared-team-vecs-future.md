@@ -1,3 +1,5 @@
+Authored by Claude
+
 # Future Feature: shared-team-vecs (placeholder)
 
 Status: idea logged 2026-05-21. NOT scheduled for v1. Separate from prose-staleness-detector v1.

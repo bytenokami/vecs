@@ -1,3 +1,5 @@
+Authored by Claude
+
 # prose-drift stage-2 recall — design
 
 Status: approved 2026-05-30. Scope: **minimal stage-2** (close the paraphrase/cross-predicate xfail). Sits under platform pillar 1 (frontier retrieval quality). Sibling roadmap: `v2-roadmap.md`. SOTA basis: `docs/research/prose-drift-review-and-sota-2026-05-29.md`.

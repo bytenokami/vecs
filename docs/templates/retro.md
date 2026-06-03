@@ -1,3 +1,5 @@
+Authored by Claude
+
 # Retrospective: <feature-name>
 
 Filled per `docs/workflow-vecs-profile-v0.1.md` Phase 8. One retro per feature.
