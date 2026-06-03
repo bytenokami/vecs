@@ -45,7 +45,7 @@ Targets workflow profile at `docs/workflow-vecs-profile-v0.1.md` (Phase 2 `conte
 
 ## Tests
 
-- `tests/` contains one module per source module (13 total). New feature touching module M MUST add or update `tests/test_M.py` (Phase 5 `new_test_required_per_feature: true`).
+- `tests/` holds **one or more** test files per source module. New feature touching module M MUST add or update its test file(s) (Phase 5 `new_test_required_per_feature: true`). Small modules use a single `tests/test_M.py`. A large module is split by concern to keep each file readable/cheap-to-load: **`indexer.py` → `tests/test_indexer_{manifest,embed,code,docs,sessions,run}.py`** plus shared fakes/fixtures in **`tests/indexer_helpers.py`** (a plain importable module, not `test_*`, so pytest doesn't collect it as tests; the concern files `from indexer_helpers import ...`).
 - Runner: `uv run pytest -q`.
 - Opt-in integration tests gated by VECS_TEST_REAL_LLM=1 — real LLM calls; default-skipped in CI. See tests/test_prose_drift.py::test_integration_real_anthropic.
 
