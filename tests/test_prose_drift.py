@@ -156,12 +156,12 @@ def test_extraction_uses_correct_model_no_temperature(fake_anthropic, monkeypatc
     extract_facts([{"role": "user", "text": "we have no BE dev", "timestamp": "0"}], "p1")
     assert len(fake_anthropic["calls"]) == 1
     call = fake_anthropic["calls"][0]
-    assert call["model"] == "claude-opus-4-7"
-    assert "temperature" not in call, "claude-opus-4-7 rejects temperature kwarg"
+    assert call["model"] == "claude-sonnet-4-6"
+    assert "temperature" not in call, "extraction model rejects temperature kwarg"
 
 
 def test_prose_extraction_model_constant_is_pinned():
-    assert PROSE_EXTRACTION_MODEL == "claude-opus-4-7"
+    assert PROSE_EXTRACTION_MODEL == "claude-sonnet-4-6"
 
 
 def test_voyage_embed_uses_pinned_facts_model(monkeypatch):
@@ -1155,7 +1155,7 @@ def test_judge_contradiction_uses_pinned_model_no_temperature(fake_anthropic):
     prose_drift._judge_contradiction(doc, chat, "p_judge_model")
     jc = _judge_calls(fake_anthropic)
     assert len(jc) == 1
-    assert jc[0]["model"] == prose_drift.PROSE_JUDGE_MODEL == "claude-opus-4-7"
+    assert jc[0]["model"] == prose_drift.PROSE_JUDGE_MODEL == "claude-opus-4-8"
     assert "temperature" not in jc[0]
 
 

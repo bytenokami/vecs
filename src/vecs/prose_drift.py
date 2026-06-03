@@ -22,11 +22,15 @@ import chromadb
 from vecs.clients import get_voyage_client
 from vecs.config import CHROMADB_DIR, FACTS_MODEL
 
-PROSE_EXTRACTION_MODEL = "claude-opus-4-7"
+# Owner-decided 2026-06-03 (direction review): bulk fact extraction runs on the
+# latest Sonnet (cheap-strong); the rare, decisive stage-2 contradiction judge
+# stays on the latest Opus. Both dormant today (extraction disabled), so no cost
+# now -- the Inc-1-A metering spike must report $/run before extraction is enabled.
+PROSE_EXTRACTION_MODEL = "claude-sonnet-4-6"
 EXTRACTION_PROMPT_VERSION = "v2"
 
 # stage-2 recall: embedding-similarity fallback + selective contradiction-judge.
-PROSE_JUDGE_MODEL = "claude-opus-4-7"
+PROSE_JUDGE_MODEL = "claude-opus-4-8"
 JUDGE_PROMPT_VERSION = "v1"
 STAGE2_SIM_THRESHOLD = 0.85
 
@@ -270,7 +274,7 @@ def extract_facts(messages: list[dict], project: str) -> list[Triple]:
                 f"[{m['role']}]: {m['text']}" for m in user_msgs
             )
         )
-        # NOTE: no `temperature` kwarg. claude-opus-4-7 rejects it (400).
+        # NOTE: no `temperature` kwarg (the configured model rejected it — 400).
         resp = client.messages.create(
             model=PROSE_EXTRACTION_MODEL,
             max_tokens=2048,
@@ -320,7 +324,7 @@ def extract_facts_from_doc(
 
         client = anthropic.Anthropic()
         prompt = DOC_EXTRACTION_PROMPT.format(text=text)
-        # NOTE: no `temperature` kwarg. claude-opus-4-7 rejects it (400).
+        # NOTE: no `temperature` kwarg (the configured model rejected it — 400).
         resp = client.messages.create(
             model=PROSE_EXTRACTION_MODEL,
             max_tokens=2048,
@@ -632,7 +636,7 @@ def _judge_contradiction_ex(
             doc=f'subject="{doc_triple.subject}" predicate="{doc_triple.predicate}" object="{doc_triple.object}"',
             chat=f'subject="{chat_meta.get("subject", "")}" predicate="{chat_meta.get("predicate", "")}" object="{chat_meta.get("object", "")}"',
         )
-        # NOTE: no `temperature` kwarg. claude-opus-4-7 rejects it (400).
+        # NOTE: no `temperature` kwarg (the configured model rejected it — 400).
         resp = client.messages.create(
             model=PROSE_JUDGE_MODEL,
             max_tokens=512,
