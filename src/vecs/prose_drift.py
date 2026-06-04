@@ -11,6 +11,7 @@ import json
 import math
 import os
 import sqlite3
+import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ import chromadb
 
 from vecs.clients import get_voyage_client
 from vecs.config import CHROMADB_DIR, FACTS_MODEL
+from vecs.metering import MeteringCapExceeded, metered_create
 
 # Owner-decided 2026-06-03 (direction review): bulk fact extraction runs on the
 # latest Sonnet (cheap-strong); the rare, decisive stage-2 contradiction judge
@@ -275,7 +277,10 @@ def extract_facts(messages: list[dict], project: str) -> list[Triple]:
             )
         )
         # NOTE: no `temperature` kwarg (the configured model rejected it — 400).
-        resp = client.messages.create(
+        # metered_create (Inc 1-A): enforces MAX_CALLS_PER_DAY + emits a cost
+        # record. Only reached on a cache MISS, so cache hits cost nothing.
+        resp = metered_create(
+            client,
             model=PROSE_EXTRACTION_MODEL,
             max_tokens=2048,
             messages=[{"role": "user", "content": prompt}],
@@ -325,7 +330,8 @@ def extract_facts_from_doc(
         client = anthropic.Anthropic()
         prompt = DOC_EXTRACTION_PROMPT.format(text=text)
         # NOTE: no `temperature` kwarg (the configured model rejected it — 400).
-        resp = client.messages.create(
+        resp = metered_create(
+            client,
             model=PROSE_EXTRACTION_MODEL,
             max_tokens=2048,
             messages=[{"role": "user", "content": prompt}],
@@ -431,7 +437,10 @@ def find_prose_drift(project) -> dict:
 
     Returns the MCP payload dict:
       {"drift": [...], "facts_scanned": int, "facts_scanned_docs": int,
-       "stage2_judge_calls": int, "stage2_judge_errors": int, "project": str}
+       "stage2_judge_calls": int, "stage2_judge_errors": int,
+       "cap_hit": bool, "project": str}
+    cap_hit is True when the scan stopped early because the metering daily call
+    cap (Inc 1-A) was reached — the result is then PARTIAL.
     """
     name = project.name
     facts = _get_prose_facts_collection(name)
@@ -441,42 +450,54 @@ def find_prose_drift(project) -> dict:
     docs_scanned = 0
     judge_calls = 0
     judge_errors = 0
-    for chunk_text, source_relpath in iterate_indexed_docs(name):
-        docs_scanned += 1
-        for dt in extract_facts_from_doc(chunk_text, source_relpath, project=name):
-            chain_key = f"{dt.subject}|{dt.predicate}"
-            cur = by_chain.get(chain_key)
-            if cur is not None:
-                if cur["object"] != dt.object:
-                    drift.append(_exact_drift_entry(dt, cur, source_relpath))
-                continue
-            # chain_key MISS -> stage-2 semantic fallback.
-            if not current_rows:
-                continue
-            doc_emb = _voyage_embed_cached(
-                f"{dt.subject} {dt.predicate} {dt.object}", name
-            )
-            cand = _best_semantic_candidate(doc_emb, current_rows)
-            if cand is None or cand[1] < STAGE2_SIM_THRESHOLD:
-                continue
-            cand_meta, sim = cand
-            # Only per-candidate parse failures are swallowed (counted + skipped);
-            # a fatal anthropic error (auth, rate-limit) propagates and aborts the scan
-            # rather than masking real contradictions as a clean result.
-            try:
-                verdict, api_called = _judge_contradiction_ex(dt, cand_meta, name)
-            except (json.JSONDecodeError, KeyError, ValueError, TypeError, IndexError):
-                judge_calls += 1  # an api call was made; it just failed to parse
-                judge_errors += 1
-                continue
-            if api_called:
-                judge_calls += 1
-            if verdict.contradicts:
-                drift.append(
-                    _semantic_drift_entry(
-                        dt, cand_meta, source_relpath, sim, verdict.confidence
-                    )
+    # Inc 1-A: the metered extraction/judge calls raise MeteringCapExceeded once
+    # the daily call cap is reached. Catch it here so the scan STOPS gracefully
+    # at the cap (returning whatever was found so far) instead of aborting — the
+    # payload's cap_hit flags the partial result.
+    cap_hit = False
+    try:
+        for chunk_text, source_relpath in iterate_indexed_docs(name):
+            docs_scanned += 1
+            for dt in extract_facts_from_doc(chunk_text, source_relpath, project=name):
+                chain_key = f"{dt.subject}|{dt.predicate}"
+                cur = by_chain.get(chain_key)
+                if cur is not None:
+                    if cur["object"] != dt.object:
+                        drift.append(_exact_drift_entry(dt, cur, source_relpath))
+                    continue
+                # chain_key MISS -> stage-2 semantic fallback.
+                if not current_rows:
+                    continue
+                doc_emb = _voyage_embed_cached(
+                    f"{dt.subject} {dt.predicate} {dt.object}", name
                 )
+                cand = _best_semantic_candidate(doc_emb, current_rows)
+                if cand is None or cand[1] < STAGE2_SIM_THRESHOLD:
+                    continue
+                cand_meta, sim = cand
+                # Only per-candidate parse failures are swallowed (counted + skipped);
+                # a fatal anthropic error (auth, rate-limit) propagates and aborts the scan
+                # rather than masking real contradictions as a clean result.
+                try:
+                    verdict, api_called = _judge_contradiction_ex(dt, cand_meta, name)
+                except (json.JSONDecodeError, KeyError, ValueError, TypeError, IndexError):
+                    judge_calls += 1  # an api call was made; it just failed to parse
+                    judge_errors += 1
+                    continue
+                if api_called:
+                    judge_calls += 1
+                if verdict.contradicts:
+                    drift.append(
+                        _semantic_drift_entry(
+                            dt, cand_meta, source_relpath, sim, verdict.confidence
+                        )
+                    )
+    except MeteringCapExceeded as e:
+        cap_hit = True
+        print(
+            f"prose-drift[{name}]: {e} -- stopping extraction at the daily cap",
+            file=sys.stderr,
+        )
     drift.sort(key=lambda d: (d["subject"], d["predicate"], d.get("match_type", "")))
     facts_scanned = len(facts.get(where={"is_current": True}).get("ids") or [])
     return {
@@ -485,6 +506,7 @@ def find_prose_drift(project) -> dict:
         "facts_scanned_docs": docs_scanned,
         "stage2_judge_calls": judge_calls,
         "stage2_judge_errors": judge_errors,
+        "cap_hit": cap_hit,
         "project": name,
     }
 
@@ -637,7 +659,8 @@ def _judge_contradiction_ex(
             chat=f'subject="{chat_meta.get("subject", "")}" predicate="{chat_meta.get("predicate", "")}" object="{chat_meta.get("object", "")}"',
         )
         # NOTE: no `temperature` kwarg (the configured model rejected it — 400).
-        resp = client.messages.create(
+        resp = metered_create(
+            client,
             model=PROSE_JUDGE_MODEL,
             max_tokens=512,
             messages=[{"role": "user", "content": prompt}],

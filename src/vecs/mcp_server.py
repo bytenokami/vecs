@@ -125,8 +125,9 @@ def prose_drift(project: str | None = None) -> dict:
     paraphrase drift. Each drift entry carries match_type ("exact" | "semantic"); a
     semantic entry adds similarity + confidence and a chat block with the chat-side
     subject/predicate/object/session_id. The payload also includes facts_scanned,
-    facts_scanned_docs, stage2_judge_calls, and stage2_judge_errors. Still out of
-    scope: omission and soft/temporal "used to have" contradictions.
+    facts_scanned_docs, stage2_judge_calls, stage2_judge_errors, and cap_hit (True
+    when the scan stopped early at the metering daily call cap — a PARTIAL result).
+    Still out of scope: omission and soft/temporal "used to have" contradictions.
 
     Args:
         project: Project name, or None to scan all enabled projects.

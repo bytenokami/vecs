@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from vecs import prose_drift
+from vecs import metering, prose_drift
 from vecs.config import ProjectConfig
 from vecs.prose_drift import (
     EVENT_INSERT,
@@ -19,6 +19,7 @@ from vecs.prose_drift import (
     EVENT_SUPERSEDE,
     EXTRACTION_PROMPT_VERSION,
     PROSE_EXTRACTION_MODEL,
+    PROSE_JUDGE_MODEL,
     Triple,
     _extract_cache_key_text,
     add_fact_with_state_machine,
@@ -34,6 +35,9 @@ def _isolate_chroma_and_cache(monkeypatch, tmp_path):
     """Pin Chroma + cache dir to tmp_path so dry-run does not touch ~/.vecs/."""
     monkeypatch.setattr(prose_drift, "_chroma_path", lambda: tmp_path / "chromadb")
     monkeypatch.setattr(prose_drift, "_cache_dir", lambda: tmp_path / "prose_drift_cache")
+    # Inc 1-A: keep metering's cost-record JSONL off the real ~/.vecs store (and
+    # out of the real daily cap) during tests.
+    monkeypatch.setattr(metering, "DEFAULT_METERING_PATH", tmp_path / "metering" / "calls.jsonl")
     yield
 
 
@@ -162,6 +166,46 @@ def test_extraction_uses_correct_model_no_temperature(fake_anthropic, monkeypatc
 
 def test_prose_extraction_model_constant_is_pinned():
     assert PROSE_EXTRACTION_MODEL == "claude-sonnet-4-6"
+
+
+# ----- Inc 1-A: metering wiring -----------------------------------------------
+
+
+def test_extraction_emits_metering_record(fake_anthropic):
+    """Every real extraction call goes through the metering chokepoint and emits
+    a cost record (acceptance A line 1)."""
+    extract_facts([{"role": "user", "text": "we have no BE dev", "timestamp": "0"}], "p_meter")
+    assert len(fake_anthropic["calls"]) == 1
+    assert metering.calls_today() == 1  # isolated store (autouse fixture)
+
+
+def test_extraction_cache_hit_emits_no_metering_record(fake_anthropic):
+    """A cache hit makes no API call, so it records no cost (zero spend)."""
+    msgs = [{"role": "user", "text": "cache me", "timestamp": "0"}]
+    extract_facts(msgs, "p_meter2")
+    extract_facts(msgs, "p_meter2")  # cache hit -> no second API call
+    assert len(fake_anthropic["calls"]) == 1
+    assert metering.calls_today() == 1  # only the miss was metered
+
+
+def test_find_prose_drift_stops_at_cap(monkeypatch, fake_voyage):
+    """When extraction hits the daily cap mid-scan, find_prose_drift stops
+    gracefully: no exception escapes, the payload carries cap_hit=True
+    (acceptance A line 2 — 'extraction stops at the cap')."""
+    proj = ProjectConfig(name="p_cap")
+    monkeypatch.setattr(
+        prose_drift, "iterate_indexed_docs",
+        lambda name: iter([("some doc text", "docs/x.md")]),
+    )
+
+    def _capped(*a, **k):
+        raise metering.MeteringCapExceeded("daily LLM call cap reached (test)")
+
+    monkeypatch.setattr(prose_drift, "extract_facts_from_doc", _capped)
+    out = prose_drift.find_prose_drift(proj)
+    assert out["cap_hit"] is True
+    assert out["project"] == "p_cap"
+    assert out["facts_scanned_docs"] == 1  # the one doc we started before the cap
 
 
 def test_voyage_embed_uses_pinned_facts_model(monkeypatch):
@@ -741,6 +785,84 @@ def test_exact_finding_tagged_match_type_exact(fake_anthropic, fake_voyage):
     assert d["match_type"] == "exact"
     assert d["chat"]["subject"] == "team" and d["chat"]["predicate"] == "has_role"
     assert report["stage2_judge_calls"] == 0
+
+
+# ----- Inc 1-A: metering through the find_prose_drift judge + doc paths -------
+
+
+def _metering_models():
+    """Models recorded in the (isolated) metering JSONL this test."""
+    p = metering.DEFAULT_METERING_PATH
+    if not p.exists():
+        return []
+    return [json.loads(line)["model"] for line in p.read_text().splitlines() if line.strip()]
+
+
+def test_find_prose_drift_meters_doc_extraction_and_judge(fake_anthropic, fake_voyage):
+    """Both the doc-extraction AND the stage-2 judge LLM calls inside
+    find_prose_drift route through metered_create, each emitting a cost record
+    (acceptance A line 1 — the judge + doc halves, which the extraction-only
+    record tests don't cover)."""
+    project = "p_meter_judge"
+    prose_drift.add_fact_with_state_machine(
+        prose_drift.Triple("team", "employs", "sasha"), "s", project,
+    )
+    fake_anthropic["state"]["response_text"] = (
+        '[{"subject":"team","predicate":"mentions","object":"sasha is great"}]'
+    )
+    fake_anthropic["state"]["judge_response"] = (
+        '{"contradicts": false, "confidence": 0.1, "reason": "no"}'
+    )
+    _seed_doc(project, "Sasha is great.", "praise.md")
+
+    report = prose_drift.find_prose_drift(_Proj(project))
+    assert report["stage2_judge_calls"] == 1  # the judge actually fired
+
+    models = _metering_models()
+    assert PROSE_EXTRACTION_MODEL in models  # doc-extraction was metered
+    assert PROSE_JUDGE_MODEL in models  # the judge call was metered
+
+
+def test_find_prose_drift_judge_cap_is_not_swallowed_by_inner_except(
+    fake_anthropic, fake_voyage, monkeypatch
+):
+    """A cap raised on the JUDGE call must propagate past the inner judge except
+    (which catches only parse errors) to the outer cap-stop — NOT be swallowed
+    and miscounted as a judge_error. Pins that MeteringCapExceeded (a
+    RuntimeError) stays outside that narrow except tuple."""
+    project = "p_judge_cap"
+    prose_drift.add_fact_with_state_machine(
+        prose_drift.Triple("team", "employs", "sasha"), "s", project,
+    )
+    fake_anthropic["state"]["response_text"] = (
+        '[{"subject":"team","predicate":"mentions","object":"sasha is great"}]'
+    )
+    _seed_doc(project, "Sasha is great.", "praise.md")
+
+    def _cap(*a, **k):
+        raise metering.MeteringCapExceeded("cap on judge (test)")
+
+    monkeypatch.setattr(prose_drift, "_judge_contradiction_ex", _cap)
+
+    report = prose_drift.find_prose_drift(_Proj(project))
+    assert report["cap_hit"] is True
+    assert report["stage2_judge_errors"] == 0  # not swallowed/miscounted
+
+
+def test_find_prose_drift_real_metered_cap_stops_and_logs(
+    fake_anthropic, fake_voyage, monkeypatch, capsys
+):
+    """End-to-end: the REAL metered_create raises mid-scan once the daily cap is
+    hit (here MAX_CALLS_PER_DAY=0 -> the first metered call trips it), so
+    find_prose_drift stops with cap_hit=True AND logs that it stopped to stderr
+    (acceptance A line 2 — both 'stops' and 'logs that it stopped')."""
+    project = "p_real_cap"
+    monkeypatch.setattr(metering, "MAX_CALLS_PER_DAY", 0)  # cap already reached
+    _seed_doc(project, "Our team has no backend developer.", "team.md")
+
+    report = prose_drift.find_prose_drift(_Proj(project))
+    assert report["cap_hit"] is True
+    assert "stopping extraction at the daily cap" in capsys.readouterr().err
 
 
 # ----- stage-2 review-driven hardening -----------------------------------
