@@ -10,6 +10,25 @@ from vecs.utils import slugify
 mcp = FastMCP("vecs")
 
 
+def _freshness_tag(meta: dict) -> str:
+    """Per-hit freshness/trust signal from chunk metadata (Inc 1.5c).
+
+    The chunk's ``version_id`` (git HEAD sha for code, file mtime for docs;
+    stamped by the indexer, C) is the freshness anchor. A 40-hex git sha is
+    shortened to 8 chars for a readable header; an mtime/content-hash proxy is
+    left verbatim (shortening would mangle it). A chunk with no version_id
+    (legacy, pre-C) surfaces an explicit ``unknown`` bucket rather than hiding
+    the absent signal.
+    """
+    v = meta.get("version_id")
+    if not v:
+        return "v:unknown"
+    v = str(v)
+    if len(v) == 40 and all(c in "0123456789abcdef" for c in v.lower()):
+        v = v[:8]
+    return f"v:{v}"
+
+
 @mcp.tool()
 def semantic_search(
     query: str,
@@ -45,7 +64,8 @@ def semantic_search(
         dist = r.get("distance")
         dist_str = f" (distance: {dist:.4f})" if dist is not None else ""
         proj = r.get("project", "?")
-        header = f"--- Result {i} [{proj}:{collection_name}] {source}{dist_str} ---"
+        tag = _freshness_tag(meta)
+        header = f"--- Result {i} [{proj}:{collection_name}] {source}{dist_str} [{tag}] ---"
         text = r["text"]
         if len(text) > 2000:
             text = text[:2000] + "\n... [truncated]"

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 from cachetools import TTLCache
 
 from vecs.bm25_index import get_bm25
@@ -10,6 +12,7 @@ from vecs.config import (
     VECS_DIR,
     load_config,
 )
+from vecs.embed_cache import EmbedCache
 
 # Cache embeddings by (query, model) for 5 minutes
 _embedding_cache: TTLCache = TTLCache(maxsize=256, ttl=300)
@@ -28,6 +31,34 @@ def _cached_embed(vo, query: str, model: str) -> list[float]:
     embedding = vo.embed([query], model=model, input_type="query").embeddings[0]
     _embedding_cache[key] = embedding
     return embedding
+
+
+def _warn(msg: str) -> None:
+    """Emit a non-fatal searcher warning to stderr (mirrors indexer._log)."""
+    print(f"vecs.searcher: {msg}", file=sys.stderr)
+
+
+def _collection_markers(collections: list[str]) -> dict[str, str | None]:
+    """Recorded embed model per collection (None = unknown), read in ONE cache
+    lifetime.
+
+    None means 'no marker' — e.g. code collections (never marked; only the docs
+    re-embed path records one) or a pre-marker store. The model-flip interlock
+    (1.5c) treats None as FAIL-OPEN: it cannot assert a mismatch, so vector
+    scoring proceeds. Any error opening/reading the cache yields None for EVERY
+    collection — a marker-read failure must never silently disable vector search
+    (it would nuke all code retrieval). One EmbedCache open per search, mirroring
+    the indexer's one-cache-per-operation lifecycle rather than reopening it per
+    collection.
+    """
+    try:
+        cache = EmbedCache()
+        try:
+            return {c: cache.get_collection_model(c) for c in collections}
+        finally:
+            cache.close()
+    except Exception:
+        return {c: None for c in collections}
 
 
 def format_results(raw: dict) -> list[dict]:
@@ -150,12 +181,34 @@ def search(
             # collections permanently unsearched.
             targets.append((proj.docs_collection, DOCS_MODEL, proj_name))
 
+    # 1.5c model-flip interlock: drop from the VECTOR path any target whose
+    # recorded embed model differs from the configured model — its stored
+    # vectors live in a different space, so scoring new-model query vectors
+    # against them silently corrupts ranking. The collection still participates
+    # in BM25 below (model-agnostic), the safe fallback until a reindex
+    # re-embeds it. A None marker (unknown) is fail-open: the vector path keeps
+    # it. Markers read ONCE here (one cache open), not per fetch-multiplier retry
+    # and not per target.
+    vector_targets = []
+    markers = _collection_markers([t[0] for t in targets])
+    for tgt in targets:
+        col_name, model, _ = tgt
+        marker = markers.get(col_name)
+        if marker is not None and marker != model:
+            _warn(
+                f"model-flip interlock: '{col_name}' embedded under {marker!r} "
+                f"but configured model is {model!r}; skipping vector scoring, "
+                f"BM25-only for this collection until reindex"
+            )
+            continue
+        vector_targets.append(tgt)
+
     # Fetch with escalating multiplier: try 2x first, then 3x if dedup eats too many
     for fetch_multiplier in (2, 3):
         fetch_n = n_results * fetch_multiplier
 
         all_results = []
-        for col_name, model, proj_name in targets:
+        for col_name, model, proj_name in vector_targets:
             try:
                 collection = db.get_collection(col_name)
             except Exception:

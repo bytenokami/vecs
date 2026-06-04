@@ -24,12 +24,12 @@ Ships before Inc 2. Three independent fixes; all reuse already-shipped deletion/
 
 ## 1.5c — freshness / trust signal
 
-- [ ] Search results surface a freshness/trust signal per hit (the chunk `version_id` and/or a freshness bucket) through the MCP `semantic_search` result shape.
-- [ ] Query-time model-flip interlock: when a collection's recorded model marker (`EmbedCache.get_collection_model`) differs from the configured embedding model, the searcher warns and/or falls back to BM25 for that collection instead of silently scoring new-model query vectors against old-model stored vectors.
-- [ ] Test: marker ≠ configured model triggers the interlock (warn/fallback) for that collection; marker == configured model does not.
+- [x] Search results surface a freshness/trust signal per hit (the chunk `version_id` and/or a freshness bucket) through the MCP `semantic_search` result shape. — `mcp_server._freshness_tag`; header `[v:<version_id>]` (40-hex sha → 8 chars, mtime verbatim, absent → `v:unknown`). Tests: `test_mcp_server.py`.
+- [x] Query-time model-flip interlock: when a collection's recorded model marker (`EmbedCache.get_collection_model`) differs from the configured embedding model, the searcher warns and/or falls back to BM25 for that collection instead of silently scoring new-model query vectors against old-model stored vectors. — `searcher._collection_markers` (one cache open/search) + the `vector_targets` partition; mismatched collection dropped from the vector path, BM25 still runs, stderr warning. `None` marker / cache-read error is fail-open.
+- [x] Test: marker ≠ configured model triggers the interlock (warn/fallback) for that collection; marker == configured model does not. — `test_searcher.py`: skips-vector / inactive-when-matches / none-fails-open / per-collection-not-all-or-nothing + real-function `_collection_markers` fail-open-on-error coverage.
 
 ## Global (this feature)
 
-- [ ] `uv run pytest -q` green; new/updated tests in `test_indexer.py` (1.5a), `test_searcher.py` (1.5b/1.5c), `test_mcp_server.py` (1.5c surface) as touched.
-- [ ] `src/vecs/CLAUDE.md` updated for touched modules (prune contract, orphan sweep, `-docs` search, freshness signal).
-- [ ] Phase 4 multi-agent adversarial review verdict = approve; every finding triaged against the code.
+- [x] `uv run pytest -q` green; new/updated tests in `test_indexer.py` (1.5a; now split into `test_indexer_{manifest,embed,code,docs,run}.py`), `test_searcher.py` (1.5b/1.5c), `test_mcp_server.py` (1.5c surface) as touched. — 345 passed / 2 skipped.
+- [x] `src/vecs/CLAUDE.md` updated for touched modules (prune contract, orphan sweep, `-docs` search, freshness signal + model-flip interlock).
+- [x] Phase 4 multi-agent adversarial review verdict = approve; every finding triaged against the code. — 1.5c review (4 dimensions + adversarial verify): 3 findings, all triaged in-thread and addressed (interlock cache opened once/search; fail-open-on-error + per-collection regression tests added). No critical/high.

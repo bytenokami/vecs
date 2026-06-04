@@ -182,6 +182,11 @@ def test_search_queries_docs_collection_without_docs_dir(monkeypatch):
     monkeypatch.setattr(searcher, "get_voyage_client", lambda: MagicMock())
     monkeypatch.setattr(searcher, "_cached_embed", lambda vo, q, m: [0.1, 0.2, 0.3, 0.4])
     monkeypatch.setattr(searcher, "get_bm25", lambda path: None)  # skip BM25
+    # 1.5c interlock now consults the embed-cache markers; stub them to "no
+    # marker" (fail-open) so this 1.5b test still exercises the vector path.
+    monkeypatch.setattr(
+        searcher, "_collection_markers", lambda cols: {c: None for c in cols}
+    )
 
     queried: list[str] = []
 
@@ -256,3 +261,185 @@ def test_reembed_quality_expected_sources_returned():
         checked += 1
     if checked == 0:
         pytest.skip("No eval pairs matched a configured project/collection; adjust REEMBED_EVAL_SET.")
+
+
+# --- Inc 1.5c: query-time model-flip interlock -------------------------------
+# When a collection's recorded embed-model marker differs from the configured
+# model, scoring new-model query vectors against old-model stored vectors
+# silently degrades ranking. The searcher must skip vector scoring for that
+# collection and fall back to BM25 (model-agnostic) until a reindex re-embeds it.
+
+
+def _single_project(searcher, monkeypatch):
+    """One project (bloomly), with voyage/embed stubbed. Returns the config."""
+    from vecs.config import VecsConfig, ProjectConfig
+
+    cfg = VecsConfig(path="/tmp/x.yaml")
+    cfg.projects["bloomly"] = ProjectConfig(name="bloomly")
+    monkeypatch.setattr(searcher, "load_config", lambda: cfg)
+    monkeypatch.setattr(searcher, "get_voyage_client", lambda: MagicMock())
+    monkeypatch.setattr(searcher, "_cached_embed", lambda vo, q, m: [0.1, 0.2, 0.3, 0.4])
+    return cfg
+
+
+def _vector_query_recorder(monkeypatch, searcher):
+    """Wire a chroma stub whose .query appends the collection name to a list."""
+    queried: list[str] = []
+
+    def fake_get_collection(name):
+        col = MagicMock()
+
+        def _query(*a, **k):
+            queried.append(name)
+            return {
+                "ids": [[f"{name}:0"]],
+                "documents": [["vector hit"]],
+                "metadatas": [[{"file_path": "bloomly/x"}]],
+                "distances": [[0.1]],
+            }
+
+        col.query.side_effect = _query
+        return col
+
+    db = MagicMock()
+    db.get_collection.side_effect = fake_get_collection
+    monkeypatch.setattr(searcher, "get_chromadb_client", lambda: db)
+    return queried
+
+
+def test_model_flip_interlock_skips_vector_falls_back_to_bm25(monkeypatch):
+    """Marker != configured model -> the collection's vectors are NOT queried,
+    and BM25 supplies the fallback hit for it."""
+    from vecs import searcher
+
+    _single_project(searcher, monkeypatch)
+    monkeypatch.setattr(
+        searcher,
+        "_collection_markers",
+        lambda cols: {c: ("voyage-3-OLD" if c.endswith("-docs") else None) for c in cols},
+    )
+    vector_queried = _vector_query_recorder(monkeypatch, searcher)
+
+    def fake_get_bm25(path):
+        if path.name.endswith("_docs.db"):
+            bm = MagicMock()
+            bm.search.return_value = [
+                {
+                    "id": "bloomly-docs:bloomly/README.md:0",
+                    "text": "bm25 docs hit",
+                    "metadata": {"file_path": "bloomly/README.md"},
+                    "score": 5.0,
+                }
+            ]
+            return bm
+        return None
+
+    monkeypatch.setattr(searcher, "get_bm25", fake_get_bm25)
+
+    results = searcher.search("anything", collection_name="docs", project="bloomly")
+
+    assert "bloomly-docs" not in vector_queried  # vectors skipped (interlock)
+    assert any(
+        (r.get("metadata") or {}).get("file_path") == "bloomly/README.md"
+        for r in results
+    )  # BM25 fallback surfaced its content
+
+
+def test_model_flip_interlock_inactive_when_marker_matches(monkeypatch):
+    """Marker == configured model -> vectors ARE queried (no interlock)."""
+    from vecs import searcher
+    from vecs.config import DOCS_MODEL
+
+    _single_project(searcher, monkeypatch)
+    monkeypatch.setattr(
+        searcher,
+        "_collection_markers",
+        lambda cols: {c: (DOCS_MODEL if c.endswith("-docs") else None) for c in cols},
+    )
+    vector_queried = _vector_query_recorder(monkeypatch, searcher)
+    monkeypatch.setattr(searcher, "get_bm25", lambda path: None)
+
+    searcher.search("anything", collection_name="docs", project="bloomly")
+
+    assert "bloomly-docs" in vector_queried
+
+
+def test_model_marker_none_fails_open_vectors_queried(monkeypatch):
+    """No recorded marker (e.g. code collections, never marked) must NOT disable
+    vector search -- we cannot assert a mismatch, so fail open."""
+    from vecs import searcher
+
+    _single_project(searcher, monkeypatch)
+    monkeypatch.setattr(
+        searcher, "_collection_markers", lambda cols: {c: None for c in cols}
+    )
+    vector_queried = _vector_query_recorder(monkeypatch, searcher)
+    monkeypatch.setattr(searcher, "get_bm25", lambda path: None)
+
+    searcher.search("anything", collection_name="code", project="bloomly")
+
+    assert "bloomly-code" in vector_queried
+
+
+def test_model_flip_interlock_is_per_collection_not_all_or_nothing(monkeypatch):
+    """collection=None over one project: the -docs marker is OLD (mismatch) and
+    the -code marker is None (fail-open). The interlock must drop ONLY -docs
+    from the vector path while -code is still vector-queried -- per-collection,
+    NOT all-or-nothing (an all-or-nothing collapse would nuke code retrieval,
+    the exact catastrophe the fail-open design pin guards against)."""
+    from vecs import searcher
+
+    _single_project(searcher, monkeypatch)
+    monkeypatch.setattr(
+        searcher,
+        "_collection_markers",
+        lambda cols: {c: ("voyage-3-OLD" if c.endswith("-docs") else None) for c in cols},
+    )
+    vector_queried = _vector_query_recorder(monkeypatch, searcher)
+    monkeypatch.setattr(searcher, "get_bm25", lambda path: None)
+
+    searcher.search("anything", project="bloomly")  # collection_name=None -> both
+
+    assert "bloomly-code" in vector_queried  # None marker -> fail-open, kept
+    assert "bloomly-docs" not in vector_queried  # OLD marker -> dropped
+
+
+# --- Inc 1.5c: the real _collection_markers (fail-open contract) -------------
+# The interlock tests above stub _collection_markers; these exercise the REAL
+# function, pinning the load-bearing fail-open-on-error branch that guarantees a
+# marker-read failure can never disable vector search (else it nukes all code
+# retrieval). Without these, a refactor narrowing the try/except would leave the
+# stubbed interlock tests green while production search crashes query-wide.
+
+
+def test_collection_markers_reads_real_cache(tmp_path, monkeypatch):
+    """Reads recorded markers from a live EmbedCache; an unmarked collection
+    returns None."""
+    from vecs import searcher
+    from vecs.embed_cache import EmbedCache as RealCache
+
+    db = tmp_path / "cache.db"
+    seed = RealCache(db_path=db)
+    seed.set_collection_model("vecs-docs", "voyage-4")
+    seed.close()
+
+    monkeypatch.setattr(searcher, "EmbedCache", lambda: RealCache(db_path=db))
+    markers = searcher._collection_markers(["vecs-docs", "vecs-code"])
+
+    assert markers["vecs-docs"] == "voyage-4"
+    assert markers["vecs-code"] is None  # never marked -> None (fail-open)
+
+
+def test_collection_markers_fail_open_on_cache_error(monkeypatch):
+    """A cache-open/read error yields None for EVERY collection and never
+    raises -- the load-bearing safety branch behind the interlock."""
+    from vecs import searcher
+
+    class _Boom:
+        def __init__(self, *a, **k):
+            raise OSError("cache unavailable")
+
+    monkeypatch.setattr(searcher, "EmbedCache", _Boom)
+    markers = searcher._collection_markers(["x-code", "x-docs"])
+
+    assert markers == {"x-code": None, "x-docs": None}
