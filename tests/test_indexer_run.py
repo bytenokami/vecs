@@ -11,7 +11,6 @@ from vecs.indexer import (
     Manifest,
     _embed_and_store,
     _delete_stale_chunks_after_embed,
-    _get_session_new_content,
     _index_collection,
     _make_batches,
     _paginated_get,
@@ -25,7 +24,7 @@ from vecs.config import VecsConfig, ProjectConfig, CodeDir
 from indexer_helpers import (  # noqa: F401
     FakeEmbedResult, _embedded_texts, _make_index_db, _capture_files,
     _git_init_commit, _capture_chunks_via_index_collection, _StatefulDocsChroma,
-    _capture_embed_ids, _seed_manifest_with_doc_code_session, _remodel_fixture,
+    _capture_embed_ids, _seed_manifest_with_doc_code, _remodel_fixture,
     _FakeChromaCollection, _FakeDB,
 )
 
@@ -61,7 +60,6 @@ def test_run_index_threads_one_cache_to_all_indexers(tmp_path, monkeypatch):
     config_file = tmp_path / "config.yaml"
     config_file.write_text(yaml.dump({
         "projects": {"p": {"code_dirs": [{"path": str(tmp_path / "code"), "extensions": [".cs"]}]}},
-        "codex_disabled": True,
     }))
     (tmp_path / "code").mkdir()
     _clear_config_cache()
@@ -90,35 +88,77 @@ def test_run_index_threads_one_cache_to_all_indexers(tmp_path, monkeypatch):
         return f
 
     monkeypatch.setattr("vecs.indexer.index_code", cap("code"))
-    monkeypatch.setattr("vecs.indexer.index_sessions", cap("sessions"))
     monkeypatch.setattr("vecs.indexer.index_docs", cap("docs"))
 
     from vecs.indexer import run_index
     run_index()
 
     assert seen["code"] is not None
-    assert seen["code"] is seen["sessions"]
     assert seen["code"] is seen["docs"]
+
+def test_run_index_prune_isolation_one_project_failure_does_not_skip_others(tmp_path, monkeypatch):
+    """run_index wraps the per-project prune+sweep in try/except so one project's
+    prune/save I/O error can't skip the sweep for the rest of the run."""
+    from vecs.config import _clear_config_cache
+
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump({
+        "projects": {
+            "p1": {"code_dirs": [{"path": str(tmp_path / "c1"), "extensions": [".cs"]}]},
+            "p2": {"code_dirs": [{"path": str(tmp_path / "c2"), "extensions": [".cs"]}]},
+        },
+    }))
+    (tmp_path / "c1").mkdir()
+    (tmp_path / "c2").mkdir()
+    _clear_config_cache()
+
+    monkeypatch.setattr(
+        "vecs.indexer.load_config",
+        lambda: __import__("vecs.config", fromlist=["load_config"]).load_config(config_file),
+    )
+    monkeypatch.setattr("vecs.indexer.migrate_global_manifest", lambda *a, **kw: None)
+    monkeypatch.setattr("vecs.indexer.get_voyage_client", lambda: MagicMock())
+    db = MagicMock()
+    db.get_collection.return_value.count.return_value = 0
+    monkeypatch.setattr("vecs.indexer.get_chromadb_client", lambda: db)
+    monkeypatch.setattr("vecs.indexer.VECS_DIR", tmp_path)
+    monkeypatch.setattr("vecs.indexer.CHROMADB_DIR", tmp_path / "chromadb")
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+    for fn in ("index_code", "index_docs"):
+        monkeypatch.setattr(f"vecs.indexer.{fn}", lambda *a, **kw: 0)
+
+    swept: list[str] = []
+
+    def fake_prune(project, db):
+        swept.append(project.name)
+        if project.name == "p1":
+            raise OSError("manifest write failed")
+        return {"pruned_keys": 0, "code_orphans": 0, "docs_orphans": 0}
+
+    monkeypatch.setattr("vecs.indexer._prune_and_sweep_orphans", fake_prune)
+
+    from vecs.indexer import run_index
+    run_index()  # must NOT raise despite p1's prune failure
+
+    assert swept == ["p1", "p2"]  # p2 still swept after p1 raised
 
 # --- B2: model-change re-embed trigger (run_index pre/post pass) -----------
 
-def test_remodel_clears_docs_and_session_keys_leaves_code_on_model_change(tmp_path, monkeypatch):
+def test_remodel_clears_docs_leaves_code_on_model_change(tmp_path, monkeypatch):
     """Model change (recorded != configured) + non-empty collection: the pre-pass
-    drops docs file-keys and session: keys so the next pass re-embeds them, but
-    leaves code file-keys (code has no re-embed trigger)."""
+    drops docs file-keys so the next pass re-embeds them, but leaves code
+    file-keys (code has no re-embed trigger)."""
     from vecs.embed_cache import EmbedCache
     from vecs.indexer import _remodel_clear
 
     monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
     monkeypatch.setattr("vecs.indexer.DOCS_MODEL", "voyage-4")
-    monkeypatch.setattr("vecs.indexer.SESSIONS_MODEL", "voyage-4")
 
-    project, doc_f, code_f, sess_f = _remodel_fixture(tmp_path)
-    _seed_manifest_with_doc_code_session(tmp_path, doc_f, code_f, sess_f)
+    project, doc_f, code_f = _remodel_fixture(tmp_path)
+    _seed_manifest_with_doc_code(tmp_path, doc_f, code_f)
 
     cache = EmbedCache(tmp_path / "embed_cache.db")
     cache.set_collection_model("p-docs", "voyage-3")      # stale
-    cache.set_collection_model("p-sessions", "voyage-3")  # stale
 
     db = MagicMock()
     db.get_collection.return_value.count.return_value = 5  # non-empty
@@ -126,9 +166,8 @@ def test_remodel_clears_docs_and_session_keys_leaves_code_on_model_change(tmp_pa
     _remodel_clear(project, db, cache)
 
     reloaded = Manifest("p", manifests_dir=tmp_path / "manifests")
-    assert str(doc_f) not in reloaded.data          # docs cleared -> re-embed
-    assert f"session:{sess_f}" not in reloaded.data  # sessions cleared
-    assert str(code_f) in reloaded.data              # code untouched
+    assert str(doc_f) not in reloaded.data  # docs cleared -> re-embed
+    assert str(code_f) in reloaded.data      # code untouched
     cache.close()
 
 def test_remodel_clear_scope_matches_index_docs_scan_all_docs_dirs(tmp_path, monkeypatch):
@@ -140,7 +179,6 @@ def test_remodel_clear_scope_matches_index_docs_scan_all_docs_dirs(tmp_path, mon
 
     monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
     monkeypatch.setattr("vecs.indexer.DOCS_MODEL", "voyage-4")
-    monkeypatch.setattr("vecs.indexer.SESSIONS_MODEL", "voyage-4")
 
     docs0 = tmp_path / "docs0"
     docs0.mkdir()
@@ -180,7 +218,6 @@ def test_remodel_clear_clears_inrepo_md_but_not_code_keys(tmp_path, monkeypatch)
 
     monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
     monkeypatch.setattr("vecs.indexer.DOCS_MODEL", "voyage-4")
-    monkeypatch.setattr("vecs.indexer.SESSIONS_MODEL", "voyage-4")
 
     code = tmp_path / "client-uk"
     (code / "Assets").mkdir(parents=True)
@@ -216,14 +253,12 @@ def test_remodel_noop_when_model_unchanged(tmp_path, monkeypatch):
 
     monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
     monkeypatch.setattr("vecs.indexer.DOCS_MODEL", "voyage-4")
-    monkeypatch.setattr("vecs.indexer.SESSIONS_MODEL", "voyage-4")
 
-    project, doc_f, code_f, sess_f = _remodel_fixture(tmp_path)
-    _seed_manifest_with_doc_code_session(tmp_path, doc_f, code_f, sess_f)
+    project, doc_f, code_f = _remodel_fixture(tmp_path)
+    _seed_manifest_with_doc_code(tmp_path, doc_f, code_f)
 
     cache = EmbedCache(tmp_path / "embed_cache.db")
     cache.set_collection_model("p-docs", "voyage-4")      # matches
-    cache.set_collection_model("p-sessions", "voyage-4")  # matches
     cache.close()
     cache = EmbedCache(tmp_path / "embed_cache.db")
 
@@ -234,7 +269,6 @@ def test_remodel_noop_when_model_unchanged(tmp_path, monkeypatch):
 
     reloaded = Manifest("p", manifests_dir=tmp_path / "manifests")
     assert str(doc_f) in reloaded.data
-    assert f"session:{sess_f}" in reloaded.data
     assert str(code_f) in reloaded.data
     cache.close()
 
@@ -245,14 +279,12 @@ def test_remodel_noop_when_collection_empty(tmp_path, monkeypatch):
 
     monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
     monkeypatch.setattr("vecs.indexer.DOCS_MODEL", "voyage-4")
-    monkeypatch.setattr("vecs.indexer.SESSIONS_MODEL", "voyage-4")
 
-    project, doc_f, code_f, sess_f = _remodel_fixture(tmp_path)
-    _seed_manifest_with_doc_code_session(tmp_path, doc_f, code_f, sess_f)
+    project, doc_f, code_f = _remodel_fixture(tmp_path)
+    _seed_manifest_with_doc_code(tmp_path, doc_f, code_f)
 
     cache = EmbedCache(tmp_path / "embed_cache.db")
     cache.set_collection_model("p-docs", "voyage-3")      # stale...
-    cache.set_collection_model("p-sessions", "voyage-3")
 
     db = MagicMock()
     db.get_collection.return_value.count.return_value = 0  # ...but empty
@@ -261,7 +293,6 @@ def test_remodel_noop_when_collection_empty(tmp_path, monkeypatch):
 
     reloaded = Manifest("p", manifests_dir=tmp_path / "manifests")
     assert str(doc_f) in reloaded.data
-    assert f"session:{sess_f}" in reloaded.data
     cache.close()
 
 def test_remodel_treats_missing_collection_as_empty(tmp_path, monkeypatch):
@@ -271,14 +302,12 @@ def test_remodel_treats_missing_collection_as_empty(tmp_path, monkeypatch):
 
     monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
     monkeypatch.setattr("vecs.indexer.DOCS_MODEL", "voyage-4")
-    monkeypatch.setattr("vecs.indexer.SESSIONS_MODEL", "voyage-4")
 
-    project, doc_f, code_f, sess_f = _remodel_fixture(tmp_path)
-    _seed_manifest_with_doc_code_session(tmp_path, doc_f, code_f, sess_f)
+    project, doc_f, code_f = _remodel_fixture(tmp_path)
+    _seed_manifest_with_doc_code(tmp_path, doc_f, code_f)
 
     cache = EmbedCache(tmp_path / "embed_cache.db")
     cache.set_collection_model("p-docs", "voyage-3")
-    cache.set_collection_model("p-sessions", "voyage-3")
 
     db = MagicMock()
     db.get_collection.side_effect = Exception("collection not found")
@@ -287,7 +316,6 @@ def test_remodel_treats_missing_collection_as_empty(tmp_path, monkeypatch):
 
     reloaded = Manifest("p", manifests_dir=tmp_path / "manifests")
     assert str(doc_f) in reloaded.data
-    assert f"session:{sess_f}" in reloaded.data
     cache.close()
 
 def test_run_index_remodel_migrates_docs_manifest_and_records_marker(tmp_path, monkeypatch):
@@ -309,7 +337,6 @@ def test_run_index_remodel_migrates_docs_manifest_and_records_marker(tmp_path, m
             "code_dirs": [{"path": str(tmp_path / "code"), "extensions": [".py"]}],
             "docs_dirs": [str(docs_dir)],
         }},
-        "codex_disabled": True,
     }))
     (tmp_path / "code").mkdir()
     _clear_config_cache()
@@ -340,9 +367,7 @@ def test_run_index_remodel_migrates_docs_manifest_and_records_marker(tmp_path, m
 
     # Indexers are no-ops: we are testing the orchestration pre/post pass only.
     monkeypatch.setattr("vecs.indexer.index_code", lambda *a, **kw: 0)
-    monkeypatch.setattr("vecs.indexer.index_sessions", lambda *a, **kw: 0)
     monkeypatch.setattr("vecs.indexer.index_docs", lambda *a, **kw: 0)
-    monkeypatch.setattr("vecs.indexer.index_codex_sessions", lambda *a, **kw: 0)
 
     from vecs.indexer import run_index
     run_index()
@@ -352,9 +377,6 @@ def test_run_index_remodel_migrates_docs_manifest_and_records_marker(tmp_path, m
 
     chk = EmbedCache(tmp_path / "embed_cache.db")
     assert chk.get_collection_model("p-docs") == "voyage-4", "post-pass should record new marker"
-    # _remodel_record stamps BOTH docs and sessions; assert sessions too so a
-    # dropped session set_collection_model line cannot pass unnoticed.
-    assert chk.get_collection_model("p-sessions") == "voyage-4", "post-pass should record sessions marker"
     chk.close()
 
 # --- Inc 1.5a: prune-orphan fix (delete chunks for deleted sources) ---------
@@ -410,21 +432,6 @@ def test_sweep_deleted_source_chunks_empty_root_map_is_noop():
 
     assert deleted == []
     assert "code:repo/a.cs:0" in col._rows
-
-def test_sweep_deleted_session_chunks_deletes_by_session_id():
-    """Session chunks (no file_path) are swept by session_id metadata."""
-    from vecs.indexer import _sweep_deleted_session_chunks
-
-    col = _FakeChromaCollection([
-        ("session:gone-sid:0", {"session_id": "gone-sid"}),
-        ("session:gone-sid:1", {"session_id": "gone-sid"}),
-        ("session:keep-sid:0", {"session_id": "keep-sid"}),
-    ])
-
-    deleted = _sweep_deleted_session_chunks(col, ["gone-sid"])
-
-    assert set(deleted) == {"session:gone-sid:0", "session:gone-sid:1"}
-    assert "session:keep-sid:0" in col._rows
 
 def test_prune_and_sweep_orphans_deletes_code_docs_and_bm25(tmp_path, monkeypatch):
     """End-to-end: deleting a code file and a docs file makes a reindex's
@@ -506,48 +513,6 @@ def test_prune_and_sweep_orphans_clears_backlog_orphan(tmp_path, monkeypatch):
     assert stats["pruned_keys"] == 0  # manifest empty -> nothing pruned
     assert stats["code_orphans"] == 1  # ...but the orphan chunk is still swept
     assert "code:repo/ghost.cs:0" not in code_col._rows
-
-def test_prune_and_sweep_orphans_deletes_chunks_for_deleted_session_file(tmp_path, monkeypatch):
-    """A deleted session file is pruned from the manifest AND its session_id
-    chunks are deleted from chroma + BM25; a surviving session is untouched."""
-    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
-    from vecs.indexer import _prune_and_sweep_orphans
-
-    sess_dir = tmp_path / "sess"
-    sess_dir.mkdir()
-    keep = sess_dir / "keep-sid.jsonl"
-    gone = sess_dir / "gone-sid.jsonl"
-    keep.write_text("{}")
-    gone.write_text("{}")
-
-    project = ProjectConfig(name="p")
-    m = Manifest("p")
-    m.mark_session_indexed(keep, byte_offset=2, chunk_count=1)
-    m.mark_session_indexed(gone, byte_offset=2, chunk_count=1)
-    m.save()
-    gone.unlink()
-
-    sess_col = _FakeChromaCollection([
-        ("session:gone-sid:0", {"session_id": "gone-sid"}),
-        ("session:keep-sid:0", {"session_id": "keep-sid"}),
-    ])
-    db = _FakeDB({
-        "p-sessions": sess_col,
-        "p-code": _FakeChromaCollection([]),
-        "p-docs": _FakeChromaCollection([]),
-    })
-    bm25: list[tuple[str, list[str]]] = []
-    monkeypatch.setattr(
-        "vecs.indexer._delete_ids_from_bm25",
-        lambda proj, suffix, ids: bm25.append((suffix, sorted(ids))),
-    )
-
-    stats = _prune_and_sweep_orphans(project, db)
-
-    assert stats["session_orphans"] == 1
-    assert "session:gone-sid:0" not in sess_col._rows
-    assert "session:keep-sid:0" in sess_col._rows
-    assert ("sessions", ["session:gone-sid:0"]) in bm25
 
 # --- Inc 1.5a: Phase-4 review hardening (data-loss guards) -------------------
 
@@ -631,79 +596,6 @@ def test_prune_and_sweep_orphans_skips_colliding_basename_roots(tmp_path, monkey
     assert stats["code_orphans"] == 0
     assert "code:shared/keep.cs:0" in code_col._rows  # live chunk preserved
 
-def test_prune_and_sweep_orphans_saves_manifest_after_session_sweep(tmp_path, monkeypatch):
-    """Crash-safety: the manifest must be persisted only AFTER session chunks are
-    deleted, so an interruption leaves the session: key for next run to retry
-    (session chunks carry no file_path and cannot self-heal via the disk scan)."""
-    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
-    from vecs.indexer import _prune_and_sweep_orphans
-
-    sess_dir = tmp_path / "sess"
-    sess_dir.mkdir()
-    gone = sess_dir / "gone-sid.jsonl"
-    gone.write_text("{}")
-
-    project = ProjectConfig(name="p")
-    m = Manifest("p")
-    m.mark_session_indexed(gone, byte_offset=2, chunk_count=1)
-    m.save()
-    gone.unlink()
-
-    db = _FakeDB({
-        "p-sessions": _FakeChromaCollection([("session:gone-sid:0", {"session_id": "gone-sid"})]),
-        "p-code": _FakeChromaCollection([]),
-        "p-docs": _FakeChromaCollection([]),
-    })
-
-    # The session chunk delete fails partway -> the function must NOT have already
-    # persisted the pruned manifest.
-    def boom(*a, **kw):
-        raise RuntimeError("interrupted mid-sweep")
-
-    monkeypatch.setattr("vecs.indexer._sweep_deleted_session_chunks", boom)
-    monkeypatch.setattr("vecs.indexer._delete_ids_from_bm25", lambda *a: None)
-
-    with pytest.raises(RuntimeError):
-        _prune_and_sweep_orphans(project, db)
-
-    reloaded = Manifest("p")
-    assert f"session:{gone}" in reloaded.data  # key intact on disk -> next run retries
-
-def test_prune_and_sweep_orphans_session_stem_collision_keeps_survivor(tmp_path, monkeypatch):
-    """Two session files sharing a stem: deleting one must NOT sweep the
-    survivor's chunks (session_id is the bare stem, shared in the collection)."""
-    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
-    from vecs.indexer import _prune_and_sweep_orphans
-
-    d1 = tmp_path / "a"
-    d2 = tmp_path / "b"
-    d1.mkdir()
-    d2.mkdir()
-    gone = d1 / "run.jsonl"
-    keep = d2 / "run.jsonl"  # SAME stem "run"
-    gone.write_text("{}")
-    keep.write_text("{}")
-
-    project = ProjectConfig(name="p")
-    m = Manifest("p")
-    m.mark_session_indexed(gone, byte_offset=2, chunk_count=1)
-    m.mark_session_indexed(keep, byte_offset=2, chunk_count=1)
-    m.save()
-    gone.unlink()
-
-    sess_col = _FakeChromaCollection([("session:run:0", {"session_id": "run"})])
-    db = _FakeDB({
-        "p-sessions": sess_col,
-        "p-code": _FakeChromaCollection([]),
-        "p-docs": _FakeChromaCollection([]),
-    })
-    monkeypatch.setattr("vecs.indexer._delete_ids_from_bm25", lambda *a: None)
-
-    stats = _prune_and_sweep_orphans(project, db)
-
-    assert stats["session_orphans"] == 0  # stem "run" still has a surviving key
-    assert "session:run:0" in sess_col._rows
-
 def test_prune_and_sweep_orphans_no_bm25_when_clean(tmp_path, monkeypatch):
     """A reindex where every source still exists deletes nothing and never opens
     the BM25 sidecar (the prune path must not call _delete_ids_from_bm25 with [])."""
@@ -731,7 +623,7 @@ def test_prune_and_sweep_orphans_no_bm25_when_clean(tmp_path, monkeypatch):
 
     stats = _prune_and_sweep_orphans(project, db)
 
-    assert stats == {"pruned_keys": 0, "code_orphans": 0, "docs_orphans": 0, "session_orphans": 0}
+    assert stats == {"pruned_keys": 0, "code_orphans": 0, "docs_orphans": 0}
     assert bm25_calls == []
     assert "code:repo/a.cs:0" in code_col._rows
 

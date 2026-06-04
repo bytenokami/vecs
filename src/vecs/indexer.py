@@ -15,10 +15,7 @@ import voyageai.error
 
 from vecs.ast_chunker import chunk_code_file_ast
 from vecs.bm25_index import BM25Index
-from vecs.chunkers import preprocess_session, chunk_session
 from vecs.clients import get_voyage_client, get_chromadb_client
-from vecs.codex_chunker import preprocess_codex_session
-from vecs.codex_routing import CodexRoutingState, discover_codex_sessions
 from vecs.config import (
     CHROMADB_DIR,
     CODE_CHUNK_LINES,
@@ -28,9 +25,6 @@ from vecs.config import (
     DOCS_MODEL,
     MANIFESTS_DIR,
     MANIFEST_PATH,
-    SESSION_CHUNK_MESSAGES,
-    SESSION_CHUNK_OVERLAP,
-    SESSIONS_MODEL,
     VECS_DIR,
     ProjectConfig,
     VecsConfig,
@@ -38,11 +32,6 @@ from vecs.config import (
 )
 from vecs.doc_chunker import chunk_doc, extract_pdf_text
 from vecs.embed_cache import EmbedCache
-
-
-# Module-level set: payload types we logged-once-per-run as unrecognized.
-# Reset at the top of run_index so each indexer invocation gets fresh telemetry.
-_codex_unknown_payload_seen: set[str] = set()
 
 
 MAX_BATCH_TOKENS = 80_000  # Voyage limit is 120K; char-based estimation is unreliable, so leave wide margin
@@ -150,53 +139,17 @@ class Manifest:
         """
         self.data[str(file_path)] = file_hash
 
-    def _session_identity_hash(self, file_path: Path, num_bytes: int = 1024) -> str:
-        """Hash of first num_bytes of a file -- used as identity check.
-
-        Uses a fixed number of bytes so appending to the file does not
-        change the hash as long as the beginning is unchanged.
-        """
-        with open(file_path, "rb") as fh:
-            head = fh.read(num_bytes)
-        return hashlib.sha256(head).hexdigest()
-
-    def get_session_info(self, file_path: Path) -> dict | None:
-        """Get stored session tracking info, or None if not tracked."""
-        key = f"session:{file_path}"
-        entry = self.data.get(key)
-        if not isinstance(entry, dict):
-            return None
-        return entry
-
-    def mark_session_indexed(self, file_path: Path, byte_offset: int, chunk_count: int = 0) -> None:
-        """Record session file identity, indexed byte offset, and chunk count.
-
-        Stores the identity hash over min(1024, byte_offset) bytes so that
-        appending to the file does not change the identity hash.
-        """
-        identity_bytes = min(1024, byte_offset)
-        self.data[f"session:{file_path}"] = {
-            "byte_offset": byte_offset,
-            "identity_hash": self._session_identity_hash(file_path, num_bytes=identity_bytes),
-            "identity_bytes": identity_bytes,
-            "chunk_count": chunk_count,
-        }
-
     def prune(self) -> list[str]:
         """Remove entries whose source file no longer exists on disk.
 
         Returns the REMOVED KEYS (was a bare count) so the caller can delete the
         corresponding chunks from chroma + BM25 -- without that, a deleted file's
         vectors live forever and keep ranking against current content (the
-        prune-orphan bug, Inc 1.5a). Handles both bare-path code/docs keys and
-        `session:{path}` keys (the latter were previously skipped, so deleted
-        sessions leaked their manifest entry + chunks indefinitely).
+        prune-orphan fix, Inc 1.5a). A legacy `session:{path}` key (sessions are
+        no longer indexed) reads as a non-existent literal path and is pruned as
+        stale junk -- harmless cleanup of old manifests.
         """
-        stale: list[str] = []
-        for key in self.data:
-            path_str = key[len("session:"):] if key.startswith("session:") else key
-            if not Path(path_str).exists():
-                stale.append(key)
+        stale = [key for key in self.data if not Path(key).exists()]
         for key in stale:
             del self.data[key]
         return stale
@@ -311,7 +264,7 @@ def migrate_global_manifest(
     Algorithm:
     1. Load global manifest
     2. For each entry, check if file_path starts with any project's
-       code_dirs[].path, sessions_dir, or docs_dir
+       code_dirs[].path or docs_dir
     3. Write matched entries to per-project manifest files
     4. Write unmatched entries to _orphaned.json
     5. Rename old manifest to manifest.json.bak
@@ -337,13 +290,6 @@ def migrate_global_manifest(
             # Check code_dirs
             for cd in proj.code_dirs:
                 if file_path_str.startswith(str(cd.path)):
-                    matched_project = proj_name
-                    break
-            if matched_project:
-                break
-            # Check sessions_dirs
-            for sd in proj.sessions_dirs:
-                if file_path_str.startswith(str(sd)):
                     matched_project = proj_name
                     break
             if matched_project:
@@ -857,30 +803,6 @@ def _sweep_deleted_source_chunks(
     return orphan_ids
 
 
-def _sweep_deleted_session_chunks(
-    collection: chromadb.Collection,
-    session_ids: list[str],
-) -> list[str]:
-    """Delete `-sessions` chunks for session ids whose source file is gone.
-
-    Session chunks carry no `file_path` metadata (they key on `session_id` = the
-    file stem), so the manifest is the only signal that a session file was
-    deleted; the caller passes the stems of pruned `session:{path}` keys. Returns
-    the deleted ids. Per-id failures logged + swallowed.
-    """
-    deleted: list[str] = []
-    for sid in session_ids:
-        try:
-            existing = collection.get(where={"session_id": sid})
-            ids = existing.get("ids") or []
-            if ids:
-                _paginated_delete(collection, ids)
-                deleted.extend(ids)
-        except Exception as e:
-            _log(f"  Warning: session orphan sweep failed for session_id={sid}: {e}")
-    return deleted
-
-
 def _track_embed_success(
     succeeded_ids: list[str],
     chunk_to_file: dict[str, Path],
@@ -1163,270 +1085,6 @@ def index_code(
     return total_stored
 
 
-def _get_session_new_content(
-    file_path: Path,
-    manifest: Manifest,
-) -> tuple[str, int, bool]:
-    """Determine what content to index for a session file.
-
-    Returns:
-        (content_to_index, new_byte_offset, is_full_reindex)
-    """
-    file_size = file_path.stat().st_size
-    info = manifest.get_session_info(file_path)
-
-    if info is None:
-        # Never indexed -- full read
-        content = file_path.read_text(errors="replace")
-        return content, file_size, True
-
-    identity_bytes = info.get("identity_bytes", 1024)
-    current_identity = manifest._session_identity_hash(file_path, num_bytes=identity_bytes)
-    if current_identity != info["identity_hash"]:
-        # File rewritten/compacted -- full re-index
-        content = file_path.read_text(errors="replace")
-        return content, file_size, True
-
-    stored_offset = info["byte_offset"]
-    if file_size <= stored_offset:
-        # File hasn't grown (or shrunk) -- nothing new
-        return "", stored_offset, False
-
-    # Append-only growth -- read only new bytes
-    with open(file_path, "rb") as fh:
-        fh.seek(stored_offset)
-        new_bytes = fh.read()
-    content = new_bytes.decode("utf-8", errors="replace")
-    return content, file_size, False
-
-
-def _index_session_files(
-    project: ProjectConfig,
-    files: list[Path],
-    parser_fn,
-    agent_tag: str,
-    vo: voyageai.Client,
-    db: chromadb.ClientAPI,
-    *,
-    log_label: str,
-    manifest: Manifest | None = None,
-    cache: EmbedCache | None = None,
-) -> int:
-    """Shared session indexing pipeline.
-
-    Both the Claude Code (`index_sessions`) and Codex (`index_codex_sessions`)
-    code paths call this with their respective parser_fn and agent_tag. The
-    embedding model, BM25 sidecar suffix, and chunking parameters are constant
-    across agents; only parsing differs.
-
-    Args:
-        project: Target project. Output goes to project.sessions_collection.
-        files: Session files to consider (already routed and filtered).
-        parser_fn: Callable[[str], list[dict]] mapping raw JSONL to messages
-            in the shared `{role, text, timestamp}` shape.
-        agent_tag: "claude_code" | "codex". Stamped onto every chunk's
-            metadata so search results can distinguish sources.
-        vo: Voyage client.
-        db: Chromadb client.
-        log_label: Human-readable label for log lines.
-        manifest: Optional pre-built Manifest. Pass when caller already opened
-            one to avoid double-loading.
-
-    Returns:
-        Number of successfully embedded+stored chunks.
-    """
-    if not files:
-        return 0
-
-    if manifest is None:
-        manifest = Manifest(project.name)
-    collection = db.get_or_create_collection(project.sessions_collection)
-
-    all_chunks: list[dict] = []
-    chunk_to_file: dict[str, Path] = {}
-    file_expected_count: dict[Path, int] = {}
-    file_cleanup: dict[Path, tuple[str, str, set[str]]] = {}
-    # Per-file: (new_byte_offset, total_chunk_count, is_full_reindex)
-    file_session_meta: dict[Path, tuple[int, int, bool]] = {}
-
-    indexed_count = 0
-    file_messages: dict[Path, list[dict]] = {}
-    for f in files:
-        content, new_offset, is_full = _get_session_new_content(f, manifest)
-        if not content:
-            continue
-
-        indexed_count += 1
-        session_id = f.stem
-
-        messages = parser_fn(content)
-        file_messages[f] = messages
-        if not messages:
-            # Mark indexed anyway so byte_offset advances; otherwise we re-read
-            # the same uninteresting bytes every run.
-            manifest.mark_session_indexed(f, byte_offset=new_offset)
-            continue
-
-        chunk_index_offset = 0
-        if not is_full:
-            info = manifest.get_session_info(f)
-            if info and "chunk_count" in info:
-                chunk_index_offset = info["chunk_count"]
-
-        chunks = chunk_session(
-            messages, session_id, SESSION_CHUNK_MESSAGES, overlap=SESSION_CHUNK_OVERLAP
-        )
-        chunk_ids_for_file: set[str] = set()
-        for c in chunks:
-            c["metadata"]["chunk_index"] += chunk_index_offset
-            c["metadata"]["agent"] = agent_tag
-            # C: version_id for sessions = the session/run id (file stem).
-            c["metadata"]["version_id"] = session_id
-            c["id"] = _make_chunk_id(f"session:{session_id}", c["metadata"]["chunk_index"])
-            chunk_to_file[c["id"]] = f
-            chunk_ids_for_file.add(c["id"])
-
-        file_expected_count[f] = len(chunks)
-        total_chunk_count = chunk_index_offset + len(chunks)
-        file_session_meta[f] = (new_offset, total_chunk_count, is_full)
-
-        if is_full:
-            file_cleanup[f] = ("session_id", session_id, chunk_ids_for_file)
-
-        all_chunks.extend(chunks)
-
-    if indexed_count == 0:
-        _log(f"[{project.name}] {log_label}: nothing new to index.")
-    else:
-        _log(f"[{project.name}] {log_label}: {indexed_count} files to index ({len(files)} total)")
-
-    if not all_chunks:
-        manifest.save()
-        return 0
-
-    succeeded_ids = _embed_and_store(all_chunks, collection, SESSIONS_MODEL, vo, cache=cache)
-
-    fully_succeeded = _track_embed_success(
-        succeeded_ids, chunk_to_file, file_expected_count, file_cleanup, collection,
-    )
-    for f in fully_succeeded:
-        if f in file_session_meta:
-            new_offset, total_chunk_count, _ = file_session_meta[f]
-            manifest.mark_session_indexed(f, byte_offset=new_offset, chunk_count=total_chunk_count)
-
-    manifest.save()
-
-    if project.prose_drift_enabled:
-        try:
-            from vecs.prose_drift import add_fact_with_state_machine, extract_facts
-            for f in fully_succeeded:
-                session_id = f.stem
-                messages = file_messages.get(f)
-                if not messages:
-                    continue
-                user_messages = [m for m in messages if m.get("role") == "user"]
-                if not user_messages:
-                    continue
-                try:
-                    triples = extract_facts(user_messages, project.name)
-                except Exception as e:
-                    _log(f"[{project.name}] prose extract failed for {f.name}: {e}")
-                    continue
-                if not triples:
-                    _log(f"[{project.name}] prose-drift {f.name}: triples=0")
-                    continue
-                counts = {"INSERT": 0, "NOOP": 0, "SUPERSEDE": 0}
-                for t in triples:
-                    try:
-                        event = add_fact_with_state_machine(
-                            t, source_id=session_id, project=project.name,
-                        )
-                        counts[event] = counts.get(event, 0) + 1
-                    except Exception as e:
-                        _log(f"[{project.name}] prose state-machine failed for {f.name} triple {t}: {e}")
-                        continue
-                _log(
-                    f"[{project.name}] prose-drift {f.name}: "
-                    f"INSERT={counts['INSERT']} NOOP={counts['NOOP']} SUPERSEDE={counts['SUPERSEDE']}"
-                )
-        except ImportError as e:
-            _log(f"[{project.name}] anthropic not installed; skipping prose-drift facet: {e}")
-
-    if len(succeeded_ids) > 0:
-        _sync_bm25(collection, project.name, "sessions")
-
-    return len(succeeded_ids)
-
-
-def index_sessions(
-    project: ProjectConfig,
-    vo: voyageai.Client,
-    db: chromadb.ClientAPI,
-    cache: EmbedCache | None = None,
-) -> int:
-    """Index Claude Code session transcripts for a project.
-
-    Thin wrapper around `_index_session_files` for backward-compat.
-    """
-    if not project.sessions_dirs:
-        return 0
-
-    manifest = Manifest(project.name)
-    total = 0
-    for sessions_dir in project.sessions_dirs:
-        if not sessions_dir.exists():
-            _log(f"[{project.name}] Sessions dir not found: {sessions_dir}")
-            continue
-        files = sorted(sessions_dir.glob("*.jsonl"))
-        total += _index_session_files(
-            project,
-            files,
-            preprocess_session,
-            agent_tag="claude_code",
-            vo=vo,
-            db=db,
-            log_label=f"Sessions ({sessions_dir})",
-            manifest=manifest,
-            cache=cache,
-        )
-    return total
-
-
-def _make_codex_parser(unknown_seen: set[str]):
-    """Bind the per-run `unknown_payload_seen` set onto preprocess_codex_session.
-
-    The shared `_index_session_files` expects parser_fn(content) -> messages.
-    Codex parser also accepts an optional set arg; we close over the run-level
-    set so unknown payload types are deduplicated across all files.
-    """
-    def parse(content: str) -> list[dict]:
-        return preprocess_codex_session(content, unknown_payload_seen=unknown_seen)
-    return parse
-
-
-def index_codex_sessions(
-    project: ProjectConfig,
-    files: list[Path],
-    vo: voyageai.Client,
-    db: chromadb.ClientAPI,
-    cache: EmbedCache | None = None,
-) -> int:
-    """Index Codex CLI session transcripts already routed to this project."""
-    if not files:
-        return 0
-    parser = _make_codex_parser(_codex_unknown_payload_seen)
-    return _index_session_files(
-        project,
-        files,
-        parser,
-        agent_tag="codex",
-        vo=vo,
-        db=db,
-        log_label="Codex sessions",
-        cache=cache,
-    )
-
-
 def _docs_source_root_names(project: ProjectConfig) -> set[str]:
     """Configured source-root basenames for the -docs collection.
 
@@ -1507,6 +1165,13 @@ def _owning_doc_root(project: ProjectConfig, file_path: Path) -> Path | None:
     `index_docs` reindex would -- otherwise add + reindex would disagree on the
     chunk id and double-store the file. Returns None if the file is under no
     configured root.
+
+    Deliberately does NOT honor a code_dir's `exclude_dirs` (unlike `_docs_sources`
+    via `_scan_code_dir`): add-document is an EXPLICIT per-file user opt-in, so a
+    `.md` under an excluded subdir is still indexed when added by hand. The only
+    divergence this creates is benign: a later full reindex won't re-scan that
+    file (it's out of scan scope), but the orphan sweeps keep its chunk (valid
+    root prefix, file present on disk) -- no loss, no re-embed thrash, ids agree.
     """
     for root in [*project.docs_dirs, *(cd.path for cd in project.code_dirs)]:
         try:
@@ -1626,82 +1291,6 @@ def index_docs(
     return total_stored
 
 
-def purge_session_files_from_project(
-    project_name: str,
-    file_paths: list[Path],
-    session_ids: list[str],
-    db: chromadb.ClientAPI | None = None,
-) -> dict:
-    """Drop manifest entries + sweep chunks for a set of session files in a project.
-
-    Used by `codex_assign` / `codex_ignore` to invalidate previous routing so a
-    subsequent `vecs index` re-emits sessions into the correct project (or skips
-    them, in the ignore case).
-
-    Args:
-        project_name: Project whose `sessions_collection` and manifest are touched.
-        file_paths: Absolute paths whose `session:{path}` manifest entries are
-            dropped. Empty list is a no-op.
-        session_ids: Session ids whose chunks are deleted from the project's
-            sessions collection (chroma) AND BM25 sidecar. Empty list skips the
-            chunk sweep but still drops manifest entries.
-        db: Chromadb client. If None, opened lazily.
-
-    Returns:
-        {
-            "manifest_entries_dropped": int,
-            "chunks_deleted": int,
-            "session_ids_swept": int,
-        }
-    """
-    result = {"manifest_entries_dropped": 0, "chunks_deleted": 0, "session_ids_swept": 0}
-
-    # 1. Drop manifest entries (no chromadb needed if list empty).
-    if file_paths:
-        manifest = Manifest(project_name)
-        for fp in file_paths:
-            key = f"session:{fp}"
-            if key in manifest.data:
-                del manifest.data[key]
-                result["manifest_entries_dropped"] += 1
-        if result["manifest_entries_dropped"]:
-            manifest.save()
-
-    if not session_ids:
-        return result
-
-    # 2. Sweep chunks from chroma collection by session_id metadata.
-    if db is None:
-        db = get_chromadb_client()
-    config = load_config()
-    if project_name not in config.projects:
-        return result
-    project = config.projects[project_name]
-    try:
-        collection = db.get_collection(project.sessions_collection)
-    except Exception:
-        return result
-
-    deleted = 0
-    for sid in session_ids:
-        try:
-            existing = collection.get(where={"session_id": sid})
-            ids = existing.get("ids") or []
-            if ids:
-                _paginated_delete(collection, ids)
-                deleted += len(ids)
-                result["session_ids_swept"] += 1
-        except Exception as e:
-            _log(f"  Warning: chunk sweep failed for session_id={sid}: {e}")
-    result["chunks_deleted"] = deleted
-
-    if deleted:
-        # Keep BM25 sidecar in sync with the now-shorter chroma collection.
-        _sync_bm25(collection, project_name, "sessions")
-
-    return result
-
-
 def index_single_doc(project_name: str, file_path: Path) -> int:
     """Index a single doc file immediately. Returns chunk count."""
     config = load_config()
@@ -1782,20 +1371,14 @@ def get_status(project_name: str | None = None) -> dict:
         else config.projects
     )
 
-    status: dict = {"projects": {}, "total_code_chunks": 0, "total_session_chunks": 0, "total_docs_chunks": 0}
+    status: dict = {"projects": {}, "total_code_chunks": 0, "total_docs_chunks": 0}
 
     for name, p in projects.items():
         code_count = 0
-        session_count = 0
         docs_count = 0
         try:
             col = db.get_collection(p.code_collection)
             code_count = col.count()
-        except Exception:
-            pass
-        try:
-            col = db.get_collection(p.sessions_collection)
-            session_count = col.count()
         except Exception:
             pass
         try:
@@ -1805,11 +1388,9 @@ def get_status(project_name: str | None = None) -> dict:
             pass
         status["projects"][name] = {
             "code_chunks": code_count,
-            "session_chunks": session_count,
             "docs_chunks": docs_count,
         }
         status["total_code_chunks"] += code_count
-        status["total_session_chunks"] += session_count
         status["total_docs_chunks"] += docs_count
 
     total_manifest_entries = 0
@@ -1871,69 +1452,44 @@ def _clear_docs_manifest_entries(manifest: Manifest, docs_files: list[Path]) -> 
     return cleared
 
 
-def _clear_session_manifest_entries(manifest: Manifest) -> int:
-    """Drop every session: manifest key so each session re-embeds in FULL.
-
-    `_get_session_new_content` returns is_full=True when a session's manifest
-    info is None, so a cleared key forces a full (not incremental-append)
-    re-embed under the new model. Returns the number of keys removed.
-    """
-    stale = [k for k in manifest.data if k.startswith("session:")]
-    for k in stale:
-        del manifest.data[k]
-    return len(stale)
-
-
 def _remodel_clear(
     project: ProjectConfig, db: chromadb.ClientAPI, cache: EmbedCache
 ) -> dict[str, int]:
-    """run_index PRE-pass: clear manifest entries when the docs/sessions model changed.
+    """run_index PRE-pass: clear docs manifest entries when the docs model changed.
 
-    Centralized here, NOT inside the per-indexer functions, because the
-    -sessions collection is written by BOTH index_sessions and
-    index_codex_sessions: the clear must run ONCE before both, else whichever
-    indexer runs first would re-mark sessions and strand the other agent's
-    chunks in the old vector space. Docs are folded into the same pass for
-    uniformity. Code has no re-embed trigger, so code chunks are never
-    needlessly recomputed. The new marker is written AFTER all indexers by
-    `_remodel_record`.
+    Code has no re-embed trigger (it stays `voyage-code-3`), so code chunks are
+    never needlessly recomputed. The new marker is written AFTER index_docs runs
+    by `_remodel_record`.
     """
-    cleared = {"docs": 0, "sessions": 0}
-    docs_stale = _model_changed(cache, db, project.docs_collection, DOCS_MODEL)
-    sess_stale = _model_changed(cache, db, project.sessions_collection, SESSIONS_MODEL)
-    if not docs_stale and not sess_stale:
+    cleared = {"docs": 0}
+    if not _model_changed(cache, db, project.docs_collection, DOCS_MODEL):
         return cleared
 
     manifest = Manifest(project.name)
-    if docs_stale:
-        # Clear ONLY the files index_docs will actually re-scan, so we never
-        # invalidate a key the indexer won't re-embed (which would strand that
-        # file's old-model vectors after the marker advances). F: index_docs
-        # scans ALL docs_dirs ∪ in-repo .md under code_dirs (`_docs_sources`);
-        # clear and re-embed share that one enumerator, so they cannot drift.
-        docs_files = [f for _root, f in _docs_sources(project)]
-        cleared["docs"] = _clear_docs_manifest_entries(manifest, docs_files)
-    if sess_stale:
-        cleared["sessions"] = _clear_session_manifest_entries(manifest)
-    if cleared["docs"] or cleared["sessions"]:
+    # Clear ONLY the files index_docs will actually re-scan, so we never
+    # invalidate a key the indexer won't re-embed (which would strand that
+    # file's old-model vectors after the marker advances). F: index_docs
+    # scans ALL docs_dirs ∪ in-repo .md under code_dirs (`_docs_sources`);
+    # clear and re-embed share that one enumerator, so they cannot drift.
+    docs_files = [f for _root, f in _docs_sources(project)]
+    cleared["docs"] = _clear_docs_manifest_entries(manifest, docs_files)
+    if cleared["docs"]:
         manifest.save()
         _log(
             f"[{project.name}] Embedding-model change: cleared "
-            f"{cleared['docs']} docs + {cleared['sessions']} session manifest "
-            f"entries to force a re-embed."
+            f"{cleared['docs']} docs manifest entries to force a re-embed."
         )
     return cleared
 
 
 def _remodel_record(project: ProjectConfig, cache: EmbedCache) -> None:
-    """run_index POST-pass: record docs+sessions as embedded under the current model.
+    """run_index POST-pass: record docs as embedded under the current model.
 
-    Recorded only for docs and sessions (code has no re-embed trigger). Set
-    unconditionally per project so the next run reads marker == configured model
-    and the pre-pass is a no-op.
+    Recorded only for docs (code has no re-embed trigger). Set unconditionally
+    per project so the next run reads marker == configured model and the
+    pre-pass is a no-op.
     """
     cache.set_collection_model(project.docs_collection, DOCS_MODEL)
-    cache.set_collection_model(project.sessions_collection, SESSIONS_MODEL)
 
 
 def _prune_and_sweep_orphans(
@@ -1946,17 +1502,20 @@ def _prune_and_sweep_orphans(
     never removed their vectors, so deleted files kept ranking against live
     content forever. Here we:
       - prune the manifest (now returns the removed keys);
-      - delete chunks for pruned SESSION files by `session_id` (the only signal,
-        since session chunks carry no `file_path`);
       - sweep `-code` and `-docs` for chunks whose source-root-qualified
         `file_path` no longer resolves on disk (this also clears the already-
         leaked backlog, whose manifest entry is already gone).
     BM25 sidecars are updated via `_delete_ids_from_bm25` directly -- the prune
     path never reaches `_sync_bm25` (which only fires when `total_stored > 0`, so
-    a delete-only run would otherwise leave stale BM25 rows). Independent of Inc
-    4a's `valid_from`/`valid_to`.
+    a delete-only run would otherwise leave stale BM25 rows). Crash window: each
+    sweep deletes from chroma THEN BM25; an interruption in that gap leaves a
+    BM25-only strand (its chroma twin already gone). The prune RETRY does NOT
+    re-mirror it -- the retry re-derives orphans from chroma membership, and the
+    twin is no longer a member. That strand self-heals via `_sync_bm25` step-3
+    (drops BM25 rows absent from chroma) on the next content-adding run, not via
+    the prune. Independent of Inc 4a's `valid_from`/`valid_to`.
     """
-    stats = {"pruned_keys": 0, "code_orphans": 0, "docs_orphans": 0, "session_orphans": 0}
+    stats = {"pruned_keys": 0, "code_orphans": 0, "docs_orphans": 0}
 
     manifest = Manifest(project.name)
     pruned = manifest.prune()
@@ -1967,34 +1526,6 @@ def _prune_and_sweep_orphans(
             return db.get_collection(name)
         except Exception:
             return None
-
-    # Sessions FIRST and BEFORE persisting the manifest (crash-safety): session
-    # chunks carry no file_path, so the disk-scan sweep cannot recover them -- if
-    # we saved the pruned manifest and then crashed before deleting, the
-    # `session:` key would be gone and the orphan never retried. Deleting before
-    # save() keeps it idempotent under interruption (a crash leaves the key, so
-    # next run re-prunes and re-sweeps). session_id = the deleted file's stem;
-    # only sweep a stem that NO surviving session key still maps to (the stem is
-    # not path-unique, so a co-stemmed live session must not be swept).
-    surviving_stems = {
-        Path(k[len("session:"):]).stem
-        for k in manifest.data
-        if k.startswith("session:")
-    }
-    session_ids = []
-    for k in pruned:
-        if not k.startswith("session:"):
-            continue
-        stem = Path(k[len("session:"):]).stem
-        if stem not in surviving_stems:
-            session_ids.append(stem)
-    if session_ids:
-        col = _col(project.sessions_collection)
-        if col is not None:
-            ids = _sweep_deleted_session_chunks(col, session_ids)
-            if ids:
-                _delete_ids_from_bm25(project.name, "sessions", ids)
-            stats["session_orphans"] = len(ids)
 
     # Code: {code_dir.name}/{rel} -> code_dir.path / rel on disk. The map is
     # liveness- and collision-guarded so a transiently-missing or basename-
@@ -2022,7 +1553,6 @@ def _prune_and_sweep_orphans(
                 _delete_ids_from_bm25(project.name, "docs", ids)
             stats["docs_orphans"] = len(ids)
 
-    # Persist the pruned manifest only AFTER the (non-self-healing) session sweep.
     if pruned:
         manifest.save()
 
@@ -2057,25 +1587,9 @@ def run_index(project_name: str | None = None) -> None:
         else config.projects
     )
 
-    # Reset run-level Codex telemetry.
-    _codex_unknown_payload_seen.clear()
-
-    # Codex discovery is global (one walk of codex_sessions_root) so we route
-    # ALL codex files here, then hand each project its own slice. Cheaper than
-    # rerouting per project, and orphan tracking lives in one place.
-    codex_routing: dict[str, list[Path]] = {}
-    codex_state: CodexRoutingState | None = None
-    if not config.codex_disabled:
-        try:
-            codex_routing, codex_state = discover_codex_sessions(config)
-        except Exception as e:
-            _log(f"  Warning: codex discovery failed: {e}")
-            codex_routing, codex_state = {}, None
-
     run_start = time.monotonic()
     _log(f"Starting index... ({len(projects)} project(s): {', '.join(projects)})")
     total_code = 0
-    total_sessions = 0
     total_docs = 0
     # C: one content-hash embedding cache shared across every project and source
     # this run, so unchanged chunks skip the Voyage call. Closed in finally.
@@ -2084,35 +1598,16 @@ def run_index(project_name: str | None = None) -> None:
         for name, project in projects.items():
             proj_start = time.monotonic()
             _log(f"Project: {name}")
-            # B2 PRE-pass: detect a docs/sessions embedding-model change and
-            # clear the affected manifest entries so the indexers below re-embed
-            # every file under the new model. Runs once, before both session
-            # indexers share the -sessions collection.
+            # B2 PRE-pass: detect a docs embedding-model change and clear the
+            # affected manifest entries so index_docs re-embeds under the new model.
             _remodel_clear(project, db, cache)
             total_code += index_code(project, vo, db, cache=cache)
-            total_sessions += index_sessions(project, vo, db, cache=cache)
-            codex_files = codex_routing.get(name, [])
-            if codex_files:
-                total_sessions += index_codex_sessions(project, codex_files, vo, db, cache=cache)
             total_docs += index_docs(project, vo, db, cache=cache)
-            # B2 POST-pass: record the model docs+sessions are now embedded under.
+            # B2 POST-pass: record the model docs are now embedded under.
             _remodel_record(project, cache)
             _log(f"[{name}] project finished in {time.monotonic() - proj_start:.1f}s")
     finally:
         cache.close()
-
-    if _codex_unknown_payload_seen:
-        _log(
-            "  Codex parser saw unknown payload types this run: "
-            + ", ".join(sorted(_codex_unknown_payload_seen))
-        )
-
-    if codex_state is not None and codex_state.orphans:
-        _log(
-            f"  Codex orphans: {codex_state.total_orphan_sessions()} sessions across "
-            f"{len(codex_state.orphans)} cwd(s). Triage with `vecs codex orphans` "
-            f"or the codex_orphans MCP tool."
-        )
 
     # Prune manifest entries for deleted files AND delete their orphaned chunks
     # (the prune-orphan fix, Inc 1.5a): a deleted file's vectors must not keep
@@ -2123,17 +1618,16 @@ def run_index(project_name: str | None = None) -> None:
         except Exception as e:
             # Isolate per-project failure so one project's prune/save I/O error
             # can't skip the sweep for the rest of the run (code/docs self-heal
-            # next run; sessions retry because the manifest wasn't saved).
+            # next run).
             _log(f"[{name}] prune+sweep failed: {e}")
             continue
         if any(stats.values()):
             _log(
                 f"[{name}] prune+sweep: pruned {stats['pruned_keys']} manifest "
                 f"entries; deleted {stats['code_orphans']} code + "
-                f"{stats['docs_orphans']} docs + {stats['session_orphans']} "
-                f"session orphan chunks."
+                f"{stats['docs_orphans']} docs orphan chunks."
             )
 
     duration = time.monotonic() - run_start
-    _log(f"Done. Indexed {total_code} code chunks, {total_sessions} session chunks, "
-         f"{total_docs} doc chunks in {duration:.1f}s.")
+    _log(f"Done. Indexed {total_code} code chunks, {total_docs} doc chunks "
+         f"in {duration:.1f}s.")

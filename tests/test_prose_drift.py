@@ -166,8 +166,8 @@ def test_prose_extraction_model_constant_is_pinned():
 
 def test_voyage_embed_uses_pinned_facts_model(monkeypatch):
     """Facts embedding uses the dedicated FACTS_MODEL, decoupled from
-    SESSIONS_MODEL, so the Inc 1-B docs/sessions model swap cannot strand
-    fact vectors (Inc 1-B acceptance)."""
+    DOCS_MODEL, so the Inc 1-B docs model swap cannot strand fact vectors
+    (Inc 1-B acceptance)."""
     from vecs.config import FACTS_MODEL
 
     captured = {}
@@ -185,11 +185,11 @@ def test_voyage_embed_uses_pinned_facts_model(monkeypatch):
     assert captured["model"] == FACTS_MODEL
 
 
-def test_facts_model_decoupled_from_sessions_model():
-    """FACTS_MODEL is its own constant, not an alias of SESSIONS_MODEL."""
+def test_facts_model_decoupled_from_docs_model():
+    """FACTS_MODEL is its own constant, not an alias of DOCS_MODEL."""
     import vecs.config as cfg
     assert hasattr(cfg, "FACTS_MODEL")
-    # Distinct module-level name; changing SESSIONS_MODEL must not move facts.
+    # Distinct module-level name; changing DOCS_MODEL must not move facts.
     assert "FACTS_MODEL" in cfg.__dict__
 
 
@@ -297,7 +297,7 @@ def test_voyage_embed_uses_correct_model(fake_voyage):
         Triple("x", "y", "z"), "src", "vecs-voyage-test"
     )
     assert len(fake_voyage) >= 1
-    # Facts embed with the pinned FACTS_MODEL, decoupled from SESSIONS_MODEL.
+    # Facts embed with the pinned FACTS_MODEL, decoupled from DOCS_MODEL.
     assert fake_voyage[0]["model"] == FACTS_MODEL
 
 

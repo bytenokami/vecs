@@ -58,7 +58,7 @@ class EmbedCache:
         )
         # B2: per-collection embedding-model marker. Records which model a
         # collection was last embedded under so run_index can detect a model
-        # change (e.g. docs/sessions voyage-3 -> voyage-4) and trigger a
+        # change (e.g. docs voyage-3 -> voyage-4) and trigger a
         # re-embed. Kept here, NOT in the Manifest: the Manifest's prune()
         # iterates its keys and deletes any whose path is missing, so a
         # non-path marker key would be silently dropped.

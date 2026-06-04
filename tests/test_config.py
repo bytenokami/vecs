@@ -38,21 +38,6 @@ def test_load_config_with_docs_dir(tmp_path):
     assert config.projects["proj"].docs_dir == Path("/tmp/docs")
 
 
-def test_load_config_with_sessions(tmp_path):
-    """Legacy singular sessions_dir loads as single-element list."""
-    config_file = tmp_path / "config.yaml"
-    config_file.write_text(yaml.dump({
-        "projects": {
-            "proj": {
-                "code_dirs": [{"path": "/tmp/code", "extensions": [".cs"]}],
-                "sessions_dir": "/tmp/sessions",
-            }
-        }
-    }))
-    config = load_config(config_file)
-    assert config.projects["proj"].sessions_dirs == [Path("/tmp/sessions")]
-
-
 def test_load_config_missing_file(tmp_path):
     config = load_config(tmp_path / "nonexistent.yaml")
     assert config.projects == {}
@@ -64,7 +49,6 @@ def test_collection_names():
         code_dirs=[CodeDir(path=Path("/tmp"), extensions={".cs"})],
     )
     assert p.code_collection == "livly-code"
-    assert p.sessions_collection == "livly-sessions"
     assert p.docs_collection == "livly-docs"
 
 
@@ -74,7 +58,6 @@ def test_save_and_reload(tmp_path):
     config.add_project(
         "test",
         code_dirs=[CodeDir(path=Path("/tmp/code"), extensions={".cs", ".ts"})],
-        sessions_dirs=[Path("/tmp/sessions")],
         docs_dir=Path("/tmp/docs"),
     )
     config.save()
@@ -84,7 +67,6 @@ def test_save_and_reload(tmp_path):
     assert len(p.code_dirs) == 1
     assert p.code_dirs[0].path == Path("/tmp/code")
     assert p.code_dirs[0].extensions == {".cs", ".ts"}
-    assert p.sessions_dirs == [Path("/tmp/sessions")]
     assert p.docs_dir == Path("/tmp/docs")
 
 
@@ -193,53 +175,6 @@ def test_backward_compat_legacy_code_dir(tmp_path):
     assert p.code_dirs[0].path == Path("/tmp/code")
     assert p.code_dirs[0].extensions == {".cs", ".ts"}
     assert p.code_dirs[0].include_dirs == ["Scripts"]
-
-
-def test_load_config_multi_sessions_dirs(tmp_path):
-    """Multiple sessions_dirs load as a list."""
-    config_file = tmp_path / "config.yaml"
-    config_file.write_text(yaml.dump({
-        "projects": {
-            "proj": {
-                "code_dirs": [{"path": "/tmp/code", "extensions": [".cs"]}],
-                "sessions_dirs": ["/tmp/sessions1", "/tmp/sessions2"],
-            }
-        }
-    }))
-    config = load_config(config_file)
-    p = config.projects["proj"]
-    assert p.sessions_dirs == [Path("/tmp/sessions1"), Path("/tmp/sessions2")]
-
-
-def test_load_config_singular_sessions_dir_compat(tmp_path):
-    """Legacy singular sessions_dir loads as single-element list."""
-    config_file = tmp_path / "config.yaml"
-    config_file.write_text(yaml.dump({
-        "projects": {
-            "proj": {
-                "code_dirs": [{"path": "/tmp/code", "extensions": [".cs"]}],
-                "sessions_dir": "/tmp/sessions",
-            }
-        }
-    }))
-    config = load_config(config_file)
-    p = config.projects["proj"]
-    assert p.sessions_dirs == [Path("/tmp/sessions")]
-
-
-def test_load_config_no_sessions_dirs(tmp_path):
-    """No sessions config results in empty list."""
-    config_file = tmp_path / "config.yaml"
-    config_file.write_text(yaml.dump({
-        "projects": {
-            "proj": {
-                "code_dirs": [{"path": "/tmp/code", "extensions": [".cs"]}],
-            }
-        }
-    }))
-    config = load_config(config_file)
-    p = config.projects["proj"]
-    assert p.sessions_dirs == []
 
 
 # --- docs_dirs multi-path coercion (Inc 1-pipeline, Phase-7 dry-run) ---
@@ -454,35 +389,6 @@ def test_clear_config_cache(tmp_path):
     assert c1 is not c2  # fresh object after cache clear
 
 
-def test_save_and_reload_multi_sessions_dirs(tmp_path):
-    """Multi sessions_dirs round-trip through save/load."""
-    config_file = tmp_path / "config.yaml"
-    config = load_config(config_file)
-    config.add_project(
-        "test",
-        code_dirs=[CodeDir(path=Path("/tmp/code"), extensions={".cs"})],
-        sessions_dirs=[Path("/tmp/s1"), Path("/tmp/s2")],
-    )
-    config.save()
-    reloaded = load_config(config_file)
-    p = reloaded.projects["test"]
-    assert p.sessions_dirs == [Path("/tmp/s1"), Path("/tmp/s2")]
-
-
-def test_save_empty_sessions_dirs_omitted(tmp_path):
-    """Empty sessions_dirs list is not written to YAML."""
-    config_file = tmp_path / "config.yaml"
-    config = load_config(config_file)
-    config.add_project(
-        "test",
-        code_dirs=[CodeDir(path=Path("/tmp/code"), extensions={".cs"})],
-    )
-    config.save()
-    raw = yaml.safe_load(config_file.read_text())
-    assert "sessions_dirs" not in raw["projects"]["test"]
-    assert "sessions_dir" not in raw["projects"]["test"]
-
-
 # --- Extension validation tests (L6) ---
 
 def test_code_dir_requires_extensions():
@@ -507,90 +413,14 @@ def test_load_config_missing_extensions_raises(tmp_path):
         load_config(config_file)
 
 
-# --- Codex env-var escape hatch ---
-
-def test_codex_disabled_env_var_forces_off(tmp_path, monkeypatch):
-    """VECS_CODEX_DISABLED=1 in the environment forces codex_disabled = True."""
-    from vecs.config import _clear_config_cache, load_config
-
-    cfg_file = tmp_path / "config.yaml"
-    cfg_file.write_text("projects: {}\n")
-    _clear_config_cache()
-    monkeypatch.setenv("VECS_CODEX_DISABLED", "1")
-    config = load_config(cfg_file)
-    assert config.codex_disabled is True
-
-
-def test_codex_disabled_env_var_truey_values_accepted(tmp_path, monkeypatch):
-    from vecs.config import _clear_config_cache, load_config
-
-    cfg_file = tmp_path / "config.yaml"
-    cfg_file.write_text("projects: {}\n")
-
-    for value in ("1", "true", "TRUE", "yes"):
-        _clear_config_cache()
-        monkeypatch.setenv("VECS_CODEX_DISABLED", value)
-        config = load_config(cfg_file)
-        assert config.codex_disabled is True, f"value={value!r} should disable"
-
-
-def test_codex_disabled_env_var_falsey_values_ignored(tmp_path, monkeypatch):
-    from vecs.config import _clear_config_cache, load_config
-
-    cfg_file = tmp_path / "config.yaml"
-    cfg_file.write_text("projects: {}\n")
-
-    for value in ("", "0", "false", "no"):
-        _clear_config_cache()
-        monkeypatch.setenv("VECS_CODEX_DISABLED", value)
-        config = load_config(cfg_file)
-        assert config.codex_disabled is False, f"value={value!r} should not disable"
-
-
-def test_codex_cwds_per_project_save_and_reload(tmp_path):
-    from vecs.config import VecsConfig, ProjectConfig, _clear_config_cache, load_config
-
-    cfg_file = tmp_path / "config.yaml"
-    config = VecsConfig(path=cfg_file)
-    proj = ProjectConfig(name="p1")
-    proj.codex_cwds = [Path("/Users/x/repos/p1"), Path("/tmp/scratch")]
-    config.projects["p1"] = proj
-    config.save()
-
-    _clear_config_cache()
-    reloaded = load_config(cfg_file)
-    assert reloaded.projects["p1"].codex_cwds == [
-        Path("/Users/x/repos/p1"),
-        Path("/tmp/scratch"),
-    ]
-
-
-def test_codex_top_level_settings_save_and_reload(tmp_path):
-    from vecs.config import VecsConfig, _clear_config_cache, load_config
-
-    cfg_file = tmp_path / "config.yaml"
-    config = VecsConfig(path=cfg_file)
-    config.codex_sessions_root = tmp_path / "custom" / "codex"
-    config.codex_disabled = True
-    config.codex_ignore_cwds = [Path("/tmp/scratch"), Path("/etc")]
-    config.save()
-
-    _clear_config_cache()
-    reloaded = load_config(cfg_file)
-    assert reloaded.codex_sessions_root == tmp_path / "custom" / "codex"
-    assert reloaded.codex_disabled is True
-    assert reloaded.codex_ignore_cwds == [Path("/tmp/scratch"), Path("/etc")]
-
-
 # --- Inc 1-B: voyage-4 re-embed target + dim safety -------------------------
 
-def test_docs_and_sessions_models_are_voyage_4():
-    """B1: docs + sessions re-embed target is voyage-4 (current frontier). The
-    in-place migration is delivered by the run_index model-change trigger (B2),
-    so flipping the constant is safe. Code stays on voyage-code-3 (no trigger)."""
-    from vecs.config import DOCS_MODEL, SESSIONS_MODEL, CODE_MODEL
+def test_docs_model_is_voyage_4():
+    """B1: docs re-embed target is voyage-4 (current frontier). The in-place
+    migration is delivered by the run_index model-change trigger (B2), so
+    flipping the constant is safe. Code stays on voyage-code-3 (no trigger)."""
+    from vecs.config import DOCS_MODEL, CODE_MODEL
     assert DOCS_MODEL == "voyage-4"
-    assert SESSIONS_MODEL == "voyage-4"
     assert CODE_MODEL == "voyage-code-3"
 
 
@@ -599,7 +429,7 @@ def test_voyage4_dim_matches_voyage3_for_in_place_reembed():
     so re-embedded vectors overwrite existing chunk ids in the same Chroma
     collection with no recreate -- but NOT SUFFICIENT: a different vector space
     still requires a real re-embed (delivered by B2)."""
-    from vecs.config import EMBED_DIMS, DOCS_MODEL, SESSIONS_MODEL, CODE_MODEL
+    from vecs.config import EMBED_DIMS, DOCS_MODEL, CODE_MODEL
     assert EMBED_DIMS["voyage-4"] == EMBED_DIMS["voyage-3"] == 1024
     # Every configured model resolves to the same dim -> in-place overwrite safe.
-    assert EMBED_DIMS[DOCS_MODEL] == EMBED_DIMS[SESSIONS_MODEL] == EMBED_DIMS[CODE_MODEL] == 1024
+    assert EMBED_DIMS[DOCS_MODEL] == EMBED_DIMS[CODE_MODEL] == 1024

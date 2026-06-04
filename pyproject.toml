@@ -1,7 +1,7 @@
 [project]
 name = "vecs"
 version = "0.1.0"
-description = "Semantic search for your codebase and Claude Code sessions"
+description = "Semantic search for your codebase and docs"
 requires-python = ">=3.12"
 dependencies = [
     "voyageai>=0.3,<1",

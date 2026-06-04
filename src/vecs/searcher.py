@@ -7,7 +7,6 @@ from vecs.clients import get_voyage_client, get_chromadb_client
 from vecs.config import (
     CODE_MODEL,
     DOCS_MODEL,
-    SESSIONS_MODEL,
     VECS_DIR,
     load_config,
 )
@@ -125,7 +124,7 @@ def search(
 
     Args:
         query: Search query string.
-        collection_name: "code", "sessions", "docs", or None (all).
+        collection_name: "code", "docs", or None (all).
         n_results: Number of results to return.
         path_filter: Filter results to paths containing this substring.
         project: Search a specific project (default: all).
@@ -144,13 +143,11 @@ def search(
     for proj_name, proj in projects.items():
         if collection_name is None or collection_name == "code":
             targets.append((proj.code_collection, CODE_MODEL, proj_name))
-        if collection_name is None or collection_name == "sessions":
-            targets.append((proj.sessions_collection, SESSIONS_MODEL, proj_name))
         if collection_name is None or collection_name == "docs":
             # Always attempt -docs (skip-on-miss at get_collection below, like
-            # code/sessions). F populates -docs from in-repo .md even for
-            # projects with no configured docs_dir (bloomly/eric), so gating on
-            # proj.docs_dir would leave those collections permanently unsearched.
+            # code). F populates -docs from in-repo .md even for projects with no
+            # configured docs_dir, so gating on proj.docs_dir would leave those
+            # collections permanently unsearched.
             targets.append((proj.docs_collection, DOCS_MODEL, proj_name))
 
     # Fetch with escalating multiplier: try 2x first, then 3x if dedup eats too many
@@ -178,7 +175,8 @@ def search(
                     where=where,
                 )
             except Exception:
-                # where clause may fail on sessions collection (no file_path)
+                # tolerate a where-clause failure on a collection that lacks
+                # file_path metadata rather than aborting the whole search
                 if path_filter:
                     continue
                 raise
@@ -193,12 +191,7 @@ def search(
         bm25_results = []
         bm25_dir = VECS_DIR / "bm25"
         for col_name, model, proj_name in targets:
-            if col_name.endswith("-code"):
-                suffix = "code"
-            elif col_name.endswith("-sessions"):
-                suffix = "sessions"
-            else:
-                suffix = "docs"
+            suffix = "code" if col_name.endswith("-code") else "docs"
             bm25_path = bm25_dir / f"{proj_name}_{suffix}.db"
             bm25 = get_bm25(bm25_path)
             if bm25 is not None:

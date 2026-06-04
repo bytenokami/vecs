@@ -11,7 +11,6 @@ from vecs.indexer import (
     Manifest,
     _embed_and_store,
     _delete_stale_chunks_after_embed,
-    _get_session_new_content,
     _index_collection,
     _make_batches,
     _paginated_get,
@@ -142,15 +141,14 @@ def _capture_embed_ids(monkeypatch):
     monkeypatch.setattr("vecs.indexer._delete_ids_from_bm25", lambda *a, **kw: None)
     return captured
 
-def _seed_manifest_with_doc_code_session(tmp_path, doc_f, code_f, sess_f):
+def _seed_manifest_with_doc_code(tmp_path, doc_f, code_f):
     manifest = Manifest("p", manifests_dir=tmp_path / "manifests")
     manifest.mark_indexed(doc_f, "hdoc")
     manifest.mark_indexed(code_f, "hcode")
-    manifest.mark_session_indexed(sess_f, byte_offset=2, chunk_count=1)
     manifest.save()
 
 def _remodel_fixture(tmp_path):
-    """Build (project, doc_f, code_f, sess_f) sharing one manifest namespace."""
+    """Build (project, doc_f, code_f) sharing one manifest namespace."""
     docs_dir = tmp_path / "docs"
     docs_dir.mkdir()
     code_dir = tmp_path / "code"
@@ -159,14 +157,12 @@ def _remodel_fixture(tmp_path):
     doc_f.write_text("doc body")
     code_f = code_dir / "m.py"
     code_f.write_text("print(1)")
-    sess_f = tmp_path / "sess.jsonl"
-    sess_f.write_text("{}")
     project = ProjectConfig(
         name="p",
         code_dirs=[CodeDir(path=code_dir, extensions={".py"})],
         docs_dirs=[docs_dir],
     )
-    return project, doc_f, code_f, sess_f
+    return project, doc_f, code_f
 
 class _FakeChromaCollection:
     """Minimal in-memory chroma collection: supports the get/delete/count the

@@ -11,7 +11,6 @@ from vecs.indexer import (
     Manifest,
     _embed_and_store,
     _delete_stale_chunks_after_embed,
-    _get_session_new_content,
     _index_collection,
     _make_batches,
     _paginated_get,
@@ -25,7 +24,7 @@ from vecs.config import VecsConfig, ProjectConfig, CodeDir
 from indexer_helpers import (  # noqa: F401
     FakeEmbedResult, _embedded_texts, _make_index_db, _capture_files,
     _git_init_commit, _capture_chunks_via_index_collection, _StatefulDocsChroma,
-    _capture_embed_ids, _seed_manifest_with_doc_code_session, _remodel_fixture,
+    _capture_embed_ids, _seed_manifest_with_doc_code, _remodel_fixture,
     _FakeChromaCollection, _FakeDB,
 )
 
