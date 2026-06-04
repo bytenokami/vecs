@@ -18,6 +18,7 @@ from vecs.indexer import (
     _sweep_excluded_chunks,
     _track_embed_success,
     index_code,
+    index_docs,
     migrate_global_manifest,
 )
 from vecs.config import VecsConfig, ProjectConfig, CodeDir
@@ -57,7 +58,6 @@ def test_index_single_doc_stamps_mtime_version_id(tmp_path, monkeypatch):
 
 def test_index_docs_stamps_mtime_version_id(tmp_path, monkeypatch):
     """Each stored docs chunk carries version_id == the file mtime."""
-    from vecs.indexer import index_docs
     monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
 
     docs = tmp_path / "docs"
@@ -107,7 +107,6 @@ def test_docs_sources_enumerates_docs_dirs_and_inrepo_md(tmp_path):
 
 def test_index_docs_qualifies_chunk_id_with_source_root_basename(tmp_path, monkeypatch):
     """docs chunk id + file_path are source-root-qualified: docs:{root.name}/{rel}."""
-    from vecs.indexer import index_docs
     monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
 
     docs = tmp_path / "docs"
@@ -129,7 +128,6 @@ def test_index_docs_two_roots_same_readme_do_not_collide(tmp_path, monkeypatch):
     """Collision test (deliverable 3): two distinct source roots each holding
     README.md produce DISTINCT chunk ids + distinct cleanup file_path values, so
     neither's reindex can over-match and delete the other's chunks."""
-    from vecs.indexer import index_docs
     monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
 
     repo_a = tmp_path / "repoA"
@@ -160,7 +158,6 @@ def test_index_docs_two_roots_same_readme_real_cleanup_no_mutual_delete(tmp_path
     each with README.md both survive -- per-file _delete_stale_chunks_after_embed
     filters on the qualified file_path so neither file's cleanup matches the
     other's chunks."""
-    from vecs.indexer import index_docs
     monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
 
     repo_a = tmp_path / "repoA"
@@ -218,7 +215,6 @@ def test_docs_sources_dedups_overlapping_roots_docs_wins(tmp_path):
 def test_index_docs_qualifies_txt_and_pdf_under_docs_dir(tmp_path, monkeypatch):
     """Deliverable 3 covers .md/.txt/.pdf: non-.md docs are also source-root
     qualified (id + file_path = docs:{root.name}/{rel})."""
-    from vecs.indexer import index_docs
     monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
     monkeypatch.setattr(
         "vecs.indexer.extract_pdf_text", lambda p: "PDF body long enough to chunk here.\n"
@@ -255,7 +251,6 @@ def test_docs_source_root_names_unions_docs_and_code_basenames(tmp_path):
 def test_index_docs_routes_inrepo_md_when_no_docs_dir(tmp_path, monkeypatch):
     """A project with NO docs_dir still indexes in-repo .md under its code_dirs
     into the -docs collection (deliverable 4)."""
-    from vecs.indexer import index_docs
     monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
 
     code = tmp_path / "eric"
@@ -275,7 +270,6 @@ def test_index_docs_routes_inrepo_md_when_no_docs_dir(tmp_path, monkeypatch):
 def test_index_docs_inrepo_md_respects_code_dir_exclude(tmp_path, monkeypatch):
     """In-repo .md discovery uses the code_dir's own exclude scope, so a .md
     under an excluded subdir is NOT routed to docs (no third-party junk)."""
-    from vecs.indexer import index_docs
     monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
 
     code = tmp_path / "client-uk"
@@ -335,7 +329,6 @@ def test_index_docs_no_md_content_lost(tmp_path, monkeypatch):
 
 def test_index_docs_returns_zero_without_any_source(tmp_path, monkeypatch):
     """No docs_dir and no .md under code_dirs -> index_docs is a no-op (0)."""
-    from vecs.indexer import index_docs
     monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
 
     code = tmp_path / "eric"
@@ -419,7 +412,6 @@ def test_partition_docs_by_root_empty_roots_never_scans(tmp_path):
 def test_index_docs_sweeps_unrooted_chunks_even_with_nothing_new(tmp_path, monkeypatch):
     """The orphan sweep runs on every docs pass (chroma + BM25), including runs
     where there is nothing new to index -- so legacy bare-id chunks get purged."""
-    from vecs.indexer import index_docs
     monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
 
     docs = tmp_path / "docs"
@@ -477,7 +469,6 @@ def test_index_docs_migrates_legacy_bare_id_without_model_change(tmp_path, monke
     even with NO docs model change. A legacy bare-id chunk + a steady-state
     manifest key (matching hash) must be RE-EMBEDDED under the qualified id, not
     merely deleted (which would silently lose the content)."""
-    from vecs.indexer import index_docs, Manifest
     monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
 
     docs = tmp_path / "docs"
@@ -520,7 +511,6 @@ def test_index_docs_migrates_inrepo_md_without_model_change(tmp_path, monkeypatc
     """Phase-4 regression: an in-repo .md previously code-indexed (manifest key set,
     matching hash) must be embedded into -docs under the qualified id even with no
     model change and an empty -docs collection -- else it is lost from both."""
-    from vecs.indexer import index_docs, Manifest
     monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
 
     code = tmp_path / "client-uk"
@@ -605,7 +595,6 @@ def test_md_reroute_converges_end_to_end_no_model_change(tmp_path, monkeypatch):
 def test_index_docs_steady_state_second_run_is_noop(tmp_path, monkeypatch):
     """Idempotency: once chunks are present under qualified ids and the manifest
     matches, a subsequent docs pass re-embeds nothing and deletes nothing."""
-    from vecs.indexer import index_docs, Manifest
     monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
 
     docs = tmp_path / "docs"
@@ -728,3 +717,240 @@ def test_index_single_doc_qualifies_inrepo_md_by_code_dir_root(tmp_path, monkeyp
     for c in captured["chunks"]:
         assert c["id"].startswith("docs:client-uk/README.md:")
         assert c["metadata"]["file_path"] == "client-uk/README.md"
+
+
+# --- Inc: hidden (dot) dirs skipped in docs scan + swept from -docs (option-2) ---
+
+def test_docs_sources_skips_hidden_dirs(tmp_path):
+    """_docs_sources drops files under hidden dirs in BOTH a docs_dir
+    (.research/) and in-repo .md under a code_dir (.claude/)."""
+    from vecs.indexer import _docs_sources
+    docs = tmp_path / "docs"
+    (docs / ".research").mkdir(parents=True)
+    (docs / "real").mkdir(parents=True)
+    (docs / "real" / "a.md").write_text("# a\n\nbody.\n")
+    (docs / ".research" / "notes.md").write_text("# n\n\nbody.\n")
+    code = tmp_path / "client-uk"
+    (code / ".claude").mkdir(parents=True)
+    (code / "Assets").mkdir(parents=True)
+    (code / "Assets" / "B.md").write_text("# b\n\nbody.\n")
+    (code / ".claude" / "skill.md").write_text("# s\n\nbody.\n")
+    project = ProjectConfig(
+        name="p",
+        code_dirs=[CodeDir(path=code, extensions={".cs"})],
+        docs_dirs=[docs],
+    )
+    names = {f.name for _r, f in _docs_sources(project)}
+    assert names == {"a.md", "B.md"}  # .research/notes.md + .claude/skill.md dropped
+
+
+def test_index_docs_sweeps_now_hidden_chunk_under_valid_root(tmp_path, monkeypatch):
+    """A -docs chunk under a still-valid root but now under a hidden dir (no
+    longer in _docs_sources) is swept on reindex, even with nothing new; the
+    in-scope chunk survives. (Closes the gap: _partition_docs_by_root keeps it
+    -- valid root -- and the 1.5a deleted-source sweep keeps it -- file present.)"""
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+
+    code = tmp_path / "client-uk"
+    (code / ".claude" / "commands").mkdir(parents=True)
+    (code / "Assets").mkdir(parents=True)
+    keep = code / "Assets" / "GUIDE.md"
+    keep.write_text("# guide\n\nbody long enough.\n")
+    (code / ".claude" / "commands" / "create-pr.md").write_text("# pr\n\nbody.\n")
+
+    m = Manifest("p", manifests_dir=tmp_path / "manifests")
+    _, h = m.needs_indexing(keep)
+    m.mark_indexed(keep, h)
+    m.save()
+
+    hidden_id = "docs:client-uk/.claude/commands/create-pr.md:0"
+    keep_id = "docs:client-uk/Assets/GUIDE.md:0"
+    collection = MagicMock()
+
+    def fake_get(*a, **k):
+        if "where" in k:
+            return {"ids": []}
+        if k.get("offset", 0) == 0:
+            return {
+                "ids": [hidden_id, keep_id],
+                "documents": ["", ""],
+                "metadatas": [
+                    {"file_path": "client-uk/.claude/commands/create-pr.md"},
+                    {"file_path": "client-uk/Assets/GUIDE.md"},
+                ],
+            }
+        return {"ids": [], "documents": [], "metadatas": []}
+
+    collection.get.side_effect = fake_get
+    db = MagicMock()
+    db.get_or_create_collection.return_value = collection
+
+    bm25_deletes: list = []
+    monkeypatch.setattr(
+        "vecs.indexer._delete_ids_from_bm25",
+        lambda proj, suffix, ids: bm25_deletes.append((proj, suffix, list(ids))),
+    )
+    monkeypatch.setattr("vecs.indexer._sync_bm25", lambda *a, **k: None)
+
+    project = ProjectConfig(name="p", code_dirs=[CodeDir(path=code, extensions={".cs"})])
+    index_docs(project, vo=MagicMock(), db=db)
+
+    deleted = []
+    for c in collection.delete.call_args_list:
+        ids = c.kwargs.get("ids") or (c.args[0] if c.args else [])
+        deleted.extend(ids)
+    assert hidden_id in deleted       # now-hidden chunk swept
+    assert keep_id not in deleted     # in-scope chunk survives
+    assert ("p", "docs", [hidden_id]) in bm25_deletes
+
+
+# --- out-of-scope -docs sweep: safety guards (review F1/F2/F4/F5) ---------
+
+def test_out_of_scope_sweep_keeps_missing_root_and_gone_file(tmp_path, monkeypatch):
+    """The out-of-scope sweep must only delete chunks whose source file EXISTS
+    on disk under a present, unique-basename root (present-but-out-of-scope).
+    A transiently-MISSING root's chunks (F1) and a GONE file's chunks (F2 /
+    1.5a's job) are KEPT -- an orphan is safer than deleting live data. The
+    hidden chunk under the present root is still swept."""
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+
+    present_code = tmp_path / "client-uk"
+    (present_code / "Assets").mkdir(parents=True)
+    (present_code / ".claude").mkdir(parents=True)
+    guide = present_code / "Assets" / "GUIDE.md"
+    guide.write_text("# g\n\nbody long enough.\n")
+    (present_code / ".claude" / "x.md").write_text("# x\n\nbody.\n")
+    m = Manifest("p", manifests_dir=tmp_path / "manifests")
+    _, h = m.needs_indexing(guide)
+    m.mark_indexed(guide, h)
+    m.save()
+
+    missing = tmp_path / "server-uk"  # configured but NOT created on disk
+
+    guide_id = "docs:client-uk/Assets/GUIDE.md:0"
+    hidden_id = "docs:client-uk/.claude/x.md:0"
+    missing_root_id = "docs:server-uk/doc/REFERENCE.md:0"
+    gone_file_id = "docs:client-uk/Assets/GONE.md:0"  # valid present root, file absent
+    collection = MagicMock()
+
+    def fake_get(*a, **k):
+        if "where" in k:
+            return {"ids": []}
+        if k.get("offset", 0) == 0:
+            return {
+                "ids": [guide_id, hidden_id, missing_root_id, gone_file_id],
+                "documents": ["", "", "", ""],
+                "metadatas": [
+                    {"file_path": "client-uk/Assets/GUIDE.md"},
+                    {"file_path": "client-uk/.claude/x.md"},
+                    {"file_path": "server-uk/doc/REFERENCE.md"},
+                    {"file_path": "client-uk/Assets/GONE.md"},
+                ],
+            }
+        return {"ids": [], "documents": [], "metadatas": []}
+
+    collection.get.side_effect = fake_get
+    db = MagicMock()
+    db.get_or_create_collection.return_value = collection
+    monkeypatch.setattr("vecs.indexer._delete_ids_from_bm25", lambda *a: None)
+    monkeypatch.setattr("vecs.indexer._sync_bm25", lambda *a, **k: None)
+
+    project = ProjectConfig(name="p", code_dirs=[
+        CodeDir(path=present_code, extensions={".cs"}),
+        CodeDir(path=missing, extensions={".go"}),
+    ])
+    index_docs(project, vo=MagicMock(), db=db)
+
+    deleted = []
+    for c in collection.delete.call_args_list:
+        deleted.extend(c.kwargs.get("ids") or (c.args[0] if c.args else []))
+    assert hidden_id in deleted              # present-root hidden file -> swept
+    assert guide_id not in deleted           # in-scope -> survives
+    assert missing_root_id not in deleted    # F1: missing root -> kept
+    assert gone_file_id not in deleted       # F2: gone file -> kept (1.5a's job)
+
+
+def test_index_docs_empty_sources_does_not_wipe_populated_collection(tmp_path, monkeypatch):
+    """F4: a populated -docs collection whose scope collapses to empty
+    (_docs_sources == []) must NOT be swept -- the `if not sources: return 0`
+    guard precedes the out-of-scope sweep."""
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+
+    code = tmp_path / "client-uk"  # exists but has NO .md -> sources empty
+    code.mkdir()
+    collection = MagicMock()
+
+    def fake_get(*a, **k):
+        if "where" in k:
+            return {"ids": []}
+        if k.get("offset", 0) == 0:
+            return {
+                "ids": ["docs:client-uk/a.md:0"],
+                "documents": [""],
+                "metadatas": [{"file_path": "client-uk/a.md"}],
+            }
+        return {"ids": [], "documents": [], "metadatas": []}
+
+    collection.get.side_effect = fake_get
+    db = MagicMock()
+    db.get_or_create_collection.return_value = collection
+
+    project = ProjectConfig(name="p", code_dirs=[CodeDir(path=code, extensions={".cs"})])
+    n = index_docs(project, vo=MagicMock(), db=db)
+    assert n == 0
+    collection.delete.assert_not_called()
+
+
+def test_out_of_scope_sweep_docs_dir_rooted_hidden_subdir(tmp_path, monkeypatch):
+    """F5: the sweep reclaims a hidden-subdir chunk rooted at a DOCS_DIR (not
+    just a code_dir), end-to-end through index_docs."""
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+
+    docs = tmp_path / "docs"
+    (docs / ".research").mkdir(parents=True)
+    (docs / "real").mkdir(parents=True)
+    real = docs / "real" / "a.md"
+    real.write_text("# a\n\nbody long enough.\n")
+    (docs / ".research" / "notes.md").write_text("# n\n\nbody.\n")
+    m = Manifest("p", manifests_dir=tmp_path / "manifests")
+    _, h = m.needs_indexing(real)
+    m.mark_indexed(real, h)
+    m.save()
+
+    keep_id = "docs:docs/real/a.md:0"
+    hidden_id = "docs:docs/.research/notes.md:0"
+    collection = MagicMock()
+
+    def fake_get(*a, **k):
+        if "where" in k:
+            return {"ids": []}
+        if k.get("offset", 0) == 0:
+            return {
+                "ids": [keep_id, hidden_id],
+                "documents": ["", ""],
+                "metadatas": [
+                    {"file_path": "docs/real/a.md"},
+                    {"file_path": "docs/.research/notes.md"},
+                ],
+            }
+        return {"ids": [], "documents": [], "metadatas": []}
+
+    collection.get.side_effect = fake_get
+    db = MagicMock()
+    db.get_or_create_collection.return_value = collection
+    bm25_deletes = []
+    monkeypatch.setattr(
+        "vecs.indexer._delete_ids_from_bm25",
+        lambda proj, suffix, ids: bm25_deletes.append((proj, suffix, list(ids))),
+    )
+    monkeypatch.setattr("vecs.indexer._sync_bm25", lambda *a, **k: None)
+
+    project = ProjectConfig(name="p", docs_dirs=[docs])
+    index_docs(project, vo=MagicMock(), db=db)
+
+    deleted = []
+    for c in collection.delete.call_args_list:
+        deleted.extend(c.kwargs.get("ids") or (c.args[0] if c.args else []))
+    assert hidden_id in deleted
+    assert keep_id not in deleted
+    assert ("p", "docs", [hidden_id]) in bm25_deletes

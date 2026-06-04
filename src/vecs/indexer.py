@@ -666,6 +666,73 @@ def _sweep_excluded_chunks(
     return len(orphan_ids)
 
 
+def _sweep_out_of_scope_docs(
+    collection: chromadb.Collection,
+    stale_file_paths: set[str],
+    root_map: dict[str, Path],
+) -> list[str]:
+    """Delete `-docs` chunks whose qualified `file_path` is in `stale_file_paths`.
+
+    These are chunks present under a still-VALID source root but whose source
+    file is no longer an in-scope `_docs_sources` member — a newly-hidden dir
+    (`.claude/…`) or a newly-excluded subdir. `_partition_docs_by_root` keeps them
+    (root is valid, not an orphan) and the Inc 1.5a deleted-source sweep keeps
+    them (file still on disk), so without this they would linger forever. The
+    caller computes `present_file_paths - in_scope_qualified`.
+
+    Deletes ONLY a chunk whose source file STILL EXISTS on disk under a known,
+    on-disk `root_map` root (present-but-out-of-scope is unambiguously stale). A
+    candidate whose root basename is absent from `root_map` (root not on disk
+    this scan, or non-unique basename) or whose file no longer exists is KEPT —
+    a transiently-missing root must never wipe its live chunks (mirrors
+    `_safe_sweep_root_map` + `_sweep_deleted_source_chunks`), and a genuinely
+    deleted file is the Inc 1.5a deleted-source sweep's job. Metadata-only scan;
+    returns deleted ids for the BM25 mirror. Failures logged + swallowed.
+    """
+    if not stale_file_paths or not root_map:
+        return []
+
+    # Stat each distinct candidate file at most once. True = "present under a
+    # known root -> out of scope, delete"; False = "missing root / gone / unstattable
+    # -> keep (an orphan is safer than deleting a transiently-absent root's data)".
+    present: dict[str, bool] = {}
+
+    def _present_under_known_root(fp: str) -> bool:
+        if fp in present:
+            return present[fp]
+        if "/" not in fp:
+            present[fp] = False
+            return False
+        root_name, rel = fp.split("/", 1)
+        root = root_map.get(root_name)
+        if root is None:
+            present[fp] = False  # root absent this scan -> keep, never wipe
+        else:
+            try:
+                present[fp] = (root / rel).exists()
+            except OSError:
+                present[fp] = False  # unstattable -> keep (never delete live data)
+        return present[fp]
+
+    ids: list[str] = []
+    try:
+        for page in _paginated_get(collection, include=["metadatas"]):
+            for cid, meta in zip(page["ids"], page["metadatas"]):
+                fp = (meta or {}).get("file_path")
+                if (
+                    isinstance(fp, str)
+                    and fp in stale_file_paths
+                    and _present_under_known_root(fp)
+                ):
+                    ids.append(cid)
+        if ids:
+            _paginated_delete(collection, ids)
+    except Exception as e:
+        _log(f"  Warning: out-of-scope -docs sweep failed: {e}")
+        return []
+    return ids
+
+
 def _sweep_md_code_chunks(collection: chromadb.Collection) -> list[str]:
     """Delete chunks whose source file is a `.md` from a `-code` collection.
 
@@ -877,9 +944,27 @@ def _index_collection(
     return len(succeeded_ids)
 
 
+def _under_hidden_dir(path: Path, root: Path) -> bool:
+    """True if `path` lives under a hidden DIRECTORY relative to `root` (any
+    parent path component starts with ``.``).
+
+    Hidden dirs (``.git``, ``.claude``, ``.github``, ``.agents``, caches, …) are
+    tooling/config/scaffolding — essentially never the code or docs a coding
+    agent should retrieve — so the scanners skip them everywhere. Only hidden
+    DIRECTORIES are excluded here; a hidden FILE is left to the extension filter.
+    Returns False when `path` is not under `root`.
+    """
+    try:
+        rel = path.relative_to(root)
+    except ValueError:
+        return False
+    return any(part.startswith(".") for part in rel.parts[:-1])
+
+
 def _scan_code_dir(code_dir: CodeDir, extensions: set[str]) -> list[Path]:
-    """Discover files under `code_dir` matching `extensions`, applying the
-    code_dir's include_dirs / exclude_dirs filters (exclude wins on overlap).
+    """Discover files under `code_dir` matching `extensions`, skipping hidden
+    dirs and applying the code_dir's include_dirs / exclude_dirs filters (exclude
+    wins on overlap).
 
     Extracted so `index_code` and `index_docs` scope a code_dir scan identically:
     F routes in-repo `.md` to the -docs collection using the SAME include/exclude
@@ -900,6 +985,9 @@ def _scan_code_dir(code_dir: CodeDir, extensions: set[str]) -> list[Path]:
             f for f in code_dir.path.rglob("*")
             if f.suffix in extensions and f.is_file()
         ]
+
+    # Skip hidden dirs (.git/.claude/.github/.agents/caches/…): tooling, not code/docs.
+    files = [f for f in files if not _under_hidden_dir(f, code_dir.path)]
 
     # exclude_dirs: drop files whose path is under any excluded subdir.
     if code_dir.exclude_dirs:
@@ -1145,7 +1233,11 @@ def _docs_sources(project: ProjectConfig) -> list[tuple[Path, Path]]:
         if not d.exists():
             continue
         for f in d.rglob("*"):
-            if f.suffix in DOC_EXTENSIONS and f.is_file():
+            if (
+                f.suffix in DOC_EXTENSIONS
+                and f.is_file()
+                and not _under_hidden_dir(f, d)
+            ):
                 _add(d, f)
 
     for code_dir in project.code_dirs:
@@ -1166,12 +1258,18 @@ def _owning_doc_root(project: ProjectConfig, file_path: Path) -> Path | None:
     chunk id and double-store the file. Returns None if the file is under no
     configured root.
 
-    Deliberately does NOT honor a code_dir's `exclude_dirs` (unlike `_docs_sources`
-    via `_scan_code_dir`): add-document is an EXPLICIT per-file user opt-in, so a
-    `.md` under an excluded subdir is still indexed when added by hand. The only
-    divergence this creates is benign: a later full reindex won't re-scan that
-    file (it's out of scan scope), but the orphan sweeps keep its chunk (valid
-    root prefix, file present on disk) -- no loss, no re-embed thrash, ids agree.
+    Deliberately does NOT honor a code_dir's `exclude_dirs` / hidden-dir skip
+    (unlike `_docs_sources` via `_scan_code_dir`): add-document is an EXPLICIT
+    per-file user opt-in, so a `.md` under an excluded or hidden (`.`-prefixed)
+    subdir is still indexed when added by hand, with an id that AGREES with what
+    a full reindex would produce.
+
+    Caveat (changed by the out-of-scope sweep): such a hand-added out-of-scope
+    file is TEMPORARY. A later full `index_docs` of that `-docs` collection won't
+    re-scan it (out of scan scope) AND `_sweep_out_of_scope_docs` reclaims it
+    (present on disk under a valid root, but not an in-scope `_docs_sources`
+    member) -- so it survives only until the next full reindex of its project.
+    Re-add it afterwards if it must persist.
     """
     for root in [*project.docs_dirs, *(cd.path for cd in project.code_dirs)]:
         try:
@@ -1215,6 +1313,30 @@ def index_docs(
     sources = _docs_sources(project)
     if not sources:
         return 0
+
+    # Sweep chunks now OUT OF SCOPE under a still-valid root: a source file that
+    # left _docs_sources (newly-hidden dir, newly-excluded subdir) but whose root
+    # is unchanged is NOT an orphan (_partition_docs_by_root keeps it) and NOT a
+    # deleted source (1.5a keeps it -- file still on disk). present_file_paths
+    # (valid-root chunks) minus the in-scope qualified set = exactly those stale
+    # chunks. Guarded by the non-empty `sources` check above, so an empty scope
+    # can never wipe the collection.
+    in_scope_qualified = {f"{root.name}/{f.relative_to(root)}" for root, f in sources}
+    stale_paths = present_paths - in_scope_qualified
+    if stale_paths:
+        # Only sweep candidates whose root is on disk THIS scan with a unique
+        # basename (same guard as the 1.5a deleted-source sweep): a transiently
+        # missing root degrades to "keep the chunk", never "wipe the root".
+        docs_root_map = _safe_sweep_root_map(
+            [*project.docs_dirs, *(cd.path for cd in project.code_dirs)]
+        )
+        stale_ids = _sweep_out_of_scope_docs(collection, stale_paths, docs_root_map)
+        if stale_ids:
+            _delete_ids_from_bm25(project.name, "docs", stale_ids)
+            _log(
+                f"[{project.name}] swept {len(stale_ids)} -docs chunks now out of "
+                f"scope under a valid root (hidden/excluded subdir)."
+            )
 
     # Migration self-heal: a source file whose qualified chunks are ABSENT from
     # the collection must be re-embedded even when its (shared, possibly

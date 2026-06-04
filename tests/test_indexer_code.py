@@ -635,3 +635,31 @@ def test_index_code_uses_embed_cache_end_to_end(tmp_path, monkeypatch):
     assert n2 >= 1                    # same chunks re-stored
     assert vo.embed.call_count == 0   # all served from cache -> wiring intact
     cache.close()
+
+
+# --- Inc: scanner skips hidden (dot) dirs everywhere (option-2) -----------
+
+def test_under_hidden_dir_detects_hidden_parent():
+    from vecs.indexer import _under_hidden_dir
+    root = Path("/r")
+    assert _under_hidden_dir(Path("/r/.claude/commands/x.md"), root) is True
+    assert _under_hidden_dir(Path("/r/src/.github/y.yml"), root) is True
+    assert _under_hidden_dir(Path("/r/src/app/z.py"), root) is False
+    # a hidden FILE (not under a hidden dir) is NOT excluded by this helper
+    assert _under_hidden_dir(Path("/r/src/.env"), root) is False
+    # F6: path not under root (relative_to raises ValueError) -> not hidden
+    assert _under_hidden_dir(Path("/other/.claude/x.md"), root) is False
+
+
+def test_scan_code_dir_skips_hidden_dirs(tmp_path):
+    from vecs.indexer import _scan_code_dir
+    root = tmp_path / "repo"
+    (root / "src").mkdir(parents=True)
+    (root / ".claude" / "commands").mkdir(parents=True)
+    (root / ".github").mkdir(parents=True)
+    (root / "src" / "keep.py").write_text("x=1")
+    (root / ".claude" / "commands" / "drop.py").write_text("x=2")
+    (root / ".github" / "drop2.py").write_text("x=3")
+    cd = CodeDir(path=root, extensions={".py"})
+    found = {f.name for f in _scan_code_dir(cd, {".py"})}
+    assert found == {"keep.py"}
