@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import chromadb
 import voyageai
+from chromadb.config import Settings
 
 from vecs.config import CHROMADB_DIR
 
@@ -22,5 +23,8 @@ def get_chromadb_client() -> chromadb.ClientAPI:
     global _db_client
     if _db_client is None:
         CHROMADB_DIR.mkdir(parents=True, exist_ok=True)
-        _db_client = chromadb.PersistentClient(path=str(CHROMADB_DIR))
+        _db_client = chromadb.PersistentClient(
+            path=str(CHROMADB_DIR),
+            settings=Settings(anonymized_telemetry=False),
+        )
     return _db_client

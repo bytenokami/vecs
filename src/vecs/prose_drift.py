@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import chromadb
+from chromadb.config import Settings
 
 from vecs.clients import get_voyage_client
 from vecs.config import CHROMADB_DIR, FACTS_MODEL
@@ -360,14 +361,18 @@ def _ensure_doc_facts_row(conn, source_relpath: str, sha256: str, triples_json: 
 def _get_prose_facts_collection(project: str):
     path = _chroma_path()
     path.mkdir(parents=True, exist_ok=True)
-    client = chromadb.PersistentClient(path=str(path))
+    client = chromadb.PersistentClient(
+        path=str(path), settings=Settings(anonymized_telemetry=False)
+    )
     return client.get_or_create_collection(name=f"{project}-prose-facts")
 
 
 def _get_docs_collection(project: str):
     path = _chroma_path()
     path.mkdir(parents=True, exist_ok=True)
-    client = chromadb.PersistentClient(path=str(path))
+    client = chromadb.PersistentClient(
+        path=str(path), settings=Settings(anonymized_telemetry=False)
+    )
     return client.get_or_create_collection(name=f"{project}-docs")
 
 
