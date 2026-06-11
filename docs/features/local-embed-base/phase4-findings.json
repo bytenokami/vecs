@@ -1,0 +1,127 @@
+{
+  "summary": "Phase-4 adversarial review of the local-embed-base branch diff",
+  "agentCount": 3,
+  "logs": [
+    "[stall] agent \"p4:deep-correctness\" stalled (no progress) after 629s — retrying (1/5)",
+    "[stall] agent \"p4:test-quality\" stalled (no progress) after 1360s — retrying (1/5)",
+    "[stall] agent \"p4:deep-correctness\" stalled (no progress) after 1086s — retrying (2/5)"
+  ],
+  "result": [
+    {
+      "lens": "deep-correctness",
+      "findings": [
+        {
+          "severity": "MED",
+          "where": "src/vecs/indexer.py:1647-1655 (with 1576-1577, 1635-1643)",
+          "problem": "_remodel_record advances the code marker unconditionally even when the model-mismatch clear matched ZERO files because the code_dir was transiently missing — producing a falsely 'current' marker over old-model vectors, permanently disarming the interlock with no re-embed ever happening.",
+          "evidence": "Walk-through with CODE_MODEL changed and code_dir unmounted for one run: _remodel_clear:1635 sees marker mismatch + _collection_count>0 (chroma store under ~/.vecs is independent of the source dir), but _code_sources:1576 does `if not code_dir.path.exists(): continue` → clears 0 manifest keys; index_code:1034 skips the missing dir; _remodel_record:1655 then runs `cache.set_collection_model(project.code_collection, CODE_MODEL)` unconditionally. Next run: marker == CODE_MODEL → no clear; manifest keys intact → needs_indexing False → old-model vectors are scored against new-model query embeddings silently, forever (the exact corruption the marker machinery exists to prevent). The docs twin of this hole pre-exists on master (_remodel_record always marked docs unconditionally); this diff replicates it to code.",
+          "fix": "Have _remodel_clear report whether a detected mismatch was actually actionable (sources enumerable / keys cleared), and have run_index skip _remodel_record's marker advance for a collection whose mismatch-clear was skipped due to empty source enumeration while the collection is non-empty. Fix docs the same way while there."
+        },
+        {
+          "severity": "MED",
+          "where": "src/vecs/searcher.py:166, src/vecs/prose_drift.py:520, src/vecs/embed_provider.py:147-160",
+          "problem": "get_provider() constructs a FRESH provider per operation, but QwenLocalProvider caches loaded SentenceTransformer models per-instance (self._models). Under embed_provider=qwen-local, every search() call and every _embed_fact cache-miss reloads the multi-GB model from disk — multi-second-to-minute latency per MCP query in the long-lived server process. Zero impact at merge (voyage default), guaranteed hit at the L3 personal-mac soak: the seam's stated purpose ('swap is a config flip') breaks operationally on the search path.",
+          "evidence": "searcher.search():166 calls get_provider(config) per invocation; prose_drift._embed_fact:520 calls get_provider() per fact; embed_provider.get_provider:160 returns `QwenLocalProvider()` (new instance, empty self._models / _dim_checked) every time. VoyageProvider hides this because it delegates to the get_voyage_client() module singleton; QwenLocalProvider has no equivalent singleton.",
+          "fix": "Memoize the provider in get_provider (module-level cache keyed by provider name, mirroring clients.py's singleton pattern), or at minimum make QwenLocalProvider's model dict a module-level cache. Cheap to do now; invisible to current tests."
+        },
+        {
+          "severity": "MED",
+          "where": "src/vecs/embed_provider.py:6-7, 91-96; src/vecs/config.py:15-25; src/vecs/searcher.py:177,183",
+          "problem": "The module docstring promises 'an embedding-model swap is a config flip + reindex, not a code change', and design.md L3 flip mechanics say 'set embed_provider + model ids in that machine's config.yaml' — but model ids (CODE_MODEL/DOCS_MODEL/FACTS_MODEL) remain config.py constants with no config.yaml override. Flipping `embed_provider: qwen-local` alone (the only config lever shipped) makes every search and reindex crash: searcher builds targets with the voyage constants, and QwenLocalProvider._get_model raises ValueError for 'voyage-code-3'.",
+          "evidence": "searcher.py:177/183 pass CODE_MODEL/DOCS_MODEL into targets regardless of provider; embed_provider.py:91-96 raises `Unknown qwen-local model id 'voyage-code-3'` for any voyage id; nothing in load_config models a model-id override. So the documented per-machine flip is actually config-flip + NEW RELEASE with edited constants, and a config-only flip is a hard outage (loud, not silent — but the runbook as designed is not executable against this implementation).",
+          "fix": "Either (a) correct the docstring/design to 'config flip + constants release + reindex' and add a guard in get_provider/search that fails with an actionable message when embed_provider=qwen-local while CODE_MODEL/DOCS_MODEL are voyage ids, or (b) make the model ids config-resolvable (the design's literal wording). (a) is the cheap L1-scoped fix."
+        },
+        {
+          "severity": "MED",
+          "where": "src/vecs/indexer.py:1630-1634",
+          "problem": "The no-regret backfill stamps an unmarked non-empty code collection with the CURRENTLY CONFIGURED CODE_MODEL, assuming the store 'predates code markers and is current'. If a machine jumps from a pre-L1 build directly to a future flip build (CODE_MODEL=qwen id) with no reindex in between, the first reindex backfills the qwen id onto voyage-code-3 vectors: no clear, no re-embed, interlock disarmed — permanent silent cross-space scoring for the entire code collection.",
+          "evidence": "indexer.py:1631-1633: `if code_marker is None: if _collection_count(...) > 0: cache.set_collection_model(project.code_collection, CODE_MODEL)` — CODE_MODEL is whatever the running build configures, not what the vectors were embedded under. Matches design.md L1.4's stated assumption, so not a spec violation — but the assumption's precondition (at least one reindex under a voyage-constants L1 build before any model-id change) is enforced nowhere and is absent from the flip mechanics. Work mac is covered by the daily launchd reindex; the personal mac has cron OFF (manual reindexes only), and it is scheduled to flip FIRST.",
+          "fix": "Add the precondition to the L3 flip runbook and acceptance ('verify code markers exist via collection_models before installing a flip build'), and/or log a loud warning when backfilling a collection whose configured model is a qwen id (a qwen-configured build backfilling an unmarked store is exactly the suspicious case)."
+        },
+        {
+          "severity": "LOW",
+          "where": "src/vecs/searcher.py:165-166, src/vecs/indexer.py:1744",
+          "problem": "Voyage client construction is now lazy (first embed) instead of eager (operation entry), changing behavior when VOYAGE_API_KEY is missing: search() can now succeed BM25-only or via the query TTL-cache where master raised AuthenticationError at entry, and run_index now executes manifest clears, .md sweeps and orphan sweeps before failing at the first embed (master died at `vo = get_voyage_client()` before touching anything).",
+          "evidence": "master searcher.py called get_voyage_client() first line of search(); voyageai.util.default_api_key raises AuthenticationError at Client() construction when no key is present (verified against the installed package). New VoyageProvider.embed (embed_provider.py:61-67) defers get_voyage_client() to the first actual embed call. All deletions that now run keyless are correctness-preserving (orphan/md sweeps) and manifest clears converge, so this is a diagnostics/ordering change, not data loss.",
+          "fix": "Accept (arguably an improvement), or have get_provider('voyage') eagerly resolve the client to preserve fail-fast. Worth one line in the retro either way."
+        }
+      ],
+      "verdict": "fix-then-ship: voyage-path behavior is provably unchanged at merge (retry/calibration/cache/manifest/search pipeline all bit-identical, 422 green), but fix the per-call Qwen provider instancing and the marker-advance-without-re-embed hole before L2 builds on this base, and document the backfill/flip preconditions."
+    },
+    {
+      "lens": "test-quality",
+      "findings": [
+        {
+          "severity": "MED",
+          "where": "tests/test_indexer_run.py:373",
+          "problem": "No-clear backfill (code collection, L1.4) is unpinned on the run_index INTEGRATION path. The only test of the backfill logic is the unit test `test_remodel_docs_clear_backfills_unmarked_code_without_clearing` which calls `_remodel_clear` directly. The integration test `test_run_index_remodel_migrates_docs_manifest_and_records_marker` goes through `run_index()` but (a) never seeds a code manifest entry, making the 'code not cleared' assertion trivially vacuous, and (b) never asserts that `cache.get_collection_model('p-code') == CODE_MODEL` after the run. A regression that changes the unmarked-code branch to skip the backfill write (e.g., rewrites it as `_model_changed(cache, db, project.code_collection, CODE_MODEL)` which would trigger a clear, not a backfill) would be caught by the unit test but NOT by any integration test.",
+          "evidence": "tests/test_indexer_run.py:373-432 seeds only `p-docs` in the manifest (line 413-416), never adds a code file, then only checks `str(doc_f) not in reloaded.data` and `cache.get_collection_model('p-docs') == 'voyage-4'`. No assertion on `cache.get_collection_model('p-code')` or on code manifest entries. indexer.py:1630-1634 is the backfill branch.",
+          "fix": "Add assertions in the existing integration test (or a new one): after `run_index()` with an unmarked non-empty code collection and a stale docs marker, assert both `cache.get_collection_model('p-code') == CODE_MODEL` (backfill fired) AND that a seeded code manifest entry is still present (no clear). This would pin the run_index orchestration wiring, not just the _remodel_clear logic."
+        },
+        {
+          "severity": "MED",
+          "where": "tests/test_embed_provider.py:56-127",
+          "problem": "The QwenLocalProvider lazy-import error path is untested. The acceptance checklist at `docs/features/local-embed-base/acceptance.md:10` marks `lazy import with actionable error` as complete, but no test function pins that selecting `qwen-local` without the `vecs[local]` extra raises `RuntimeError` with the actionable install message. A refactor that accidentally removes the `try/except ImportError` around `from sentence_transformers import SentenceTransformer` (e.g., moves the import to module level) would break the user-facing error message and no test would catch it.",
+          "evidence": "grep across all test files: zero tests contain 'RuntimeError', 'sentence.transform.*import', or 'uv.*local'. The check in `embed_provider.py:129-136` is entirely uncovered by tests. All Qwen tests inject a `model_loader` fake, bypassing the real import path.",
+          "fix": "Add a test that monkeypatches `sentence_transformers` import to fail (e.g., `sys.modules['sentence_transformers'] = None`) and verifies `_load_sentence_transformer('qwen3-embedding-0.6b')` raises `RuntimeError` containing `'vecs[local]'`."
+        },
+        {
+          "severity": "MED",
+          "where": "tests/test_indexer_embed.py:231-265",
+          "problem": "`test_embed_and_store_treats_voyage_timeout_as_transient` no longer tests what its docstring says. The original docstring says 'Regression: substring check `\"TimeoutError\" in \"Timeout\"` is False'. That string-based check was replaced by `isinstance(e, provider.retryable_errors)` in the provider seam refactor. The test now pins that `voyageai.error.Timeout` is in `VoyageProvider.retryable_errors` — still a valid and meaningful assertion — but the doc comment misleads a future reader into thinking the string path is what's being tested. The test name and docstring are now inaccurate relative to the production code path being exercised.",
+          "evidence": "indexer.py:454-459: `isinstance(e, provider.retryable_errors)` is checked first; the `'rate' in error_msg and 'limit' in error_msg` string path is only reached when isinstance returns False. The test raises `voyageai.error.Timeout`, which IS in `VoyageProvider.retryable_errors`, so it exercises the isinstance path, not the string path the docstring references.",
+          "fix": "Update the test docstring and name to reflect what it now tests: that `voyageai.error.Timeout` is classified as transient via `VoyageProvider.retryable_errors` (the isinstance path). Optionally, add a separate test that pins the string-based fallback path with a provider that has empty `retryable_errors` (simulating QwenLocalProvider context) and a message containing 'rate limit'."
+        },
+        {
+          "severity": "LOW",
+          "where": "tests/test_eval_harness.py:278-325",
+          "problem": "No test pins the edge cases for `run_arm` and `ab_report`: (a) empty eval set, (b) arms of length 0 passed to `_summarize_arms`. The behavior is graceful (no crash, `delta=None`, `n=0`) but is untested, so a refactor that adds a division or subscript on empty arrays would not be caught. The `by_class` part of `ab_report` with zero per-class cases is also untested.",
+          "evidence": "tests/test_eval_harness.py: no test calls `run_arm([], ...)` or `ab_report([], [])`. `_summarize_arms` at eval_harness.py:401 has `if a else None` guards that are never exercised by a test. Verified empirically: `ab_report([], [])` returns gracefully with `delta=None, n=0`.",
+          "fix": "Add parametrized edge-case tests: `run_arm` with empty eval set returns `[]`; `ab_report([], [])` returns a dict with `delta=None` and `n=0` for all metrics; `ab_report` with a two-class eval set correctly produces two `by_class` entries."
+        },
+        {
+          "severity": "LOW",
+          "where": "src/vecs/searcher.py:28-35",
+          "problem": "The `_cached_embed` cache key `(query, model)` does not include the provider. If two providers in the same process happen to use the same model-id string (e.g., a custom provider registered under 'voyage-4'), the first provider's embedding would be served from cache for the second provider's call. In the current codebase this cannot happen: Voyage model ids ('voyage-4', 'voyage-code-3') are disjoint from Qwen model ids ('qwen3-embedding-*'), so there is no practical collision. But there is no test that pins this segregation invariant explicitly.",
+          "evidence": "searcher.py:30: `key = (query, model)`. Verified empirically: calling `_cached_embed(voyage, 'hello', 'same-model')` followed by `_cached_embed(fake_provider, 'hello', 'same-model')` returns the voyage result for the second call. In practice, providers use distinct model id namespaces (confirmed by EMBED_DIMS in config.py:35-45).",
+          "fix": "Add a test that asserts `_cached_embed` with different providers but the same model string returns different embeddings (proving the cache is keyed on model string and that production providers always use distinct model id strings). Alternatively, note the implicit assumption in a comment on `_cached_embed`."
+        }
+      ],
+      "verdict": "fix-then-ship"
+    },
+    {
+      "lens": "docs-consistency",
+      "verdict": "fix-then-ship",
+      "findings": [
+        {
+          "severity": "MED",
+          "where": "src/vecs/CLAUDE.md:47",
+          "problem": "Interlock invariant bullet attributes the model-flip check to `search()` — but since the `search_collections()` extraction, the interlock lives in `search_collections()` at `searcher.py:231`. An implementer following CLAUDE.md to locate or extend the interlock will look in the wrong function.",
+          "evidence": "CLAUDE.md:47 says 'before scoring, `search()` reads every target collection's recorded marker'; `searcher.py:149-198` shows `search()` is now a thin wrapper that calls `search_collections()` without any marker logic; the interlock block is at `searcher.py:223-246` inside `search_collections()`.",
+          "fix": "In the interlock bullet, replace 'before scoring, `search()` reads...' with 'before scoring, `search_collections()` reads...' (called by `search()` with production values). Also add a mention of `search_collections()` as the parameterized A/B entry point in the `searcher.py` module table row."
+        },
+        {
+          "severity": "MED",
+          "where": "src/vecs/searcher.py:47",
+          "problem": "`_collection_markers` docstring says 'code collections (never marked; only the docs re-embed path records one)'. Since L1.4, `_remodel_record` marks BOTH code and docs collections, so post-backfill code collections DO have markers. The old text is now wrong and will mislead anyone debugging the interlock for code collections.",
+          "evidence": "`searcher.py:47-48` still says 'e.g. code collections (never marked; only the docs re-embed path records one)'; `indexer.py:894-895` in `_remodel_record` now calls `cache.set_collection_model(project.code_collection, CODE_MODEL)` unconditionally.",
+          "fix": "Update `_collection_markers` docstring to: 'None means no marker — a pre-backfill store or a cache-read error. After a post-L1.4 reindex, code collections are marked too (`_remodel_record` records both). Fail-open for None: interlock cannot assert mismatch, vector scoring proceeds.'"
+        },
+        {
+          "severity": "MED",
+          "where": "src/vecs/CLAUDE.md:28",
+          "problem": "`eval_harness.py` module table row still describes the module as 'a small eval-set scaffold/runner stub. Read-only.' — it does not mention `load_eval_set`, `run_arm`, `ab_report`, `recall_at_k`, `ndcg_at_k`, `mrr`, or `paired_bootstrap_ci`, which are the primary deliverables of this branch. Design.md Phase 2 explicitly requires CLAUDE.md to be updated for 'eval_harness.py (golden-set A/B runner + parameterized pipeline)'.",
+          "evidence": "CLAUDE.md:28 reads '| `eval_harness.py` | Inc 1-E measurement seed: ... + a small eval-set scaffold/runner stub. Read-only. |'; `eval_harness.py:288-430` adds `load_eval_set`, `recall_at_k`, `ndcg_at_k`, `mrr`, `run_arm`, `ab_report`, `paired_bootstrap_ci`; design.md:127 lists `eval_harness.py (golden-set A/B runner + parameterized pipeline)` as a required CLAUDE.md update.",
+          "fix": "Extend the eval_harness.py row: 'Inc 1-E stale-retrieval-rate + L1.1 golden-set A/B runner: `load_eval_set` (YAML), `recall_at_k`/`ndcg_at_k`/`mrr`, `run_arm`, `ab_report` (aggregate-only, safe to export), `paired_bootstrap_ci`.'"
+        },
+        {
+          "severity": "LOW",
+          "where": "evalsets/README.md:30",
+          "problem": "The freeze changelog entry says 'frozen pre-A/B' without recording the specific commit SHA. Design.md §L1.1 requires 'frozen at a **recorded commit** before any L2 run' — an operator running L2 cannot verify the eval set was frozen at the expected revision without a SHA.",
+          "evidence": "design.md:56 says 'golden file **frozen at a recorded commit before any L2 run** — later edits require a changelog entry'; README.md:30 records only '2026-06-11: vecs.yaml authored (46 cases) per protocol; frozen pre-A/B' with no commit hash.",
+          "fix": "Append the branch tip commit SHA to the changelog line, e.g. '2026-06-11: vecs.yaml authored (46 cases) per protocol; frozen at <sha> pre-A/B'. The SHA to use is whatever commit contains the evalsets/vecs.yaml addition."
+        }
+      ]
+    }
+  ]
+}
