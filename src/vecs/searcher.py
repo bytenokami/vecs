@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 from cachetools import TTLCache
 
@@ -161,7 +162,6 @@ def search(
         path_filter: Filter results to paths containing this substring.
         project: Search a specific project (default: all).
     """
-    db = get_chromadb_client()
     config = load_config()
     provider = get_provider(config)
 
@@ -182,6 +182,44 @@ def search(
             # collections permanently unsearched.
             targets.append((proj.docs_collection, DOCS_MODEL, proj_name))
 
+    bm25_dir = VECS_DIR / "bm25"
+    bm25_paths: dict[str, Path] = {}
+    for col_name, _model, proj_name in targets:
+        suffix = "code" if col_name.endswith("-code") else "docs"
+        bm25_paths[col_name] = bm25_dir / f"{proj_name}_{suffix}.db"
+
+    return search_collections(
+        query,
+        targets,
+        provider=provider,
+        n_results=n_results,
+        path_filter=path_filter,
+        bm25_paths=bm25_paths,
+    )
+
+
+def search_collections(
+    query: str,
+    targets: list[tuple[str, str, str]],  # (collection_name, model, project_name)
+    *,
+    provider,
+    n_results: int = 5,
+    path_filter: str | None = None,
+    bm25_paths: dict[str, Path] | None = None,  # collection_name -> bm25 .db path
+    check_markers: bool = True,
+) -> list[dict]:
+    """The full hybrid pipeline (interlock -> vector -> BM25 -> RRF -> dedup ->
+    fetch-multiplier escalation) over EXPLICIT targets.
+
+    `search()` wraps this with config-derived production values; the A/B
+    harness calls it with arm values (shadow collections, a non-default
+    provider/model, per-arm BM25 paths) — ONE code path, so the A/B's
+    'hybrid (production config)' arm is the production pipeline by
+    construction (design.md L1.1). `check_markers=False` skips the model-flip
+    interlock for shadow collections the harness manages itself.
+    """
+    db = get_chromadb_client()
+
     # 1.5c model-flip interlock: drop from the VECTOR path any target whose
     # recorded embed model differs from the configured model — its stored
     # vectors live in a different space, so scoring new-model query vectors
@@ -190,19 +228,22 @@ def search(
     # re-embeds it. A None marker (unknown) is fail-open: the vector path keeps
     # it. Markers read ONCE here (one cache open), not per fetch-multiplier retry
     # and not per target.
-    vector_targets = []
-    markers = _collection_markers([t[0] for t in targets])
-    for tgt in targets:
-        col_name, model, _ = tgt
-        marker = markers.get(col_name)
-        if marker is not None and marker != model:
-            _warn(
-                f"model-flip interlock: '{col_name}' embedded under {marker!r} "
-                f"but configured model is {model!r}; skipping vector scoring, "
-                f"BM25-only for this collection until reindex"
-            )
-            continue
-        vector_targets.append(tgt)
+    if check_markers:
+        vector_targets = []
+        markers = _collection_markers([t[0] for t in targets])
+        for tgt in targets:
+            col_name, model, _ = tgt
+            marker = markers.get(col_name)
+            if marker is not None and marker != model:
+                _warn(
+                    f"model-flip interlock: '{col_name}' embedded under {marker!r} "
+                    f"but configured model is {model!r}; skipping vector scoring, "
+                    f"BM25-only for this collection until reindex"
+                )
+                continue
+            vector_targets.append(tgt)
+    else:
+        vector_targets = list(targets)
 
     # Fetch with escalating multiplier: try 2x first, then 3x if dedup eats too many
     for fetch_multiplier in (2, 3):
@@ -243,10 +284,10 @@ def search(
 
         # BM25 keyword search (cached, graceful degradation on failure)
         bm25_results = []
-        bm25_dir = VECS_DIR / "bm25"
         for col_name, model, proj_name in targets:
-            suffix = "code" if col_name.endswith("-code") else "docs"
-            bm25_path = bm25_dir / f"{proj_name}_{suffix}.db"
+            bm25_path = (bm25_paths or {}).get(col_name)
+            if bm25_path is None:
+                continue
             bm25 = get_bm25(bm25_path)
             if bm25 is not None:
                 hits = bm25.search(query, n=fetch_n, path_filter=path_filter)

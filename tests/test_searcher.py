@@ -485,3 +485,41 @@ def test_model_flip_interlock_drops_mismatched_code_collection(monkeypatch):
 
     assert "bloomly-code" not in vector_queried  # mismatched marker -> dropped
     assert "bloomly-docs" in vector_queried      # None marker -> fail-open, kept
+
+
+def test_search_collections_accepts_explicit_targets_and_bm25_paths(tmp_path, monkeypatch):
+    """The A/B harness entry point: same pipeline as search(), but targets,
+    provider and bm25 paths are injected instead of derived from config."""
+    from unittest.mock import MagicMock
+    from vecs.embed_provider import VoyageProvider
+    from vecs.searcher import search_collections, _clear_caches
+
+    _clear_caches()
+    vo = MagicMock()
+    emb_result = MagicMock()
+    emb_result.embeddings = [[0.3] * 4]
+    vo.embed.return_value = emb_result
+    provider = VoyageProvider(client=vo)
+
+    collection = MagicMock()
+    collection.query.return_value = {
+        "ids": [["c1"]],
+        "documents": [["hello world"]],
+        "metadatas": [[{"file_path": "src/x.py"}]],
+        "distances": [[0.1]],
+    }
+    db = MagicMock()
+    db.get_collection.return_value = collection
+    monkeypatch.setattr("vecs.searcher.get_chromadb_client", lambda: db)
+
+    out = search_collections(
+        "q",
+        targets=[("shadow-code-qwen", "qwen3-embedding-0.6b", "vecs")],
+        provider=provider,
+        n_results=3,
+        bm25_paths={"shadow-code-qwen": tmp_path / "absent.db"},
+        check_markers=False,
+    )
+    assert out and out[0]["id"] == "c1"
+    assert out[0]["collection"] == "shadow-code-qwen"
+    assert vo.embed.call_args.kwargs["model"] == "qwen3-embedding-0.6b"
