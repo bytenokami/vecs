@@ -1609,50 +1609,99 @@ def _remodel_clear(
     semantics here would mass re-embed the whole live code store on the first
     post-merge reindex). New markers are written AFTER the index passes by
     `_remodel_record`.
+
+    BLOCKED clears (Phase-4 finding): a detected mismatch whose sources are
+    unenumerable THIS run (a source dir transiently missing, or the enumerator
+    returned nothing while the collection is non-empty) sets `docs_blocked` /
+    `code_blocked` — `_remodel_record` must then NOT advance that collection's
+    marker, else old-model vectors get a falsely 'current' marker, the
+    interlock disarms, and no re-embed ever happens. Next run with sources
+    present re-detects the mismatch and converges.
     """
-    cleared = {"docs": 0, "code": 0}
+    cleared = {"docs": 0, "code": 0, "docs_blocked": False, "code_blocked": False}
     if _model_changed(cache, db, project.docs_collection, DOCS_MODEL):
-        manifest = Manifest(project.name)
         # Clear ONLY the files index_docs will actually re-scan, so we never
         # invalidate a key the indexer won't re-embed (which would strand that
         # file's old-model vectors after the marker advances). F: index_docs
         # scans ALL docs_dirs ∪ in-repo .md under code_dirs (`_docs_sources`);
         # clear and re-embed share that one enumerator, so they cannot drift.
         docs_files = [f for _root, f in _docs_sources(project)]
-        cleared["docs"] = _clear_docs_manifest_entries(manifest, docs_files)
-        if cleared["docs"]:
-            manifest.save()
+        docs_roots_missing = any(not d.exists() for d in project.docs_dirs)
+        if not docs_files or docs_roots_missing:
+            cleared["docs_blocked"] = True
             _log(
-                f"[{project.name}] Embedding-model change: cleared "
-                f"{cleared['docs']} docs manifest entries to force a re-embed."
+                f"[{project.name}] docs model mismatch but sources are "
+                f"unenumerable this run (missing root or empty scan); marker "
+                f"NOT advanced — will retry next run."
             )
+        else:
+            manifest = Manifest(project.name)
+            cleared["docs"] = _clear_docs_manifest_entries(manifest, docs_files)
+            if cleared["docs"]:
+                manifest.save()
+                _log(
+                    f"[{project.name}] Embedding-model change: cleared "
+                    f"{cleared['docs']} docs manifest entries to force a re-embed."
+                )
 
     code_marker = cache.get_collection_model(project.code_collection)
     if code_marker is None:
         if _collection_count(db, project.code_collection) > 0:
             cache.set_collection_model(project.code_collection, CODE_MODEL)
-            _log(f"[{project.name}] backfilled code model marker = {CODE_MODEL}")
+            msg = f"[{project.name}] backfilled code model marker = {CODE_MODEL}"
+            if not CODE_MODEL.startswith("voyage"):
+                # A non-voyage build backfilling an unmarked store is the
+                # suspicious case: the L1.4 backfill assumes the store was
+                # embedded under the era's voyage constants (design.md L1.4
+                # precondition — at least one reindex under a voyage-constants
+                # L1 build before any model-id change).
+                msg += (
+                    " -- WARNING: non-voyage model id stamped onto an unmarked "
+                    "store; verify these vectors were really embedded under "
+                    "this model, else delete the marker and reindex."
+                )
+            _log(msg)
     elif code_marker != CODE_MODEL and _collection_count(db, project.code_collection) > 0:
-        manifest = Manifest(project.name)
-        cleared["code"] = _clear_code_manifest_entries(manifest, _code_sources(project))
-        if cleared["code"]:
-            manifest.save()
+        code_files = _code_sources(project)
+        code_roots_missing = any(
+            not cd.path.exists() for cd in project.code_dirs
+        )
+        if not code_files or code_roots_missing:
+            cleared["code_blocked"] = True
             _log(
-                f"[{project.name}] Code embedding-model change: cleared "
-                f"{cleared['code']} code manifest entries to force a re-embed."
+                f"[{project.name}] code model mismatch but sources are "
+                f"unenumerable this run (missing root or empty scan); marker "
+                f"NOT advanced — will retry next run."
             )
+        else:
+            manifest = Manifest(project.name)
+            cleared["code"] = _clear_code_manifest_entries(manifest, code_files)
+            if cleared["code"]:
+                manifest.save()
+                _log(
+                    f"[{project.name}] Code embedding-model change: cleared "
+                    f"{cleared['code']} code manifest entries to force a re-embed."
+                )
     return cleared
 
 
-def _remodel_record(project: ProjectConfig, cache: EmbedCache) -> None:
+def _remodel_record(
+    project: ProjectConfig, cache: EmbedCache, blocked: dict | None = None
+) -> None:
     """run_index POST-pass: record what docs AND code are now embedded under.
 
-    Set unconditionally per project so the next run reads marker == configured
-    model and the pre-pass is a no-op. Code markers (new in L1.4) arm the
-    searcher's model-flip interlock for code collections.
+    Set per project so the next run reads marker == configured model and the
+    pre-pass is a no-op. Code markers (new in L1.4) arm the searcher's
+    model-flip interlock for code collections. A collection whose mismatch-clear
+    was BLOCKED this run (see `_remodel_clear`) keeps its old marker — advancing
+    it without the re-embed would permanently disarm the interlock over
+    old-model vectors.
     """
-    cache.set_collection_model(project.docs_collection, DOCS_MODEL)
-    cache.set_collection_model(project.code_collection, CODE_MODEL)
+    blocked = blocked or {}
+    if not blocked.get("docs_blocked"):
+        cache.set_collection_model(project.docs_collection, DOCS_MODEL)
+    if not blocked.get("code_blocked"):
+        cache.set_collection_model(project.code_collection, CODE_MODEL)
 
 
 def _prune_and_sweep_orphans(
@@ -1763,11 +1812,11 @@ def run_index(project_name: str | None = None) -> None:
             _log(f"Project: {name}")
             # B2 PRE-pass: detect a docs embedding-model change and clear the
             # affected manifest entries so index_docs re-embeds under the new model.
-            _remodel_clear(project, db, cache)
+            remodel = _remodel_clear(project, db, cache)
             total_code += index_code(project, provider, db, cache=cache)
             total_docs += index_docs(project, provider, db, cache=cache)
             # B2 POST-pass: record the model docs are now embedded under.
-            _remodel_record(project, cache)
+            _remodel_record(project, cache, blocked=remodel)
             _log(f"[{name}] project finished in {time.monotonic() - proj_start:.1f}s")
     finally:
         cache.close()

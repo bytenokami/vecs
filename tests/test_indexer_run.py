@@ -409,9 +409,13 @@ def test_run_index_remodel_migrates_docs_manifest_and_records_marker(tmp_path, m
     db.get_collection.return_value.count.return_value = 12
     monkeypatch.setattr("vecs.indexer.get_chromadb_client", lambda: db)
 
-    # Pre-seed: a docs manifest entry + the old marker (simulates pre-B2 state).
+    # Pre-seed: docs AND code manifest entries + the old docs marker (simulates
+    # a pre-B2/pre-L1.4 state: docs marked stale, code never marked).
+    code_f = tmp_path / "code" / "m.py"
+    code_f.write_text("print(1)")
     m = Manifest("p", manifests_dir=tmp_path / "manifests")
     m.mark_indexed(doc_f, "h")
+    m.mark_indexed(code_f, "hc")
     m.save()
     seed = EmbedCache(tmp_path / "embed_cache.db")
     seed.set_collection_model("p-docs", "voyage-3")
@@ -426,9 +430,14 @@ def test_run_index_remodel_migrates_docs_manifest_and_records_marker(tmp_path, m
 
     reloaded = Manifest("p", manifests_dir=tmp_path / "manifests")
     assert str(doc_f) not in reloaded.data, "pre-pass should clear the stale docs entry"
+    assert str(code_f) in reloaded.data, "unmarked code must be backfilled, NOT cleared"
 
     chk = EmbedCache(tmp_path / "embed_cache.db")
     assert chk.get_collection_model("p-docs") == "voyage-4", "post-pass should record new marker"
+    from vecs.config import CODE_MODEL
+    assert chk.get_collection_model("p-code") == CODE_MODEL, (
+        "run_index must backfill the unmarked non-empty code collection (L1.4)"
+    )
     chk.close()
 
 # --- Inc 1.5a: prune-orphan fix (delete chunks for deleted sources) ---------
@@ -780,3 +789,74 @@ def test_sweep_deleted_source_chunks_keeps_chunk_on_oserror(tmp_path, monkeypatc
 
     assert deleted == []
     assert "code:repo/x.cs:0" in col._rows
+
+
+def test_remodel_blocked_mismatch_does_not_advance_marker(tmp_path, monkeypatch):
+    """Phase-4 finding: a code-model mismatch whose source dir is transiently
+    missing must NOT advance the code marker — advancing it without the
+    re-embed would permanently disarm the interlock over old-model vectors."""
+    import shutil
+
+    from vecs.embed_cache import EmbedCache
+    from vecs.indexer import _remodel_clear, _remodel_record
+
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+    monkeypatch.setattr("vecs.indexer.DOCS_MODEL", "voyage-4")
+
+    project, doc_f, code_f = _remodel_fixture(tmp_path)
+    _seed_manifest_with_doc_code(tmp_path, doc_f, code_f)
+
+    cache = EmbedCache(tmp_path / "embed_cache.db")
+    cache.set_collection_model("p-docs", "voyage-4")        # docs current
+    cache.set_collection_model("p-code", "voyage-code-2")   # code stale
+
+    db = MagicMock()
+    db.get_collection.return_value.count.return_value = 5  # non-empty
+
+    shutil.rmtree(project.code_dirs[0].path)  # code root transiently missing
+
+    blocked = _remodel_clear(project, db, cache)
+    assert blocked["code_blocked"] is True
+    assert blocked["code"] == 0
+    # manifest untouched (the file's key survives for the retry run)
+    reloaded = Manifest("p", manifests_dir=tmp_path / "manifests")
+    assert str(code_f) in reloaded.data
+
+    _remodel_record(project, cache, blocked=blocked)
+    assert cache.get_collection_model("p-code") == "voyage-code-2"  # NOT advanced
+    assert cache.get_collection_model("p-docs") == "voyage-4"       # docs fine
+    cache.close()
+
+
+def test_remodel_blocked_docs_mismatch_does_not_advance_marker(tmp_path, monkeypatch):
+    """Docs twin of the blocked-clear pin: missing docs root + mismatch =>
+    docs marker stays, retried next run (this hole pre-existed on master)."""
+    import shutil
+
+    from vecs.embed_cache import EmbedCache
+    from vecs.indexer import _remodel_clear, _remodel_record
+
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+    monkeypatch.setattr("vecs.indexer.DOCS_MODEL", "voyage-4")
+
+    project, doc_f, code_f = _remodel_fixture(tmp_path)
+    _seed_manifest_with_doc_code(tmp_path, doc_f, code_f)
+
+    cache = EmbedCache(tmp_path / "embed_cache.db")
+    cache.set_collection_model("p-docs", "voyage-3")  # stale
+
+    db = MagicMock()
+    db.get_collection.return_value.count.return_value = 5
+
+    shutil.rmtree(project.docs_dirs[0])  # docs root transiently missing
+    # NOTE: in-repo .md under code_dirs could still enumerate; the fixture's
+    # code_dir holds only .py, so the docs scan is empty AND a root is missing.
+
+    blocked = _remodel_clear(project, db, cache)
+    assert blocked["docs_blocked"] is True
+    reloaded = Manifest("p", manifests_dir=tmp_path / "manifests")
+    assert str(doc_f) in reloaded.data  # key kept for the retry
+
+    _remodel_record(project, cache, blocked=blocked)
+    assert cache.get_collection_model("p-docs") == "voyage-3"  # NOT advanced
+    cache.close()

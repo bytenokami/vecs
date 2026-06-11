@@ -124,3 +124,53 @@ def test_qwen_loads_model_once_per_id():
     p.embed(["a"], model="qwen3-embedding-0.6b", input_type="document")
     p.embed(["b"], model="qwen3-embedding-0.6b", input_type="document")
     assert loads == ["qwen3-embedding-0.6b"]
+
+
+# ---- Phase-4 fixes: memoization, config-flip guard, lazy-import error -------
+
+
+def test_get_provider_memoizes_per_name(tmp_path):
+    from vecs.embed_provider import _clear_provider_cache
+
+    _clear_provider_cache()
+    cfg = VecsConfig(path=tmp_path / "c.yaml")
+    p1 = get_provider(cfg)
+    p2 = get_provider(cfg)
+    assert p1 is p2  # one instance per process; Qwen model cache survives calls
+    _clear_provider_cache()
+
+
+def test_config_flip_alone_to_qwen_is_guarded(tmp_path):
+    """embed_provider: qwen-local with voyage model constants must fail LOUD at
+    provider construction with the flip story, not crash on the first embed."""
+    from vecs.embed_provider import _clear_provider_cache
+
+    _clear_provider_cache()
+    cfg = VecsConfig(path=tmp_path / "c.yaml")
+    cfg.embed_provider = "qwen-local"
+    with pytest.raises(RuntimeError, match="voyage|design.md L3"):
+        get_provider(cfg)
+    _clear_provider_cache()
+
+
+def test_explicit_qwen_name_skips_config_guard():
+    """name= override (A/B arms, tests) legitimately runs qwen models while the
+    configured constants stay voyage — no guard."""
+    from vecs.embed_provider import QwenLocalProvider, _clear_provider_cache
+
+    _clear_provider_cache()
+    p = get_provider(name="qwen-local")
+    assert isinstance(p, QwenLocalProvider)
+    _clear_provider_cache()
+
+
+def test_qwen_loader_missing_extra_raises_actionable(monkeypatch):
+    """Selecting qwen-local without the vecs[local] extra raises RuntimeError
+    naming the install command (pins the lazy-import try/except)."""
+    import sys
+
+    from vecs.embed_provider import _load_sentence_transformer
+
+    monkeypatch.setitem(sys.modules, "sentence_transformers", None)
+    with pytest.raises(RuntimeError, match=r"vecs\[local\]"):
+        _load_sentence_transformer("qwen3-embedding-0.6b")

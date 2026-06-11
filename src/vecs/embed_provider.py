@@ -3,9 +3,12 @@
 One protocol, two implementations: VoyageProvider (hosted API, the default) and
 QwenLocalProvider (on-device sentence-transformers, behind the optional extra
 ``vecs[local]``). The three embed call sites (indexer, searcher, prose_drift)
-route through a provider, so an embedding-model swap is a config flip + reindex,
-not a code change. Model-id strings remain the embed-cache / collection-marker
-key, which keeps voyage and qwen vectors segregated by construction.
+route through a provider, so an embedding-model swap is a config flip + a
+model-constants release + reindex (no call-site changes): the model ids
+(CODE_MODEL/DOCS_MODEL/FACTS_MODEL) live in config.py, so flipping
+``embed_provider`` alone is guarded against (see ``get_provider``). Model-id
+strings remain the embed-cache / collection-marker key, which keeps voyage and
+qwen vectors segregated by construction.
 """
 
 from __future__ import annotations
@@ -131,7 +134,7 @@ def _load_sentence_transformer(model_id: str):
         from sentence_transformers import SentenceTransformer
     except ImportError as e:
         raise RuntimeError(
-            "embed_provider 'qwen-local' requires the optional local extra: "
+            "embed_provider 'qwen-local' requires the optional vecs[local] extra: "
             "uv tool install --editable '.[local]'  (or: uv sync --extra local)"
         ) from e
     import torch
@@ -144,20 +147,57 @@ def _load_sentence_transformer(model_id: str):
     )
 
 
+# Providers are process-wide singletons (mirrors clients.py): QwenLocalProvider
+# caches loaded SentenceTransformer models per-INSTANCE, so a fresh instance per
+# search()/reindex call would reload the multi-GB model from disk every query in
+# the long-lived MCP server process (Phase-4 finding).
+_provider_cache: dict[str, EmbedProvider] = {}
+
+
+def _clear_provider_cache() -> None:
+    """Drop memoized providers. Used in tests."""
+    _provider_cache.clear()
+
+
+def _validate_local_model_ids() -> None:
+    """Guard the CONFIG-driven qwen-local path: flipping ``embed_provider``
+    alone (with voyage model constants) is a misconfiguration that would crash
+    on the first embed — fail at provider construction with the actionable
+    story instead (Phase-4 finding: the flip is config + a build whose model
+    constants are qwen ids, design.md L3)."""
+    from vecs.config import CODE_MODEL, DOCS_MODEL, FACTS_MODEL
+
+    bad = [m for m in (CODE_MODEL, DOCS_MODEL, FACTS_MODEL) if m not in _QWEN_HF_REPOS]
+    if bad:
+        raise RuntimeError(
+            f"embed_provider is 'qwen-local' but configured model ids {bad} are "
+            f"not qwen models. The swap is a config flip PLUS a release whose "
+            f"CODE_MODEL/DOCS_MODEL/FACTS_MODEL are qwen ids (design.md L3) — "
+            f"revert embed_provider to 'voyage' or install the flip build."
+        )
+
+
 def get_provider(
     config: VecsConfig | None = None, name: str | None = None
 ) -> EmbedProvider:
-    """Resolve the configured provider. ``name`` overrides config (tests, A/B arms)."""
-    if name is None:
+    """Resolve the configured provider (memoized per name). ``name`` overrides
+    config (tests, A/B arms) and skips the config-flip guard — an A/B arm
+    legitimately runs qwen models while the configured constants stay voyage."""
+    from_config = name is None
+    if from_config:
         if config is None:
             from vecs.config import load_config
 
             config = load_config()
         name = config.embed_provider
-    if name == "voyage":
-        return VoyageProvider()
-    if name == "qwen-local":
-        return QwenLocalProvider()
-    raise ValueError(
-        f"Unknown embed_provider {name!r} (expected 'voyage' or 'qwen-local')"
-    )
+    if name not in ("voyage", "qwen-local"):
+        raise ValueError(
+            f"Unknown embed_provider {name!r} (expected 'voyage' or 'qwen-local')"
+        )
+    if name == "qwen-local" and from_config:
+        _validate_local_model_ids()
+    if name not in _provider_cache:
+        _provider_cache[name] = (
+            VoyageProvider() if name == "voyage" else QwenLocalProvider()
+        )
+    return _provider_cache[name]

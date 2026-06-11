@@ -27,4 +27,4 @@ Schema (one YAML per project):
 
 ## Changelog
 
-- 2026-06-11: `vecs.yaml` authored (46 cases) per protocol; frozen pre-A/B.
+- 2026-06-11: `vecs.yaml` authored (46 cases) per protocol; frozen at `fe0f5cb` pre-A/B.

@@ -229,11 +229,13 @@ def test_embed_and_store_no_cache_unchanged_behavior():
     assert vo.embed.call_count == 1
 
 def test_embed_and_store_treats_voyage_timeout_as_transient():
-    """voyageai.error.Timeout (class name 'Timeout') must be retried, not raised.
-
-    Regression: substring check `"TimeoutError" in "Timeout"` is False, so prior
-    code raised on Voyage timeouts and aborted the run before manifest.save(),
-    causing the next cron tick to redo the same work — a doom loop.
+    """voyageai.error.Timeout must be retried, not raised — classified transient
+    via the isinstance check on VoyageProvider.retryable_errors (the provider
+    seam). Historical context: the original bug was a substring check
+    (`"TimeoutError" in "Timeout"` is False) that raised on Voyage timeouts and
+    aborted the run before manifest.save() — a doom loop. The string-based
+    'rate limit' FALLBACK path (for providers without typed errors) is pinned
+    separately by test_string_rate_limit_fallback_is_transient.
     """
     import voyageai
     batch1_chunks = [
@@ -659,3 +661,32 @@ def test_embed_and_store_routes_through_provider():
     # calibration must come from EmbedResult.total_tokens (the provider-neutral
     # field), not the raw voyage .usage object
     assert batcher.ratio is not None
+
+
+def test_string_rate_limit_fallback_is_transient():
+    """The string-based 'rate limit' fallback must classify transient for a
+    provider with NO typed retryable errors (QwenLocalProvider has
+    retryable_errors=()): retried, then succeeds."""
+    from vecs.embed_provider import EmbedResult
+
+    class _Flaky:
+        retryable_errors: tuple = ()
+
+        def __init__(self):
+            self.calls = 0
+
+        def embed(self, texts, *, model, input_type):
+            self.calls += 1
+            if self.calls == 1:
+                raise Exception("Rate limit exceeded, slow down")
+            return EmbedResult(embeddings=[[0.1] * 4 for _ in texts], total_tokens=8)
+
+    provider = _Flaky()
+    collection = MagicMock()
+    chunks = [{"id": "code:f.cs:0", "text": "x", "metadata": {"file_path": "f.cs", "chunk_index": 0}}]
+
+    with patch("vecs.indexer.time.sleep"):
+        result = _embed_and_store(chunks, collection, "anymodel", provider)
+
+    assert result == ["code:f.cs:0"]
+    assert provider.calls == 2  # first call raised, classified transient, retried

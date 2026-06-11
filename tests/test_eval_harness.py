@@ -323,3 +323,25 @@ class TestBootstrapAB:
         assert r10["mean_a"] == 1.0 and r10["mean_b"] == 0.0 and r10["delta"] == -1.0
         assert r10["ci"][0] <= -1.0 <= r10["ci"][1]
         assert set(report["by_class"]) == {"nl", "identifier"}
+
+
+class TestABEdgeCases:
+    def test_run_arm_empty_eval_set(self):
+        assert eh.run_arm([], lambda *a, **kw: []) == []
+
+    def test_ab_report_empty_arms(self):
+        report = eh.ab_report([], [])
+        for m in ("recall5", "recall10", "ndcg10", "mrr"):
+            assert report["overall"][m]["delta"] is None
+            assert report["overall"][m]["n"] == 0
+        assert report["by_class"] == {}
+
+    def test_ab_report_two_classes(self):
+        cases = [
+            eh.EvalCase("q1", "vecs", "code", expected=["a.py"], query_class="nl"),
+            eh.EvalCase("q2", "vecs", "code", expected=["b.py"], query_class="concept"),
+        ]
+        arm = eh.run_arm(cases, lambda *a, **kw: [])
+        report = eh.ab_report(arm, arm)
+        assert set(report["by_class"]) == {"nl", "concept"}
+        assert report["by_class"]["nl"]["recall10"]["n"] == 1

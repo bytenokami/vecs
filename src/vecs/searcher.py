@@ -26,7 +26,12 @@ def _clear_caches() -> None:
 
 
 def _cached_embed(provider, query: str, model: str) -> list[float]:
-    """Embed a query through the provider, using cache when available."""
+    """Embed a query through the provider, using cache when available.
+
+    The cache key is (query, model) WITHOUT the provider: correctness rests on
+    model-id strings being globally unique across providers (voyage-* vs
+    qwen3-embedding-*, enforced by the single EMBED_DIMS registry). Two
+    providers sharing a model-id string would cross-serve cached vectors."""
     key = (query, model)
     if key in _embedding_cache:
         return _embedding_cache[key]
@@ -44,14 +49,15 @@ def _collection_markers(collections: list[str]) -> dict[str, str | None]:
     """Recorded embed model per collection (None = unknown), read in ONE cache
     lifetime.
 
-    None means 'no marker' — e.g. code collections (never marked; only the docs
-    re-embed path records one) or a pre-marker store. The model-flip interlock
-    (1.5c) treats None as FAIL-OPEN: it cannot assert a mismatch, so vector
-    scoring proceeds. Any error opening/reading the cache yields None for EVERY
-    collection — a marker-read failure must never silently disable vector search
-    (it would nuke all code retrieval). One EmbedCache open per search, mirroring
-    the indexer's one-cache-per-operation lifecycle rather than reopening it per
-    collection.
+    None means 'no marker' — a pre-backfill store or a cache-read error. Since
+    L1.4 a reindex marks BOTH code and docs collections (`_remodel_record`
+    records both; unmarked non-empty code collections are backfilled). The
+    model-flip interlock (1.5c) treats None as FAIL-OPEN: it cannot assert a
+    mismatch, so vector scoring proceeds. Any error opening/reading the cache
+    yields None for EVERY collection — a marker-read failure must never
+    silently disable vector search (it would nuke all code retrieval). One
+    EmbedCache open per search, mirroring the indexer's one-cache-per-operation
+    lifecycle rather than reopening it per collection.
     """
     try:
         cache = EmbedCache()
