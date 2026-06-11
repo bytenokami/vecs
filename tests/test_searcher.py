@@ -462,3 +462,26 @@ def test_cached_embed_uses_provider_query_input_type():
     # second call: cache hit, no new provider call
     _cached_embed(provider, "q", "voyage-code-3")
     assert vo.embed.call_count == 1
+
+
+def test_model_flip_interlock_drops_mismatched_code_collection(monkeypatch):
+    """A -code collection marked under a different model is dropped from the
+    vector path (BM25-only). The interlock itself needs zero change for this —
+    the test pins that the NEW code markers (L1.4) engage it."""
+    from vecs import searcher
+
+    _single_project(searcher, monkeypatch)
+    monkeypatch.setattr(
+        searcher,
+        "_collection_markers",
+        lambda cols: {
+            c: ("voyage-code-OLD" if c.endswith("-code") else None) for c in cols
+        },
+    )
+    vector_queried = _vector_query_recorder(monkeypatch, searcher)
+    monkeypatch.setattr(searcher, "get_bm25", lambda path: None)
+
+    searcher.search("anything", project="bloomly")
+
+    assert "bloomly-code" not in vector_queried  # mismatched marker -> dropped
+    assert "bloomly-docs" in vector_queried      # None marker -> fail-open, kept

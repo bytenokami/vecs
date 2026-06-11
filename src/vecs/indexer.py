@@ -1565,44 +1565,94 @@ def _clear_docs_manifest_entries(manifest: Manifest, docs_files: list[Path]) -> 
     return cleared
 
 
+def _code_sources(project: ProjectConfig) -> list[Path]:
+    """Every file index_code will scan, across all code_dirs (mirrors
+    `_docs_sources`; shared with the code-model clear so clear-scope ≡
+    rescan-scope by construction). `.md` is stripped exactly as index_code
+    strips it (it routes to -docs), and a missing code_dir is skipped exactly
+    as index_code skips it."""
+    files: list[Path] = []
+    for code_dir in project.code_dirs:
+        if not code_dir.path.exists():
+            continue
+        code_exts = set(code_dir.extensions)
+        code_exts.discard(".md")
+        if not code_exts:
+            continue
+        files.extend(_scan_code_dir(code_dir, code_exts))
+    return files
+
+
+def _clear_code_manifest_entries(manifest: Manifest, code_files: list[Path]) -> int:
+    """Code twin of `_clear_docs_manifest_entries`: same bare-abs-path key
+    scheme, keyed on the EXACT files index_code will re-scan. Returns the
+    number of keys removed."""
+    cleared = 0
+    for f in code_files:
+        key = str(f)
+        if key in manifest.data:
+            del manifest.data[key]
+            cleared += 1
+    return cleared
+
+
 def _remodel_clear(
     project: ProjectConfig, db: chromadb.ClientAPI, cache: EmbedCache
 ) -> dict[str, int]:
-    """run_index PRE-pass: clear docs manifest entries when the docs model changed.
+    """run_index PRE-pass: clear manifest entries when an embedding model changed.
 
-    Code has no re-embed trigger (it stays `voyage-code-3`), so code chunks are
-    never needlessly recomputed. The new marker is written AFTER index_docs runs
-    by `_remodel_record`.
+    Docs keep their legacy semantics: a None marker reads as changed (the
+    shipped pre-marker-store migration path). Code is BACKFILL-FIRST (L1.4):
+    an unmarked non-empty code collection predates code markers and is assumed
+    current -- record CODE_MODEL with NO clear; clear+re-embed fires only on a
+    real recorded-vs-configured mismatch (reusing the docs None=>changed
+    semantics here would mass re-embed the whole live code store on the first
+    post-merge reindex). New markers are written AFTER the index passes by
+    `_remodel_record`.
     """
-    cleared = {"docs": 0}
-    if not _model_changed(cache, db, project.docs_collection, DOCS_MODEL):
-        return cleared
+    cleared = {"docs": 0, "code": 0}
+    if _model_changed(cache, db, project.docs_collection, DOCS_MODEL):
+        manifest = Manifest(project.name)
+        # Clear ONLY the files index_docs will actually re-scan, so we never
+        # invalidate a key the indexer won't re-embed (which would strand that
+        # file's old-model vectors after the marker advances). F: index_docs
+        # scans ALL docs_dirs ∪ in-repo .md under code_dirs (`_docs_sources`);
+        # clear and re-embed share that one enumerator, so they cannot drift.
+        docs_files = [f for _root, f in _docs_sources(project)]
+        cleared["docs"] = _clear_docs_manifest_entries(manifest, docs_files)
+        if cleared["docs"]:
+            manifest.save()
+            _log(
+                f"[{project.name}] Embedding-model change: cleared "
+                f"{cleared['docs']} docs manifest entries to force a re-embed."
+            )
 
-    manifest = Manifest(project.name)
-    # Clear ONLY the files index_docs will actually re-scan, so we never
-    # invalidate a key the indexer won't re-embed (which would strand that
-    # file's old-model vectors after the marker advances). F: index_docs
-    # scans ALL docs_dirs ∪ in-repo .md under code_dirs (`_docs_sources`);
-    # clear and re-embed share that one enumerator, so they cannot drift.
-    docs_files = [f for _root, f in _docs_sources(project)]
-    cleared["docs"] = _clear_docs_manifest_entries(manifest, docs_files)
-    if cleared["docs"]:
-        manifest.save()
-        _log(
-            f"[{project.name}] Embedding-model change: cleared "
-            f"{cleared['docs']} docs manifest entries to force a re-embed."
-        )
+    code_marker = cache.get_collection_model(project.code_collection)
+    if code_marker is None:
+        if _collection_count(db, project.code_collection) > 0:
+            cache.set_collection_model(project.code_collection, CODE_MODEL)
+            _log(f"[{project.name}] backfilled code model marker = {CODE_MODEL}")
+    elif code_marker != CODE_MODEL and _collection_count(db, project.code_collection) > 0:
+        manifest = Manifest(project.name)
+        cleared["code"] = _clear_code_manifest_entries(manifest, _code_sources(project))
+        if cleared["code"]:
+            manifest.save()
+            _log(
+                f"[{project.name}] Code embedding-model change: cleared "
+                f"{cleared['code']} code manifest entries to force a re-embed."
+            )
     return cleared
 
 
 def _remodel_record(project: ProjectConfig, cache: EmbedCache) -> None:
-    """run_index POST-pass: record docs as embedded under the current model.
+    """run_index POST-pass: record what docs AND code are now embedded under.
 
-    Recorded only for docs (code has no re-embed trigger). Set unconditionally
-    per project so the next run reads marker == configured model and the
-    pre-pass is a no-op.
+    Set unconditionally per project so the next run reads marker == configured
+    model and the pre-pass is a no-op. Code markers (new in L1.4) arm the
+    searcher's model-flip interlock for code collections.
     """
     cache.set_collection_model(project.docs_collection, DOCS_MODEL)
+    cache.set_collection_model(project.code_collection, CODE_MODEL)
 
 
 def _prune_and_sweep_orphans(

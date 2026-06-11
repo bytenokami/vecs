@@ -145,10 +145,11 @@ def test_run_index_prune_isolation_one_project_failure_does_not_skip_others(tmp_
 
 # --- B2: model-change re-embed trigger (run_index pre/post pass) -----------
 
-def test_remodel_clears_docs_leaves_code_on_model_change(tmp_path, monkeypatch):
-    """Model change (recorded != configured) + non-empty collection: the pre-pass
-    drops docs file-keys so the next pass re-embeds them, but leaves code
-    file-keys (code has no re-embed trigger)."""
+def test_remodel_docs_clear_backfills_unmarked_code_without_clearing(tmp_path, monkeypatch):
+    """Docs model change clears docs file-keys only. The unmarked non-empty code
+    collection is BACKFILLED (marker recorded = CODE_MODEL, NO clear) — it
+    predates code markers and is assumed current (L1.4 no-regret backfill;
+    replaces the retired 'code has no trigger' invariant)."""
     from vecs.embed_cache import EmbedCache
     from vecs.indexer import _remodel_clear
 
@@ -164,11 +165,61 @@ def test_remodel_clears_docs_leaves_code_on_model_change(tmp_path, monkeypatch):
     db = MagicMock()
     db.get_collection.return_value.count.return_value = 5  # non-empty
 
-    _remodel_clear(project, db, cache)
+    cleared = _remodel_clear(project, db, cache)
 
     reloaded = Manifest("p", manifests_dir=tmp_path / "manifests")
     assert str(doc_f) not in reloaded.data  # docs cleared -> re-embed
-    assert str(code_f) in reloaded.data      # code untouched
+    assert str(code_f) in reloaded.data      # code keys untouched (backfill, no clear)
+    assert cleared["code"] == 0
+    from vecs.config import CODE_MODEL
+    assert cache.get_collection_model("p-code") == CODE_MODEL
+    cache.close()
+
+
+def test_remodel_clears_code_on_real_model_mismatch(tmp_path, monkeypatch):
+    """A RECORDED code marker != configured CODE_MODEL + non-empty collection
+    clears the code file-keys (scoped by _code_sources), leaving docs alone."""
+    from vecs.embed_cache import EmbedCache
+    from vecs.indexer import _remodel_clear
+
+    monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
+    monkeypatch.setattr("vecs.indexer.DOCS_MODEL", "voyage-4")
+
+    project, doc_f, code_f = _remodel_fixture(tmp_path)
+    _seed_manifest_with_doc_code(tmp_path, doc_f, code_f)
+
+    cache = EmbedCache(tmp_path / "embed_cache.db")
+    cache.set_collection_model("p-docs", "voyage-4")        # docs current
+    cache.set_collection_model("p-code", "voyage-code-2")   # code stale
+
+    db = MagicMock()
+    db.get_collection.return_value.count.return_value = 5  # non-empty
+
+    cleared = _remodel_clear(project, db, cache)
+
+    reloaded = Manifest("p", manifests_dir=tmp_path / "manifests")
+    assert str(code_f) not in reloaded.data  # code cleared -> re-embed
+    assert str(doc_f) in reloaded.data        # docs untouched
+    assert cleared["code"] == 1
+    cache.close()
+
+
+def test_remodel_record_marks_both_docs_and_code(tmp_path, monkeypatch):
+    """POST-pass records the current model for BOTH collections (code markers
+    are new in L1.4 — they arm the searcher interlock for code)."""
+    from vecs.embed_cache import EmbedCache
+    from vecs.indexer import _remodel_record
+
+    monkeypatch.setattr("vecs.indexer.DOCS_MODEL", "voyage-4")
+
+    project, _doc_f, _code_f = _remodel_fixture(tmp_path)
+    cache = EmbedCache(tmp_path / "embed_cache.db")
+
+    _remodel_record(project, cache)
+
+    from vecs.config import CODE_MODEL
+    assert cache.get_collection_model("p-docs") == "voyage-4"
+    assert cache.get_collection_model("p-code") == CODE_MODEL
     cache.close()
 
 def test_remodel_clear_scope_matches_index_docs_scan_all_docs_dirs(tmp_path, monkeypatch):
