@@ -332,3 +332,97 @@ def ndcg_at_k(sources: list[str], expected: list[str], k: int) -> float:
 
     rank = _hit_rank(sources[:k], expected)
     return 0.0 if rank is None else 1.0 / math.log2(rank + 2)
+
+
+@dataclass
+class QueryScore:
+    """Per-query metrics for one arm (paired by eval-set order)."""
+
+    case: EvalCase
+    recall5: float
+    recall10: float
+    ndcg10: float
+    mrr: float
+
+
+def run_arm(
+    eval_set: list[EvalCase], search_fn, n_results: int = 10
+) -> list[QueryScore]:
+    """Score one arm. A per-case search failure degrades to all-zero metrics
+    (mirrors run_eval), never aborts the arm."""
+    scores: list[QueryScore] = []
+    for case in eval_set:
+        try:
+            hits = search_fn(
+                case.query,
+                collection_name=case.collection,
+                n_results=n_results,
+                project=case.project,
+            )
+        except Exception:
+            hits = []
+        sources = [(h.get("metadata") or {}).get("file_path", "") for h in hits]
+        scores.append(
+            QueryScore(
+                case=case,
+                recall5=recall_at_k(sources, case.expected, 5),
+                recall10=recall_at_k(sources, case.expected, 10),
+                ndcg10=ndcg_at_k(sources, case.expected, 10),
+                mrr=mrr(sources, case.expected),
+            )
+        )
+    return scores
+
+
+def paired_bootstrap_ci(
+    deltas: list[float], n_boot: int = 2000, seed: int = 0, alpha: float = 0.05
+) -> tuple[float, float]:
+    """Percentile bootstrap CI for the mean of paired per-query deltas.
+
+    The L3 gate reads CI BOUNDS, not point estimates -- at ~100 queries a 3-pt
+    boundary is inside one standard error (design.md L3)."""
+    import random
+
+    if not deltas:
+        return (0.0, 0.0)
+    rng = random.Random(seed)
+    n = len(deltas)
+    means = sorted(
+        sum(rng.choice(deltas) for _ in range(n)) / n for _ in range(n_boot)
+    )
+    lo = means[max(0, int((alpha / 2) * n_boot) - 1)]
+    hi = means[min(n_boot - 1, int((1 - alpha / 2) * n_boot))]
+    return (lo, hi)
+
+
+_AB_METRICS = ("recall5", "recall10", "ndcg10", "mrr")
+
+
+def _summarize_arms(arm_a: list[QueryScore], arm_b: list[QueryScore]) -> dict:
+    out: dict = {}
+    for m in _AB_METRICS:
+        a = [getattr(s, m) for s in arm_a]
+        b = [getattr(s, m) for s in arm_b]
+        deltas = [bb - aa for aa, bb in zip(a, b)]
+        out[m] = {
+            "mean_a": sum(a) / len(a) if a else None,
+            "mean_b": sum(b) / len(b) if b else None,
+            "delta": (sum(b) - sum(a)) / len(a) if a else None,
+            "ci": paired_bootstrap_ci(deltas),
+            "n": len(a),
+        }
+    return out
+
+
+def ab_report(arm_a: list[QueryScore], arm_b: list[QueryScore]) -> dict:
+    """Paired A/B summary: overall + per query class. Arms MUST be run over the
+    same eval set in the same order (paired deltas). Aggregate-only by design --
+    safe to export off the work mac (no chunk text, no paths; design.md L1.1)."""
+    assert len(arm_a) == len(arm_b), "arms must score the same eval set"
+    report = {"overall": _summarize_arms(arm_a, arm_b), "by_class": {}}
+    classes = {s.case.query_class for s in arm_a}
+    for qc in sorted(classes):
+        a = [s for s in arm_a if s.case.query_class == qc]
+        b = [s for s in arm_b if s.case.query_class == qc]
+        report["by_class"][qc] = _summarize_arms(a, b)
+    return report

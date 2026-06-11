@@ -273,3 +273,53 @@ class TestRankingMetrics:
         import math
         assert eh.ndcg_at_k(["hit/a", "b"], ["hit"], k=10) == 1.0
         assert abs(eh.ndcg_at_k(["b", "hit/a"], ["hit"], k=10) - 1 / math.log2(3)) < 1e-9
+
+
+class TestBootstrapAB:
+    def test_paired_bootstrap_ci_zero_deltas(self):
+        lo, hi = eh.paired_bootstrap_ci([0.0] * 50)
+        assert lo == 0.0 and hi == 0.0
+
+    def test_paired_bootstrap_ci_brackets_the_mean(self):
+        deltas = [0.1] * 30 + [-0.1] * 10  # mean = 0.05
+        lo, hi = eh.paired_bootstrap_ci(deltas, seed=7)
+        assert lo < 0.05 < hi
+        assert lo > -0.1 and hi < 0.15
+
+    def test_run_arm_scores_each_case(self):
+        def fake_search(query, collection_name=None, n_results=10, project=None):
+            return [{"metadata": {"file_path": "src/searcher.py"}}]
+
+        cases = [
+            eh.EvalCase("q1", "vecs", "code", expected=["searcher.py"], query_class="nl"),
+            eh.EvalCase("q2", "vecs", "code", expected=["nowhere.py"], query_class="identifier"),
+        ]
+        scores = eh.run_arm(cases, fake_search, n_results=10)
+        assert scores[0].recall10 == 1.0 and scores[0].ndcg10 == 1.0
+        assert scores[1].recall10 == 0.0
+
+    def test_run_arm_search_failure_degrades_to_zero(self):
+        def broken_search(query, **kw):
+            raise RuntimeError("boom")
+
+        cases = [eh.EvalCase("q", "vecs", "code", expected=["x.py"])]
+        scores = eh.run_arm(cases, broken_search)
+        assert scores[0].recall10 == 0.0 and scores[0].mrr == 0.0
+
+    def test_ab_report_pairs_and_breaks_down_by_class(self):
+        cases = [
+            eh.EvalCase("q1", "vecs", "code", expected=["a.py"], query_class="nl"),
+            eh.EvalCase("q2", "vecs", "code", expected=["b.py"], query_class="identifier"),
+        ]
+
+        def arm_hits_all(query, **kw):
+            return [{"metadata": {"file_path": "a.py"}}, {"metadata": {"file_path": "b.py"}}]
+
+        def arm_hits_none(query, **kw):
+            return [{"metadata": {"file_path": "z.py"}}]
+
+        report = eh.ab_report(eh.run_arm(cases, arm_hits_all), eh.run_arm(cases, arm_hits_none))
+        r10 = report["overall"]["recall10"]
+        assert r10["mean_a"] == 1.0 and r10["mean_b"] == 0.0 and r10["delta"] == -1.0
+        assert r10["ci"][0] <= -1.0 <= r10["ci"][1]
+        assert set(report["by_class"]) == {"nl", "identifier"}
