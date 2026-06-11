@@ -1,0 +1,55 @@
+# vecs golden set — diagnostic arm (livly is the decision set; see README.md).
+# 46 cases: 24 code (12 nl / 8 identifier / 4 concept), 22 docs (12 nl / 6 identifier / 4 concept).
+cases:
+  # ---- code / nl ----
+  - {query: how are chunks batched to stay under the embedding API token limit, project: vecs, collection: code, class: nl, expected: [indexer.py]}
+  - {query: where do deleted files get their orphaned chunks removed, project: vecs, collection: code, class: nl, expected: [indexer.py]}
+  - {query: how does search merge vector and keyword results, project: vecs, collection: code, class: nl, expected: [searcher.py]}
+  - {query: where are near duplicate search results filtered out, project: vecs, collection: code, class: nl, expected: [searcher.py]}
+  - {query: how does the system avoid re-embedding unchanged chunks, project: vecs, collection: code, class: nl, expected: [embed_cache.py, indexer.py]}
+  - {query: what happens when the configured embedding model differs from what a collection was embedded with, project: vecs, collection: code, class: nl, expected: [searcher.py, indexer.py]}
+  - {query: how is a query embedding cached between searches, project: vecs, collection: code, class: nl, expected: [searcher.py]}
+  - {query: where does markdown get split into chunks, project: vecs, collection: code, class: nl, expected: [doc_chunker.py]}
+  - {query: how are C sharp files chunked using the syntax tree, project: vecs, collection: code, class: nl, expected: [ast_chunker.py]}
+  - {query: where is the daily cost cap for LLM calls enforced, project: vecs, collection: code, class: nl, expected: [metering.py]}
+  - {query: how do I add a single document to the index without a full reindex, project: vecs, collection: code, class: nl, expected: [indexer.py, cli.py, mcp_server.py]}
+  - {query: where are stale chunks detected by comparing version ids, project: vecs, collection: code, class: nl, expected: [eval_harness.py]}
+  # ---- code / identifier ----
+  - {query: reciprocal_rank_fusion, project: vecs, collection: code, class: identifier, expected: [searcher.py]}
+  - {query: AdaptiveBatcher, project: vecs, collection: code, class: identifier, expected: [indexer.py]}
+  - {query: _prune_and_sweep_orphans, project: vecs, collection: code, class: identifier, expected: [indexer.py]}
+  - {query: collection_models marker table, project: vecs, collection: code, class: identifier, expected: [embed_cache.py]}
+  - {query: metered_create, project: vecs, collection: code, class: identifier, expected: [metering.py]}
+  - {query: find_prose_drift, project: vecs, collection: code, class: identifier, expected: [prose_drift.py]}
+  - {query: _docs_sources, project: vecs, collection: code, class: identifier, expected: [indexer.py]}
+  - {query: get_bm25 FTS5, project: vecs, collection: code, class: identifier, expected: [bm25_index.py]}
+  # ---- code / concept ----
+  - {query: how does a model flip stay safe between deploy and reindex, project: vecs, collection: code, class: concept, expected: [searcher.py, indexer.py]}
+  - {query: what keeps the BM25 sidecar consistent with the vector store, project: vecs, collection: code, class: concept, expected: [indexer.py, bm25_index.py]}
+  - {query: lifecycle of a changed file from detection to embedded chunks, project: vecs, collection: code, class: concept, expected: [indexer.py]}
+  - {query: how are projects and their directories configured, project: vecs, collection: code, class: concept, expected: [config.py]}
+  # ---- docs / nl ----
+  - {query: why were session transcripts removed from indexing, project: vecs, collection: docs, class: nl, expected: [CLAUDE.md]}
+  - {query: what is the plan for sharing the knowledge base with the team, project: vecs, collection: docs, class: nl, expected: [shared-team-vecs, vecs-platform-strategy, vecs-roadmap]}
+  - {query: how does the prose staleness detector decide a doc contradicts a fact, project: vecs, collection: docs, class: nl, expected: [prose-staleness-detector, CLAUDE.md]}
+  - {query: what did the direction review decide about increment ordering, project: vecs, collection: docs, class: nl, expected: [vecs-direction-review]}
+  - {query: which local embedding models could replace voyage and why, project: vecs, collection: docs, class: nl, expected: [local-embed]}
+  - {query: what gate decides whether we swap to a local embedding model, project: vecs, collection: docs, class: nl, expected: [local-embed]}
+  - {query: how should a feature move through the workflow phases, project: vecs, collection: docs, class: nl, expected: [workflow-framework, workflow-vecs-profile]}
+  - {query: what does the freshness tag on search results mean, project: vecs, collection: docs, class: nl, expected: [CLAUDE.md, kb-freshness]}
+  - {query: how is the stale retrieval rate defined, project: vecs, collection: docs, class: nl, expected: [CLAUDE.md, kb-foundations-instrumentation]}
+  - {query: why does the embedding cache key include the model, project: vecs, collection: docs, class: nl, expected: [CLAUDE.md, kb-foundations]}
+  - {query: what would it cost to populate the facts store, project: vecs, collection: docs, class: nl, expected: [est-cost-to-populate-facts]}
+  - {query: how do we plan to detect when documentation goes stale, project: vecs, collection: docs, class: nl, expected: [prose-staleness-detector, context-staleness-detector]}
+  # ---- docs / identifier ----
+  - {query: dryrun_pass_criteria, project: vecs, collection: docs, class: identifier, expected: [workflow-vecs-profile, local-embed, kb-foundations]}
+  - {query: Qwen3-Embedding-4B, project: vecs, collection: docs, class: identifier, expected: [local-embed]}
+  - {query: stale-retrieval-rate, project: vecs, collection: docs, class: identifier, expected: [kb-foundations-instrumentation, CLAUDE.md, local-embed]}
+  - {query: _remodel_clear, project: vecs, collection: docs, class: identifier, expected: [CLAUDE.md, kb-foundations]}
+  - {query: voyage rerank-2.5-lite, project: vecs, collection: docs, class: identifier, expected: [vecs-kb-curation-design, local-embed]}
+  - {query: anonymized_telemetry, project: vecs, collection: docs, class: identifier, expected: [local-embed]}
+  # ---- docs / concept ----
+  - {query: what order do the remaining increments run in and why, project: vecs, collection: docs, class: concept, expected: [local-embed, vecs-kb-curation-design, vecs-direction-review]}
+  - {query: what invariants protect against deleting live chunks by mistake, project: vecs, collection: docs, class: concept, expected: [CLAUDE.md]}
+  - {query: how does the system know which model a collection was embedded under, project: vecs, collection: docs, class: concept, expected: [CLAUDE.md, kb-foundations, local-embed]}
+  - {query: what happened in the retro of the freshness hotfix, project: vecs, collection: docs, class: concept, expected: [kb-freshness-hotfix]}
