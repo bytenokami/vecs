@@ -233,3 +233,43 @@ def test_run_eval_tolerates_search_failure(monkeypatch):
     report = eh.run_eval(eval_set=cases, config=cfg, search_fn=boom)
     assert report.hit_rate == pytest.approx(0.0)
     assert report.results[0].n_results == 0
+
+
+# --- L1.1: golden-set loader + ranking metrics (local-embed-base) -------------
+
+
+class TestGoldenSetLoader:
+    def test_loads_yaml_cases(self, tmp_path):
+        p = tmp_path / "g.yaml"
+        p.write_text(
+            "cases:\n"
+            "  - query: how does fusion work\n"
+            "    project: vecs\n"
+            "    collection: code\n"
+            "    class: nl\n"
+            "    expected: [searcher.py]\n"
+        )
+        cases = eh.load_eval_set(p)
+        assert len(cases) == 1
+        assert cases[0].expected == ["searcher.py"]
+        assert cases[0].query_class == "nl"
+
+    def test_legacy_single_substring_back_compat(self):
+        c = eh.EvalCase("q", "vecs", "docs", expected_path_substring="kb-foundations")
+        assert c.expected == ["kb-foundations"]
+
+
+class TestRankingMetrics:
+    def test_recall_at_k(self):
+        sources = ["a/x.py", "b/y.py", "c/z.py"]
+        assert eh.recall_at_k(sources, ["y.py"], k=2) == 1.0
+        assert eh.recall_at_k(sources, ["z.py"], k=2) == 0.0
+
+    def test_mrr_first_relevant_rank(self):
+        assert eh.mrr(["a", "hit/b", "c"], ["hit"]) == 0.5
+        assert eh.mrr(["x"], ["hit"]) == 0.0
+
+    def test_ndcg_binary_relevance(self):
+        import math
+        assert eh.ndcg_at_k(["hit/a", "b"], ["hit"], k=10) == 1.0
+        assert abs(eh.ndcg_at_k(["b", "hit/a"], ["hit"], k=10) - 1 / math.log2(3)) < 1e-9

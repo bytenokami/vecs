@@ -185,12 +185,18 @@ def collection_stale_rate(
 
 @dataclass
 class EvalCase:
-    """One eval pair: a query plus the source the answer SHOULD surface from."""
+    """One eval pair: a query plus the source(s) the answer SHOULD surface from."""
 
     query: str
     project: str
     collection: str  # "code" | "docs"
-    expected_path_substring: str
+    expected_path_substring: str = ""  # legacy single-substring form
+    expected: list[str] = field(default_factory=list)
+    query_class: str = "nl"  # nl | identifier | concept
+
+    def __post_init__(self):
+        if self.expected_path_substring and not self.expected:
+            self.expected = [self.expected_path_substring]
 
 
 # Seed eval set — a handful of query -> expected-source pairs over the vecs
@@ -266,7 +272,7 @@ def run_eval(
         except Exception:
             hits = []
         sources = [(h.get("metadata") or {}).get("file_path", "") for h in hits]
-        hit = any(case.expected_path_substring in (s or "") for s in sources)
+        hit = any(any(e in (s or "") for e in case.expected) for s in sources)
         results.append(EvalCaseResult(case, hit, len(hits), sources))
 
         proj = config.projects.get(case.project)
@@ -275,3 +281,54 @@ def run_eval(
             retrieved_stale += stale_stats_for_chunks(metas, case.collection, proj)
 
     return EvalReport(results, retrieved_stale)
+
+
+# --- L1.1 (local-embed-base): golden-set loader + ranking metrics -------------
+
+
+def load_eval_set(path: Path) -> list[EvalCase]:
+    """Load a golden set YAML: {cases: [{query, project, collection, class, expected: [..]}]}.
+
+    The livly golden set lives OUTSIDE the repo (~/.vecs/evalsets/livly.yaml) --
+    work-derived queries/paths must not travel to the repo's remote
+    (design.md L1.1). Only the schema and the vecs set are versioned in-repo.
+    """
+    import yaml
+
+    raw = yaml.safe_load(path.read_text()) or {}
+    return [
+        EvalCase(
+            query=c["query"],
+            project=c["project"],
+            collection=c["collection"],
+            expected=[str(e) for e in c["expected"]],
+            query_class=c.get("class", "nl"),
+        )
+        for c in raw.get("cases", [])
+    ]
+
+
+def _hit_rank(sources: list[str], expected: list[str]) -> int | None:
+    """0-based rank of the first source matching ANY expected substring."""
+    for i, s in enumerate(sources):
+        if any(e in (s or "") for e in expected):
+            return i
+    return None
+
+
+def recall_at_k(sources: list[str], expected: list[str], k: int) -> float:
+    rank = _hit_rank(sources[:k], expected)
+    return 1.0 if rank is not None else 0.0
+
+
+def mrr(sources: list[str], expected: list[str]) -> float:
+    rank = _hit_rank(sources, expected)
+    return 0.0 if rank is None else 1.0 / (rank + 1)
+
+
+def ndcg_at_k(sources: list[str], expected: list[str], k: int) -> float:
+    """Binary-relevance nDCG: one relevant doc => DCG = 1/log2(rank+2), IDCG = 1."""
+    import math
+
+    rank = _hit_rank(sources[:k], expected)
+    return 0.0 if rank is None else 1.0 / math.log2(rank + 2)
