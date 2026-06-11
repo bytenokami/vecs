@@ -433,3 +433,37 @@ def test_voyage4_dim_matches_voyage3_for_in_place_reembed():
     assert EMBED_DIMS["voyage-4"] == EMBED_DIMS["voyage-3"] == 1024
     # Every configured model resolves to the same dim -> in-place overwrite safe.
     assert EMBED_DIMS[DOCS_MODEL] == EMBED_DIMS[CODE_MODEL] == 1024
+
+
+class TestEmbedProvider:
+    def test_default_is_voyage_when_absent(self, tmp_path):
+        p = tmp_path / "config.yaml"
+        p.write_text("projects: {}\n")
+        cfg = load_config(p)
+        assert cfg.embed_provider == "voyage"
+
+    def test_round_trips_through_save(self, tmp_path):
+        from vecs.config import VecsConfig
+        p = tmp_path / "config.yaml"
+        cfg = VecsConfig(path=p)
+        cfg.embed_provider = "qwen-local"
+        cfg.save()
+        loaded = load_config(p)
+        assert loaded.embed_provider == "qwen-local"
+
+    def test_save_after_load_preserves_provider(self, tmp_path):
+        """The add_document auto-configure path (load -> mutate projects -> save)
+        must NOT strip the provider field (design.md L1.2: save() rewrites the
+        whole file)."""
+        p = tmp_path / "config.yaml"
+        p.write_text("embed_provider: qwen-local\nprojects: {}\n")
+        cfg = load_config(p)
+        cfg.add_project("x", code_dirs=[CodeDir(path=tmp_path, extensions={".py"})])
+        cfg.save()
+        assert "qwen-local" in p.read_text()
+        assert load_config(p).embed_provider == "qwen-local"
+
+    def test_qwen_model_ids_in_embed_dims(self):
+        from vecs.config import EMBED_DIMS
+        assert EMBED_DIMS["qwen3-embedding-4b@mrl1024"] == 1024
+        assert EMBED_DIMS["qwen3-embedding-0.6b"] == 1024

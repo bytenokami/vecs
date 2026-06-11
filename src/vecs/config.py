@@ -24,8 +24,9 @@ DOCS_MODEL = "voyage-4"
 # with no migration.
 FACTS_MODEL = "voyage-4"
 
-# Embedding output dimensions (model DEFAULT -- we never send an
-# output_dimension override, so each model emits its default-width vector).
+# Embedding output dimensions (for Voyage models: the model DEFAULT -- we never
+# send an output_dimension override, so each model emits its default-width
+# vector. For local Qwen entries the value is PRESCRIPTIVE -- see inline note).
 # Recorded so the Inc 1-B in-place docs re-embed is provably dim-safe: voyage-4's
 # default 1024 == voyage-3's 1024 == voyage-code-3's 1024, so re-embedded
 # vectors overwrite existing chunk ids in the same Chroma collection with no
@@ -35,6 +36,13 @@ EMBED_DIMS = {
     "voyage-3": 1024,
     "voyage-4": 1024,
     "voyage-code-3": 1024,
+    # Local (Qwen3) model ids -- for these, the dim is PRESCRIPTIVE, not
+    # descriptive: QwenLocalProvider truncates to this width (MRL). A dim
+    # change REQUIRES a new model id -- the embed cache and collection_models
+    # markers key on the id string alone, so editing a dim in place would
+    # serve stale-width cached vectors with zero invalidation.
+    "qwen3-embedding-4b@mrl1024": 1024,
+    "qwen3-embedding-0.6b": 1024,
 }
 
 # Chunking defaults
@@ -95,6 +103,12 @@ class VecsConfig:
     """Top-level config holding all projects."""
     path: Path
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
+    # Which embedding provider serves all embed calls: "voyage" (hosted API,
+    # default) or "qwen-local" (on-device, optional extra vecs[local]).
+    # MUST round-trip through save() -- save() rewrites the whole file and runs
+    # on every add_document auto-configure; an unmodeled field would be
+    # silently stripped, reverting the fleet to voyage (design.md L1.2).
+    embed_provider: str = "voyage"
 
     def add_project(
         self,
@@ -125,7 +139,7 @@ class VecsConfig:
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        data: dict = {"projects": {}}
+        data: dict = {"embed_provider": self.embed_provider, "projects": {}}
         for name, p in self.projects.items():
             proj: dict = {}
             if p.code_dirs:
@@ -175,6 +189,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> VecsConfig:
 
     config = VecsConfig(path=path)
     raw = yaml.safe_load(path.read_text()) or {}
+    config.embed_provider = raw.get("embed_provider", "voyage")
     for name, proj in raw.get("projects", {}).items():
         code_dirs = []
         for cd_raw in proj.get("code_dirs", []):
