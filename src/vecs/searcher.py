@@ -5,7 +5,8 @@ import sys
 from cachetools import TTLCache
 
 from vecs.bm25_index import get_bm25
-from vecs.clients import get_voyage_client, get_chromadb_client
+from vecs.clients import get_chromadb_client
+from vecs.embed_provider import get_provider
 from vecs.config import (
     CODE_MODEL,
     DOCS_MODEL,
@@ -23,12 +24,12 @@ def _clear_caches() -> None:
     _embedding_cache.clear()
 
 
-def _cached_embed(vo, query: str, model: str) -> list[float]:
-    """Embed a query, using cache when available."""
+def _cached_embed(provider, query: str, model: str) -> list[float]:
+    """Embed a query through the provider, using cache when available."""
     key = (query, model)
     if key in _embedding_cache:
         return _embedding_cache[key]
-    embedding = vo.embed([query], model=model, input_type="query").embeddings[0]
+    embedding = provider.embed([query], model=model, input_type="query").embeddings[0]
     _embedding_cache[key] = embedding
     return embedding
 
@@ -160,9 +161,9 @@ def search(
         path_filter: Filter results to paths containing this substring.
         project: Search a specific project (default: all).
     """
-    vo = get_voyage_client()
     db = get_chromadb_client()
     config = load_config()
+    provider = get_provider(config)
 
     projects = (
         {project: config.projects[project]}
@@ -214,7 +215,7 @@ def search(
             except Exception:
                 continue
 
-            embedding = _cached_embed(vo, query, model)
+            embedding = _cached_embed(provider, query, model)
 
             where = None
             if path_filter:

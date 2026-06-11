@@ -179,7 +179,7 @@ def test_search_queries_docs_collection_without_docs_dir(monkeypatch):
     cfg.projects["bloomly"] = ProjectConfig(name="bloomly")  # docs_dirs empty -> docs_dir None
     assert cfg.projects["bloomly"].docs_dir is None
     monkeypatch.setattr(searcher, "load_config", lambda: cfg)
-    monkeypatch.setattr(searcher, "get_voyage_client", lambda: MagicMock())
+    monkeypatch.setattr(searcher, "get_provider", lambda config=None, name=None: MagicMock())
     monkeypatch.setattr(searcher, "_cached_embed", lambda vo, q, m: [0.1, 0.2, 0.3, 0.4])
     monkeypatch.setattr(searcher, "get_bm25", lambda path: None)  # skip BM25
     # 1.5c interlock now consults the embed-cache markers; stub them to "no
@@ -277,7 +277,7 @@ def _single_project(searcher, monkeypatch):
     cfg = VecsConfig(path="/tmp/x.yaml")
     cfg.projects["bloomly"] = ProjectConfig(name="bloomly")
     monkeypatch.setattr(searcher, "load_config", lambda: cfg)
-    monkeypatch.setattr(searcher, "get_voyage_client", lambda: MagicMock())
+    monkeypatch.setattr(searcher, "get_provider", lambda config=None, name=None: MagicMock())
     monkeypatch.setattr(searcher, "_cached_embed", lambda vo, q, m: [0.1, 0.2, 0.3, 0.4])
     return cfg
 
@@ -443,3 +443,22 @@ def test_collection_markers_fail_open_on_cache_error(monkeypatch):
     markers = searcher._collection_markers(["x-code", "x-docs"])
 
     assert markers == {"x-code": None, "x-docs": None}
+
+
+def test_cached_embed_uses_provider_query_input_type():
+    from unittest.mock import MagicMock
+    from vecs.embed_provider import VoyageProvider
+    from vecs.searcher import _cached_embed, _clear_caches
+
+    _clear_caches()
+    vo = MagicMock()
+    result = MagicMock()
+    result.embeddings = [[0.2] * 4]
+    vo.embed.return_value = result
+    provider = VoyageProvider(client=vo)
+    emb = _cached_embed(provider, "q", "voyage-code-3")
+    assert emb == [0.2] * 4
+    assert vo.embed.call_args.kwargs["input_type"] == "query"
+    # second call: cache hit, no new provider call
+    _cached_embed(provider, "q", "voyage-code-3")
+    assert vo.embed.call_count == 1
