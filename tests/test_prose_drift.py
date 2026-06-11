@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from vecs import metering, prose_drift
+from vecs.embed_provider import VoyageProvider
 from vecs.config import ProjectConfig
 from vecs.prose_drift import (
     EVENT_INSERT,
@@ -56,7 +57,7 @@ def fake_voyage(monkeypatch):
             return _FakeResult(len(texts))
 
     fake = _FakeClient()
-    monkeypatch.setattr(prose_drift, "get_voyage_client", lambda: fake)
+    monkeypatch.setattr(prose_drift, "get_provider", lambda: VoyageProvider(client=fake))
     return calls
 
 
@@ -126,7 +127,7 @@ def fake_voyage_textmap(monkeypatch):
             return _FakeResult([vectors.get(t, [1.0, 0.0, 0.0, 0.0]) for t in texts])
 
     fake = _FakeClient()
-    monkeypatch.setattr(prose_drift, "get_voyage_client", lambda: fake)
+    monkeypatch.setattr(prose_drift, "get_provider", lambda: VoyageProvider(client=fake))
     return {"calls": calls, "vectors": vectors}
 
 
@@ -224,8 +225,8 @@ def test_voyage_embed_uses_pinned_facts_model(monkeypatch):
             captured["model"] = model
             return _Result()
 
-    monkeypatch.setattr(prose_drift, "get_voyage_client", lambda: _Vo())
-    prose_drift._voyage_embed("hello")
+    monkeypatch.setattr(prose_drift, "get_provider", lambda: VoyageProvider(client=_Vo()))
+    prose_drift._embed_fact("hello")
     assert captured["model"] == FACTS_MODEL
 
 

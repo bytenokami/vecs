@@ -21,7 +21,7 @@ from typing import Any
 import chromadb
 from chromadb.config import Settings
 
-from vecs.clients import get_voyage_client
+from vecs.embed_provider import get_provider
 from vecs.config import CHROMADB_DIR, FACTS_MODEL
 from vecs.metering import MeteringCapExceeded, metered_create
 
@@ -473,7 +473,7 @@ def find_prose_drift(project) -> dict:
                 # chain_key MISS -> stage-2 semantic fallback.
                 if not current_rows:
                     continue
-                doc_emb = _voyage_embed_cached(
+                doc_emb = _embed_fact_cached(
                     f"{dt.subject} {dt.predicate} {dt.object}", name
                 )
                 cand = _best_semantic_candidate(doc_emb, current_rows)
@@ -516,14 +516,14 @@ def find_prose_drift(project) -> dict:
     }
 
 
-def _voyage_embed(text: str) -> list[float]:
-    vo = get_voyage_client()
-    result = vo.embed([text], model=FACTS_MODEL, input_type="document")
+def _embed_fact(text: str) -> list[float]:
+    provider = get_provider()
+    result = provider.embed([text], model=FACTS_MODEL, input_type="document")
     return result.embeddings[0]
 
 
-def _voyage_embed_cached(text: str, project: str) -> list[float]:
-    """_voyage_embed with a per-project SQLite cache, so a doc-triple embedded on one
+def _embed_fact_cached(text: str, project: str) -> list[float]:
+    """_embed_fact with a per-project SQLite cache, so a doc-triple embedded on one
     scan is not re-embedded (a Voyage call) on the next — keeps rescans cheap."""
     text_sha = _sha256(text)
     conn = _init_cache(project)
@@ -534,7 +534,7 @@ def _voyage_embed_cached(text: str, project: str) -> list[float]:
         ).fetchone()
         if row is not None:
             return json.loads(row[0])
-        emb = list(_voyage_embed(text))
+        emb = list(_embed_fact(text))
         conn.execute(
             "INSERT OR REPLACE INTO embed_cache VALUES (?, ?, ?)",
             (text_sha, FACTS_MODEL, json.dumps(emb)),
@@ -752,7 +752,7 @@ def add_fact_with_state_machine(
     if not ids:
         new_id = str(uuid.uuid4())
         doc_text = f"{triple.subject} {triple.predicate} {triple.object}"
-        embedding = _voyage_embed(doc_text)
+        embedding = _embed_fact(doc_text)
         collection.add(
             ids=[new_id],
             embeddings=[embedding],
@@ -772,7 +772,7 @@ def add_fact_with_state_machine(
     old_version = int(operative_meta.get("version", 1))
     new_id = str(uuid.uuid4())
     doc_text = f"{triple.subject} {triple.predicate} {triple.object}"
-    embedding = _voyage_embed(doc_text)
+    embedding = _embed_fact(doc_text)
     collection.add(
         ids=[new_id],
         embeddings=[embedding],

@@ -18,6 +18,7 @@ import types
 import pytest
 
 from vecs import prose_drift
+from vecs.embed_provider import VoyageProvider
 
 
 @pytest.fixture
@@ -35,7 +36,7 @@ def fake_voyage(monkeypatch):
             return _FakeResult(len(texts))
 
     fake = _FakeClient()
-    monkeypatch.setattr(prose_drift, "get_voyage_client", lambda: fake)
+    monkeypatch.setattr(prose_drift, "get_provider", lambda: VoyageProvider(client=fake))
     return calls
 
 
