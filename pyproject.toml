@@ -20,6 +20,12 @@ dependencies = [
 [project.scripts]
 vecs = "vecs.cli:main"
 
+[project.optional-dependencies]
+local = [
+    "sentence-transformers>=3.3",
+    "torch>=2.4",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
