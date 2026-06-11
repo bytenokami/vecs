@@ -21,6 +21,7 @@ from vecs.indexer import (
     migrate_global_manifest,
 )
 from vecs.config import VecsConfig, ProjectConfig, CodeDir
+from vecs.embed_provider import VoyageProvider
 from indexer_helpers import (  # noqa: F401
     FakeEmbedResult, _embedded_texts, _make_index_db, _capture_files,
     _git_init_commit, _capture_chunks_via_index_collection, _StatefulDocsChroma,
@@ -41,7 +42,7 @@ def test_embed_and_store_returns_succeeded_ids():
     vo = MagicMock()
     vo.embed.return_value = FakeEmbedResult(3)
 
-    result = _embed_and_store(chunks, collection, "voyage-code-3", vo)
+    result = _embed_and_store(chunks, collection, "voyage-code-3", VoyageProvider(client=vo))
 
     assert isinstance(result, list)
     assert set(result) == {"code:file.cs:0", "code:file.cs:1", "code:file.cs:2"}
@@ -76,7 +77,7 @@ def test_embed_and_store_partial_failure_returns_only_succeeded():
     with patch("vecs.indexer._make_batches") as mock_batches, \
          patch("vecs.indexer.time.sleep"):
         mock_batches.return_value = iter([batch1_chunks, batch2_chunks])
-        result = _embed_and_store(all_chunks, collection, "voyage-code-3", vo)
+        result = _embed_and_store(all_chunks, collection, "voyage-code-3", VoyageProvider(client=vo))
 
     assert set(result) == {"code:a.cs:0", "code:a.cs:1"}
 
@@ -84,7 +85,7 @@ def test_embed_and_store_empty_returns_empty_list():
     """Empty input returns empty list."""
     collection = MagicMock()
     vo = MagicMock()
-    result = _embed_and_store([], collection, "voyage-code-3", vo)
+    result = _embed_and_store([], collection, "voyage-code-3", VoyageProvider(client=vo))
     assert result == []
 
 # --- C: content-hash embedding cache wired into _embed_and_store ---
@@ -103,7 +104,7 @@ def test_embed_and_store_caches_unchanged_chunks(tmp_path):
         {"id": "code:f.cs:1", "text": "BBB", "metadata": {"file_path": "f.cs", "chunk_index": 1}},
     ]
     vo.embed.return_value = FakeEmbedResult(2)
-    ids1 = _embed_and_store(chunks_v1, collection, "voyage-code-3", vo, cache=cache)
+    ids1 = _embed_and_store(chunks_v1, collection, "voyage-code-3", VoyageProvider(client=vo), cache=cache)
     assert set(ids1) == {"code:f.cs:0", "code:f.cs:1"}
     assert vo.embed.call_count == 1
     assert _embedded_texts(vo.embed.call_args) == ["AAA", "BBB"]
@@ -115,7 +116,7 @@ def test_embed_and_store_caches_unchanged_chunks(tmp_path):
         {"id": "code:f.cs:0", "text": "AAA-changed", "metadata": {"file_path": "f.cs", "chunk_index": 0}},
         {"id": "code:f.cs:1", "text": "BBB", "metadata": {"file_path": "f.cs", "chunk_index": 1}},
     ]
-    ids2 = _embed_and_store(chunks_v2, collection, "voyage-code-3", vo, cache=cache)
+    ids2 = _embed_and_store(chunks_v2, collection, "voyage-code-3", VoyageProvider(client=vo), cache=cache)
 
     # exactly the changed chunk hit Voyage
     assert vo.embed.call_count == 1
@@ -144,7 +145,7 @@ def test_cache_hit_preserves_succeeded_equals_expected_invariant(tmp_path):
             {"id": "code:f.cs:0", "text": "AAA", "metadata": meta(0)},
             {"id": "code:f.cs:1", "text": "BBB", "metadata": meta(1)},
         ],
-        collection, "voyage-code-3", vo, cache=cache,
+        collection, "voyage-code-3", VoyageProvider(client=vo), cache=cache,
     )
 
     # re-index: chunk 0 changed, chunk 1 is a cache hit
@@ -154,7 +155,7 @@ def test_cache_hit_preserves_succeeded_equals_expected_invariant(tmp_path):
             {"id": "code:f.cs:0", "text": "AAA2", "metadata": meta(0)},
             {"id": "code:f.cs:1", "text": "BBB", "metadata": meta(1)},
         ],
-        collection, "voyage-code-3", vo, cache=cache,
+        collection, "voyage-code-3", VoyageProvider(client=vo), cache=cache,
     )
 
     chunk_to_file = {"code:f.cs:0": f, "code:f.cs:1": f}
@@ -183,7 +184,7 @@ def test_embed_and_store_cache_keys_on_embedded_text_not_full_text(tmp_path, mon
         "vecs.indexer._make_batches",
         lambda chunks, batcher=None: iter([[{**chunk, "text": truncated}]]) if chunks else iter([]),
     )
-    _embed_and_store([chunk], collection, "voyage-code-3", vo, cache=cache)
+    _embed_and_store([chunk], collection, "voyage-code-3", VoyageProvider(client=vo), cache=cache)
 
     # The embedded (truncated) text is cached; the full text is NOT, so a later
     # run re-embeds rather than serving a wrong-doc vector.
@@ -210,7 +211,7 @@ def test_embed_and_store_survives_cache_get_and_put_errors():
     vo = MagicMock()
     vo.embed.return_value = FakeEmbedResult(2)
 
-    result = _embed_and_store(chunks, collection, "voyage-code-3", vo, cache=BrokenCache())
+    result = _embed_and_store(chunks, collection, "voyage-code-3", VoyageProvider(client=vo), cache=BrokenCache())
     assert set(result) == {"code:f.cs:0", "code:f.cs:1"}
     assert vo.embed.call_count == 1  # cache read failed -> all chunks embedded
 
@@ -223,7 +224,7 @@ def test_embed_and_store_no_cache_unchanged_behavior():
     collection = MagicMock()
     vo = MagicMock()
     vo.embed.return_value = FakeEmbedResult(3)
-    result = _embed_and_store(chunks, collection, "voyage-code-3", vo)
+    result = _embed_and_store(chunks, collection, "voyage-code-3", VoyageProvider(client=vo))
     assert set(result) == {"code:f.cs:0", "code:f.cs:1", "code:f.cs:2"}
     assert vo.embed.call_count == 1
 
@@ -259,7 +260,7 @@ def test_embed_and_store_treats_voyage_timeout_as_transient():
     with patch("vecs.indexer._make_batches") as mock_batches, \
          patch("vecs.indexer.time.sleep"):
         mock_batches.return_value = iter([batch1_chunks, batch2_chunks])
-        result = _embed_and_store(all_chunks, collection, "voyage-code-3", vo)
+        result = _embed_and_store(all_chunks, collection, "voyage-code-3", VoyageProvider(client=vo))
 
     assert set(result) == {"code:a.cs:0", "code:a.cs:1"}
 
@@ -273,7 +274,7 @@ def test_embed_and_store_handles_large_input_internally():
     vo = MagicMock()
     vo.embed.side_effect = lambda texts, **kw: FakeEmbedResult(len(texts))
 
-    result = _embed_and_store(chunks, collection, "voyage-code-3", vo)
+    result = _embed_and_store(chunks, collection, "voyage-code-3", VoyageProvider(client=vo))
 
     assert len(result) == 500
     assert collection.upsert.call_count >= 1
@@ -332,7 +333,7 @@ def test_index_collection_shared_pipeline(tmp_path):
         chunks=chunks,
         collection=collection,
         model="voyage-code-3",
-        vo=vo,
+        provider=VoyageProvider(client=vo),
         manifest=manifest,
         chunk_to_file={"code:dir/a.cs:0": file_a, "code:dir/a.cs:1": file_a},
         file_expected_count={file_a: 2},
@@ -369,7 +370,7 @@ def test_index_collection_partial_failure_skips_file(tmp_path):
             chunks=chunks_a + chunks_b,
             collection=collection,
             model="voyage-code-3",
-            vo=vo,
+            provider=VoyageProvider(client=vo),
             manifest=manifest,
             chunk_to_file={"code:a.cs:0": file_a, "code:b.cs:0": file_b},
             file_expected_count={file_a: 1, file_b: 1},
@@ -634,3 +635,27 @@ def test_sync_bm25_paginates_through_all_chunks(tmp_path, monkeypatch):
     assert collection.get.call_count >= 2, (
         f"expected pagination to make multiple get() calls, got {collection.get.call_count}"
     )
+
+
+def test_embed_and_store_routes_through_provider():
+    """_embed_and_store must call provider.embed (not vo.embed) and calibrate
+    the batcher from EmbedResult.total_tokens."""
+    from vecs.embed_provider import VoyageProvider
+    from vecs.indexer import AdaptiveBatcher, _embed_and_store
+
+    vo = MagicMock()
+    vo.embed.return_value = FakeEmbedResult(2)
+    provider = VoyageProvider(client=vo)
+    collection = MagicMock()
+    batcher = AdaptiveBatcher()
+    chunks = [
+        {"id": "a", "text": "alpha", "metadata": {}},
+        {"id": "b", "text": "beta", "metadata": {}},
+    ]
+    ids = _embed_and_store(chunks, collection, "voyage-code-3", provider, batcher=batcher)
+    assert sorted(ids) == ["a", "b"]
+    vo.embed.assert_called_once()
+    assert vo.embed.call_args.kwargs["input_type"] == "document"
+    # calibration must come from EmbedResult.total_tokens (the provider-neutral
+    # field), not the raw voyage .usage object
+    assert batcher.ratio is not None

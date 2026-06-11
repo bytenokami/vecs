@@ -10,12 +10,10 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import chromadb
-import voyageai
-import voyageai.error
 
 from vecs.ast_chunker import chunk_code_file_ast
 from vecs.bm25_index import BM25Index
-from vecs.clients import get_voyage_client, get_chromadb_client
+from vecs.clients import get_chromadb_client
 from vecs.config import (
     CHROMADB_DIR,
     CODE_CHUNK_LINES,
@@ -32,6 +30,7 @@ from vecs.config import (
 )
 from vecs.doc_chunker import chunk_doc, extract_pdf_text
 from vecs.embed_cache import EmbedCache
+from vecs.embed_provider import EmbedProvider, get_provider
 
 
 MAX_BATCH_TOKENS = 80_000  # Voyage limit is 120K; char-based estimation is unreliable, so leave wide margin
@@ -384,18 +383,18 @@ def _embed_and_store(
     chunks: list[dict],
     collection: chromadb.Collection,
     model: str,
-    vo: voyageai.Client,
+    provider: EmbedProvider,
     batcher: AdaptiveBatcher | None = None,
     cache: EmbedCache | None = None,
 ) -> list[str]:
     """Embed and store chunks. Returns list of successfully stored chunk IDs.
 
-    Uses AdaptiveBatcher for token estimation when provided. Calibrates
-    from Voyage API response usage data.
+    Uses AdaptiveBatcher for token estimation when provided. Calibrates from
+    EmbedResult.total_tokens when the provider reports usage.
 
     When a `cache` is supplied (C), byte-identical chunks already embedded under
-    this `model` are served from the cache without a Voyage call -- but they are
-    STILL upserted and counted in the returned ids, so the caller's
+    this `model` are served from the cache without a provider call -- but they
+    are STILL upserted and counted in the returned ids, so the caller's
     `succeeded == expected` manifest invariant holds (see _track_embed_success).
     Freshly-embedded (cache-miss) vectors are written back to the cache.
     """
@@ -448,20 +447,12 @@ def _embed_and_store(
 
         for attempt in range(5):
             try:
-                result = vo.embed(texts, model=model, input_type="document")
+                result = provider.embed(texts, model=model, input_type="document")
                 break
             except Exception as e:
                 error_msg = str(e).lower()
                 is_transient = (
-                    isinstance(e, (
-                        voyageai.error.Timeout,
-                        voyageai.error.APIConnectionError,
-                        voyageai.error.RateLimitError,
-                        voyageai.error.ServiceUnavailableError,
-                        voyageai.error.ServerError,
-                        voyageai.error.TryAgain,
-                        voyageai.error.APIError,
-                    ))
+                    isinstance(e, provider.retryable_errors)
                     or isinstance(e, (TimeoutError, ConnectionError))
                     or ("rate" in error_msg and "limit" in error_msg)
                 )
@@ -480,9 +471,9 @@ def _embed_and_store(
                  f"(sample chunk_id={sample_id}, {len(succeeded_ids)} stored so far)")
             continue
 
-        # H2: calibrate from successful response
-        if hasattr(result, "usage") and hasattr(result.usage, "total_tokens"):
-            batcher.calibrate(batch_chars, result.usage.total_tokens)
+        # H2: calibrate from successful response (provider-neutral usage field)
+        if result.total_tokens is not None:
+            batcher.calibrate(batch_chars, result.total_tokens)
 
         ids = [c["id"] for c in batch]
         metadatas = [c["metadata"] for c in batch]
@@ -902,7 +893,7 @@ def _index_collection(
     chunks: list[dict],
     collection: chromadb.Collection,
     model: str,
-    vo: voyageai.Client,
+    provider: EmbedProvider,
     manifest: Manifest,
     chunk_to_file: dict[str, Path],
     file_expected_count: dict[Path, int],
@@ -916,8 +907,8 @@ def _index_collection(
     Args:
         chunks: All chunks to embed (batching handled internally).
         collection: ChromaDB collection to upsert into.
-        model: Voyage AI model name.
-        vo: Voyage AI client.
+        model: Embedding model name.
+        provider: Embedding provider (the seam over voyage / local models).
         manifest: Manifest instance for tracking indexed files.
         chunk_to_file: Map from chunk ID to source file path.
         file_expected_count: Map from file path to expected chunk count.
@@ -931,7 +922,7 @@ def _index_collection(
     if not chunks:
         return 0
 
-    succeeded_ids = _embed_and_store(chunks, collection, model, vo, cache=cache)
+    succeeded_ids = _embed_and_store(chunks, collection, model, provider, cache=cache)
 
     fully_succeeded = _track_embed_success(
         succeeded_ids, chunk_to_file, file_expected_count, file_cleanup, collection,
@@ -1014,7 +1005,7 @@ def _scan_code_dir(code_dir: CodeDir, extensions: set[str]) -> list[Path]:
 
 def index_code(
     project: ProjectConfig,
-    vo: voyageai.Client,
+    provider: EmbedProvider,
     db: chromadb.ClientAPI,
     cache: EmbedCache | None = None,
 ) -> int:
@@ -1157,7 +1148,7 @@ def index_code(
         chunks=all_chunks,
         collection=collection,
         model=CODE_MODEL,
-        vo=vo,
+        provider=provider,
         manifest=manifest,
         chunk_to_file=chunk_to_file,
         file_expected_count=file_expected_count,
@@ -1282,7 +1273,7 @@ def _owning_doc_root(project: ProjectConfig, file_path: Path) -> Path | None:
 
 def index_docs(
     project: ProjectConfig,
-    vo: voyageai.Client,
+    provider: EmbedProvider,
     db: chromadb.ClientAPI,
     cache: EmbedCache | None = None,
 ) -> int:
@@ -1397,7 +1388,7 @@ def index_docs(
         chunks=all_chunks,
         collection=collection,
         model=DOCS_MODEL,
-        vo=vo,
+        provider=provider,
         manifest=manifest,
         chunk_to_file=chunk_to_file,
         file_expected_count=file_expected_count,
@@ -1430,7 +1421,7 @@ def index_single_doc(project_name: str, file_path: Path) -> int:
             f"docs_dir or code_dir."
         )
 
-    vo = get_voyage_client()
+    provider = get_provider(config)
     db = get_chromadb_client()
     collection = db.get_or_create_collection(project.docs_collection)
     manifest = Manifest(project_name)
@@ -1461,7 +1452,7 @@ def index_single_doc(project_name: str, file_path: Path) -> int:
         chunks=chunks,
         collection=collection,
         model=DOCS_MODEL,
-        vo=vo,
+        provider=provider,
         manifest=manifest,
         chunk_to_file=chunk_to_file,
         file_expected_count={file_path: len(chunks)},
@@ -1700,7 +1691,7 @@ def run_index(project_name: str | None = None) -> None:
     # Migrate global manifest to per-project manifests (one-time)
     migrate_global_manifest(MANIFEST_PATH, MANIFESTS_DIR, config)
 
-    vo = get_voyage_client()
+    provider = get_provider(config)
     db = get_chromadb_client()
 
     projects = (
@@ -1723,8 +1714,8 @@ def run_index(project_name: str | None = None) -> None:
             # B2 PRE-pass: detect a docs embedding-model change and clear the
             # affected manifest entries so index_docs re-embeds under the new model.
             _remodel_clear(project, db, cache)
-            total_code += index_code(project, vo, db, cache=cache)
-            total_docs += index_docs(project, vo, db, cache=cache)
+            total_code += index_code(project, provider, db, cache=cache)
+            total_docs += index_docs(project, provider, db, cache=cache)
             # B2 POST-pass: record the model docs are now embedded under.
             _remodel_record(project, cache)
             _log(f"[{name}] project finished in {time.monotonic() - proj_start:.1f}s")

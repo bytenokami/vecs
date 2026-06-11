@@ -1,3 +1,4 @@
+from vecs.embed_provider import VoyageProvider
 import hashlib
 import json
 import subprocess
@@ -46,7 +47,7 @@ def test_index_single_doc_stamps_mtime_version_id(tmp_path, monkeypatch):
     cfg = VecsConfig(path=tmp_path / "config.yaml")
     cfg.projects["p"] = ProjectConfig(name="p", docs_dirs=[docs])
     monkeypatch.setattr("vecs.indexer.load_config", lambda: cfg)
-    monkeypatch.setattr("vecs.indexer.get_voyage_client", lambda: MagicMock())
+    monkeypatch.setattr("vecs.indexer.get_provider", lambda config=None, name=None: VoyageProvider(client=MagicMock()))
     db, _collection = _make_index_db(tmp_path)
     monkeypatch.setattr("vecs.indexer.get_chromadb_client", lambda: db)
 
@@ -69,7 +70,7 @@ def test_index_docs_stamps_mtime_version_id(tmp_path, monkeypatch):
     project = ProjectConfig(name="p", docs_dirs=[docs])
     captured = _capture_chunks_via_index_collection(monkeypatch)
     db, _collection = _make_index_db(tmp_path)
-    index_docs(project, vo=MagicMock(), db=db)
+    index_docs(project, provider=VoyageProvider(client=MagicMock()), db=db)
 
     assert captured["chunks"]
     assert all(c["metadata"]["version_id"] == expected for c in captured["chunks"])
@@ -117,7 +118,7 @@ def test_index_docs_qualifies_chunk_id_with_source_root_basename(tmp_path, monke
     project = ProjectConfig(name="p", docs_dirs=[docs])
     captured = _capture_chunks_via_index_collection(monkeypatch)
     db, _collection = _make_index_db(tmp_path)
-    index_docs(project, vo=MagicMock(), db=db)
+    index_docs(project, provider=VoyageProvider(client=MagicMock()), db=db)
 
     assert captured["chunks"]
     for c in captured["chunks"]:
@@ -140,7 +141,7 @@ def test_index_docs_two_roots_same_readme_do_not_collide(tmp_path, monkeypatch):
     project = ProjectConfig(name="p", docs_dirs=[repo_a, repo_b])
     captured = _capture_chunks_via_index_collection(monkeypatch)
     db, _collection = _make_index_db(tmp_path)
-    index_docs(project, vo=MagicMock(), db=db)
+    index_docs(project, provider=VoyageProvider(client=MagicMock()), db=db)
 
     ids = [c["id"] for c in captured["chunks"]]
     paths = {c["metadata"]["file_path"] for c in captured["chunks"]}
@@ -185,7 +186,7 @@ def test_index_docs_two_roots_same_readme_real_cleanup_no_mutual_delete(tmp_path
     monkeypatch.setattr("vecs.indexer._delete_ids_from_bm25", lambda *a, **kw: None)
 
     project = ProjectConfig(name="p", docs_dirs=[repo_a, repo_b])
-    index_docs(project, vo=MagicMock(), db=db)
+    index_docs(project, provider=VoyageProvider(client=MagicMock()), db=db)
 
     paths = {e["metadata"]["file_path"] for e in collection.store.values()}
     assert "repoA/README.md" in paths, "repoA survived"
@@ -228,7 +229,7 @@ def test_index_docs_qualifies_txt_and_pdf_under_docs_dir(tmp_path, monkeypatch):
     project = ProjectConfig(name="p", docs_dirs=[docs])
     captured = _capture_chunks_via_index_collection(monkeypatch)
     db, _collection = _make_index_db(tmp_path)
-    index_docs(project, vo=MagicMock(), db=db)
+    index_docs(project, provider=VoyageProvider(client=MagicMock()), db=db)
 
     paths = {c["metadata"]["file_path"] for c in captured["chunks"]}
     assert "docs/notes.txt" in paths
@@ -261,7 +262,7 @@ def test_index_docs_routes_inrepo_md_when_no_docs_dir(tmp_path, monkeypatch):
     project = ProjectConfig(name="p", code_dirs=[CodeDir(path=code, extensions={".ts"})])
     captured = _capture_chunks_via_index_collection(monkeypatch)
     db, _collection = _make_index_db(tmp_path)
-    n = index_docs(project, vo=MagicMock(), db=db)
+    n = index_docs(project, provider=VoyageProvider(client=MagicMock()), db=db)
 
     assert n > 0
     paths = {c["metadata"]["file_path"] for c in captured["chunks"]}
@@ -284,7 +285,7 @@ def test_index_docs_inrepo_md_respects_code_dir_exclude(tmp_path, monkeypatch):
     )
     captured = _capture_chunks_via_index_collection(monkeypatch)
     db, _collection = _make_index_db(tmp_path)
-    index_docs(project, vo=MagicMock(), db=db)
+    index_docs(project, provider=VoyageProvider(client=MagicMock()), db=db)
 
     paths = {c["metadata"]["file_path"] for c in captured["chunks"]}
     assert paths == {"client-uk/Assets/GUIDE.md"}
@@ -317,7 +318,7 @@ def test_index_docs_no_md_content_lost(tmp_path, monkeypatch):
         "vecs.indexer._embed_and_store",
         lambda chunks, *a, **kw: [c["id"] for c in chunks],
     )
-    index_docs(project, vo=MagicMock(), db=db)
+    index_docs(project, provider=VoyageProvider(client=MagicMock()), db=db)
 
     expected_md = {f for _root, f in _docs_sources(project) if f.suffix == ".md"}
     manifest = Manifest("p", manifests_dir=tmp_path / "manifests")
@@ -337,7 +338,7 @@ def test_index_docs_returns_zero_without_any_source(tmp_path, monkeypatch):
 
     project = ProjectConfig(name="p", code_dirs=[CodeDir(path=code, extensions={".ts"})])
     db, _collection = _make_index_db(tmp_path)
-    assert index_docs(project, vo=MagicMock(), db=db) == 0
+    assert index_docs(project, provider=VoyageProvider(client=MagicMock()), db=db) == 0
 
 # --- F: -docs partition by source root (orphans + present qualified paths) ---
 
@@ -455,7 +456,7 @@ def test_index_docs_sweeps_unrooted_chunks_even_with_nothing_new(tmp_path, monke
     monkeypatch.setattr("vecs.indexer._sync_bm25", lambda *a, **kw: None)
 
     project = ProjectConfig(name="p", docs_dirs=[docs])
-    index_docs(project, vo=MagicMock(), db=db)
+    index_docs(project, provider=VoyageProvider(client=MagicMock()), db=db)
 
     sweep_calls = [
         c for c in collection.delete.call_args_list
@@ -501,7 +502,7 @@ def test_index_docs_migrates_legacy_bare_id_without_model_change(tmp_path, monke
 
     captured = _capture_embed_ids(monkeypatch)
     project = ProjectConfig(name="p", docs_dirs=[docs])
-    index_docs(project, vo=MagicMock(), db=db)
+    index_docs(project, provider=VoyageProvider(client=MagicMock()), db=db)
 
     assert any(cid.startswith("docs:docs/HQ/guide.md:") for cid in captured), (
         f"file must be re-embedded under the qualified id; embedded ids={captured}"
@@ -530,7 +531,7 @@ def test_index_docs_migrates_inrepo_md_without_model_change(tmp_path, monkeypatc
 
     captured = _capture_embed_ids(monkeypatch)
     project = ProjectConfig(name="p", code_dirs=[CodeDir(path=code, extensions={".cs"})])
-    index_docs(project, vo=MagicMock(), db=db)
+    index_docs(project, provider=VoyageProvider(client=MagicMock()), db=db)
 
     assert any(cid.startswith("docs:client-uk/README.md:") for cid in captured), (
         f"in-repo .md must be (re-)embedded into -docs; embedded ids={captured}"
@@ -584,8 +585,8 @@ def test_md_reroute_converges_end_to_end_no_model_change(tmp_path, monkeypatch):
     project = ProjectConfig(name="p", code_dirs=[CodeDir(path=code, extensions={".cs"})])
 
     # run_index order: code first (sweeps .md out of -code), then docs.
-    index_code(project, vo=MagicMock(), db=db)
-    index_docs(project, vo=MagicMock(), db=db)
+    index_code(project, provider=VoyageProvider(client=MagicMock()), db=db)
+    index_docs(project, provider=VoyageProvider(client=MagicMock()), db=db)
 
     code_paths = {e["metadata"]["file_path"] for e in code_coll.store.values()}
     docs_paths = {e["metadata"]["file_path"] for e in docs_coll.store.values()}
@@ -625,7 +626,7 @@ def test_index_docs_steady_state_second_run_is_noop(tmp_path, monkeypatch):
 
     captured = _capture_embed_ids(monkeypatch)
     project = ProjectConfig(name="p", docs_dirs=[docs])
-    index_docs(project, vo=MagicMock(), db=db)
+    index_docs(project, provider=VoyageProvider(client=MagicMock()), db=db)
 
     assert captured == [], f"steady state must re-embed nothing; got {captured}"
     collection.delete.assert_not_called()
@@ -645,7 +646,7 @@ def test_index_single_doc_qualifies_chunk_id_with_docs_dir_basename(tmp_path, mo
     cfg = VecsConfig(path=tmp_path / "config.yaml")
     cfg.projects["p"] = ProjectConfig(name="p", docs_dirs=[docs])
     monkeypatch.setattr("vecs.indexer.load_config", lambda: cfg)
-    monkeypatch.setattr("vecs.indexer.get_voyage_client", lambda: MagicMock())
+    monkeypatch.setattr("vecs.indexer.get_provider", lambda config=None, name=None: VoyageProvider(client=MagicMock()))
     db, _collection = _make_index_db(tmp_path)
     monkeypatch.setattr("vecs.indexer.get_chromadb_client", lambda: db)
 
@@ -675,7 +676,7 @@ def test_index_single_doc_qualifies_by_owning_root_not_docs_dirs0(tmp_path, monk
     cfg = VecsConfig(path=tmp_path / "config.yaml")
     cfg.projects["p"] = ProjectConfig(name="p", docs_dirs=[d0, d1])
     monkeypatch.setattr("vecs.indexer.load_config", lambda: cfg)
-    monkeypatch.setattr("vecs.indexer.get_voyage_client", lambda: MagicMock())
+    monkeypatch.setattr("vecs.indexer.get_provider", lambda config=None, name=None: VoyageProvider(client=MagicMock()))
     db, _collection = _make_index_db(tmp_path)
     monkeypatch.setattr("vecs.indexer.get_chromadb_client", lambda: db)
 
@@ -706,7 +707,7 @@ def test_index_single_doc_qualifies_inrepo_md_by_code_dir_root(tmp_path, monkeyp
         name="p", docs_dirs=[docs], code_dirs=[CodeDir(path=code, extensions={".cs"})]
     )
     monkeypatch.setattr("vecs.indexer.load_config", lambda: cfg)
-    monkeypatch.setattr("vecs.indexer.get_voyage_client", lambda: MagicMock())
+    monkeypatch.setattr("vecs.indexer.get_provider", lambda config=None, name=None: VoyageProvider(client=MagicMock()))
     db, _collection = _make_index_db(tmp_path)
     monkeypatch.setattr("vecs.indexer.get_chromadb_client", lambda: db)
 
@@ -793,7 +794,7 @@ def test_index_docs_sweeps_now_hidden_chunk_under_valid_root(tmp_path, monkeypat
     monkeypatch.setattr("vecs.indexer._sync_bm25", lambda *a, **k: None)
 
     project = ProjectConfig(name="p", code_dirs=[CodeDir(path=code, extensions={".cs"})])
-    index_docs(project, vo=MagicMock(), db=db)
+    index_docs(project, provider=VoyageProvider(client=MagicMock()), db=db)
 
     deleted = []
     for c in collection.delete.call_args_list:
@@ -859,7 +860,7 @@ def test_out_of_scope_sweep_keeps_missing_root_and_gone_file(tmp_path, monkeypat
         CodeDir(path=present_code, extensions={".cs"}),
         CodeDir(path=missing, extensions={".go"}),
     ])
-    index_docs(project, vo=MagicMock(), db=db)
+    index_docs(project, provider=VoyageProvider(client=MagicMock()), db=db)
 
     deleted = []
     for c in collection.delete.call_args_list:
@@ -896,7 +897,7 @@ def test_index_docs_empty_sources_does_not_wipe_populated_collection(tmp_path, m
     db.get_or_create_collection.return_value = collection
 
     project = ProjectConfig(name="p", code_dirs=[CodeDir(path=code, extensions={".cs"})])
-    n = index_docs(project, vo=MagicMock(), db=db)
+    n = index_docs(project, provider=VoyageProvider(client=MagicMock()), db=db)
     assert n == 0
     collection.delete.assert_not_called()
 
@@ -946,7 +947,7 @@ def test_out_of_scope_sweep_docs_dir_rooted_hidden_subdir(tmp_path, monkeypatch)
     monkeypatch.setattr("vecs.indexer._sync_bm25", lambda *a, **k: None)
 
     project = ProjectConfig(name="p", docs_dirs=[docs])
-    index_docs(project, vo=MagicMock(), db=db)
+    index_docs(project, provider=VoyageProvider(client=MagicMock()), db=db)
 
     deleted = []
     for c in collection.delete.call_args_list:

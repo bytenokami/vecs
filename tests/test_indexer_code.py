@@ -1,3 +1,4 @@
+from vecs.embed_provider import VoyageProvider
 import hashlib
 import json
 import subprocess
@@ -54,7 +55,7 @@ def test_index_code_exclude_dirs_drops_files(tmp_path, monkeypatch):
 
     captured = _capture_files(monkeypatch)
     db, _collection = _make_index_db(tmp_path)
-    index_code(project, vo=MagicMock(), db=db)
+    index_code(project, provider=VoyageProvider(client=MagicMock()), db=db)
 
     assert keep in captured["files"]
     assert drop not in captured["files"]
@@ -83,7 +84,7 @@ def test_index_code_exclude_wins_over_include(tmp_path, monkeypatch):
 
     captured = _capture_files(monkeypatch)
     db, _collection = _make_index_db(tmp_path)
-    index_code(project, vo=MagicMock(), db=db)
+    index_code(project, provider=VoyageProvider(client=MagicMock()), db=db)
 
     assert runtime_file in captured["files"]
     assert editor_file not in captured["files"]
@@ -111,7 +112,7 @@ def test_index_code_empty_exclude_dirs_is_noop(tmp_path, monkeypatch):
 
     captured = _capture_files(monkeypatch)
     db, _collection = _make_index_db(tmp_path)
-    index_code(project, vo=MagicMock(), db=db)
+    index_code(project, provider=VoyageProvider(client=MagicMock()), db=db)
 
     assert a in captured["files"]
     assert b in captured["files"]
@@ -145,7 +146,7 @@ def test_index_code_prunes_manifest_for_now_excluded_files(tmp_path, monkeypatch
 
     _capture_files(monkeypatch)
     db, _collection = _make_index_db(tmp_path)
-    index_code(project, vo=MagicMock(), db=db)
+    index_code(project, provider=VoyageProvider(client=MagicMock()), db=db)
 
     reloaded = Manifest("pruneproj", manifests_dir=tmp_path / "manifests")
     assert str(keep) in reloaded.data
@@ -174,7 +175,7 @@ def test_index_code_prune_leaves_non_code_extension_keys_for_docs(tmp_path, monk
     project = ProjectConfig(name="p", code_dirs=[CodeDir(path=code_root, extensions={".cs"})])
     _capture_files(monkeypatch)
     db, _collection = _make_index_db(tmp_path)
-    index_code(project, vo=MagicMock(), db=db)
+    index_code(project, provider=VoyageProvider(client=MagicMock()), db=db)
 
     reloaded = Manifest("p", manifests_dir=tmp_path / "manifests")
     assert str(md) in reloaded.data, "index_code must not prune the .md key (docs owns it)"
@@ -198,7 +199,7 @@ def test_index_code_never_indexes_md_even_if_still_listed(tmp_path, monkeypatch,
     )
     captured = _capture_files(monkeypatch)
     db, _collection = _make_index_db(tmp_path)
-    index_code(project, vo=MagicMock(), db=db)
+    index_code(project, provider=VoyageProvider(client=MagicMock()), db=db)
 
     assert cs in captured["files"]
     assert md not in captured["files"], ".md must never be indexed as code"
@@ -423,7 +424,7 @@ def test_index_code_sweeps_orphan_chunks_for_excluded_dirs(tmp_path, monkeypatch
     db.get_or_create_collection.return_value = collection
 
     _capture_files(monkeypatch)
-    index_code(project, vo=MagicMock(), db=db)
+    index_code(project, provider=VoyageProvider(client=MagicMock()), db=db)
 
     # Find the sweep-driven delete call (by orphan ids), tolerating other delete calls
     sweep_calls = [
@@ -562,7 +563,7 @@ def test_index_code_sweeps_md_chunks_and_syncs_bm25(tmp_path, monkeypatch):
     # otherwise hit a real Voyage embed against MagicMocks.
     _capture_files(monkeypatch)
 
-    index_code(project, vo=MagicMock(), db=db)
+    index_code(project, provider=VoyageProvider(client=MagicMock()), db=db)
 
     md_delete_calls = [
         c for c in collection.delete.call_args_list
@@ -601,7 +602,7 @@ def test_index_code_stamps_git_sha_version_id(tmp_path, monkeypatch):
     project = ProjectConfig(name="p", code_dirs=[CodeDir(path=repo, extensions={".cs"})])
     captured = _capture_chunks_via_index_collection(monkeypatch)
     db, _collection = _make_index_db(tmp_path)
-    index_code(project, vo=MagicMock(), db=db)
+    index_code(project, provider=VoyageProvider(client=MagicMock()), db=db)
 
     assert captured["chunks"]
     assert all(c["metadata"]["version_id"] == sha for c in captured["chunks"])
@@ -624,14 +625,14 @@ def test_index_code_uses_embed_cache_end_to_end(tmp_path, monkeypatch):
     vo = MagicMock()
     vo.embed.side_effect = lambda texts, model, input_type: FakeEmbedResult(len(texts))
 
-    n1 = index_code(project, vo=vo, db=db, cache=cache)
+    n1 = index_code(project, provider=VoyageProvider(client=vo), db=db, cache=cache)
     assert n1 >= 1
     assert vo.embed.call_count >= 1
 
     # Force a re-index (drop the manifest) but keep the cache warm.
     (tmp_path / "manifests" / "p.json").unlink()
     vo.embed.reset_mock()
-    n2 = index_code(project, vo=vo, db=db, cache=cache)
+    n2 = index_code(project, provider=VoyageProvider(client=vo), db=db, cache=cache)
     assert n2 >= 1                    # same chunks re-stored
     assert vo.embed.call_count == 0   # all served from cache -> wiring intact
     cache.close()

@@ -1,3 +1,4 @@
+from vecs.embed_provider import VoyageProvider
 import hashlib
 import json
 import subprocess
@@ -69,7 +70,7 @@ def test_run_index_threads_one_cache_to_all_indexers(tmp_path, monkeypatch):
         lambda: __import__("vecs.config", fromlist=["load_config"]).load_config(config_file),
     )
     monkeypatch.setattr("vecs.indexer.migrate_global_manifest", lambda *a, **kw: None)
-    monkeypatch.setattr("vecs.indexer.get_voyage_client", lambda: MagicMock())
+    monkeypatch.setattr("vecs.indexer.get_provider", lambda config=None, name=None: VoyageProvider(client=MagicMock()))
     # Fresh project: collections are empty, so the B2 pre-pass finds nothing to
     # re-embed. count() must be a real int (the pre-pass compares it > 0).
     db = MagicMock()
@@ -117,7 +118,7 @@ def test_run_index_prune_isolation_one_project_failure_does_not_skip_others(tmp_
         lambda: __import__("vecs.config", fromlist=["load_config"]).load_config(config_file),
     )
     monkeypatch.setattr("vecs.indexer.migrate_global_manifest", lambda *a, **kw: None)
-    monkeypatch.setattr("vecs.indexer.get_voyage_client", lambda: MagicMock())
+    monkeypatch.setattr("vecs.indexer.get_provider", lambda config=None, name=None: VoyageProvider(client=MagicMock()))
     db = MagicMock()
     db.get_collection.return_value.count.return_value = 0
     monkeypatch.setattr("vecs.indexer.get_chromadb_client", lambda: db)
@@ -346,7 +347,7 @@ def test_run_index_remodel_migrates_docs_manifest_and_records_marker(tmp_path, m
         lambda: __import__("vecs.config", fromlist=["load_config"]).load_config(config_file),
     )
     monkeypatch.setattr("vecs.indexer.migrate_global_manifest", lambda *a, **kw: None)
-    monkeypatch.setattr("vecs.indexer.get_voyage_client", lambda: MagicMock())
+    monkeypatch.setattr("vecs.indexer.get_provider", lambda config=None, name=None: VoyageProvider(client=MagicMock()))
     monkeypatch.setattr("vecs.indexer.VECS_DIR", tmp_path)
     monkeypatch.setattr("vecs.indexer.CHROMADB_DIR", tmp_path / "chromadb")
     monkeypatch.setattr("vecs.indexer.MANIFESTS_DIR", tmp_path / "manifests")
