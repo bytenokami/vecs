@@ -2,8 +2,8 @@ Authored by Claude
 
 # vecs Knowledge-Base Curation — End-State Design & Increment Program
 
-**Date:** 2026-06-01 (rev v4: 2026-06-03)
-**Revision:** v4 (three Phase-4 review rounds + a 7-lens direction review). v1 attacked by 4 reviewers → v2; v2 re-attacked by 4 → v3; v3's shipped Inc-1-pipeline work + the §6 program re-attacked by a 7-lens adversarial critic panel → v4 (`course_correct`: direction right, sequencing wrong — full verdict in `docs/vecs-direction-review-2026-06.md`). Material corrections are flagged inline as **[v4-fix]** (this round), **[v2-fix]**, or **[v1-fix]** (prior rounds).
+**Date:** 2026-06-01 (rev v4: 2026-06-03; rev v5: 2026-06-19)
+**Revision:** v5 (quality-max re-aim of Increment 7). v1 attacked by 4 reviewers → v2; v2 re-attacked by 4 → v3; v3's shipped Inc-1-pipeline work + the §6 program re-attacked by a 7-lens adversarial critic panel → v4 (`course_correct`: direction right, sequencing wrong — full verdict in `docs/vecs-direction-review-2026-06.md`). **v5 (2026-06-19, owner directive — quality is the dominant axis, latency is not a constraint): Increment 7 re-aimed from a flag-off latency-hedged amplifier to a default-ON, E-gated quality stack — full `rerank-2.5` (not lite) default-ON + task-conditioned `instructions` + Contextual Retrieval + voyage-context-3 + MMR diversification + HyDE (experiment-gated); the query router is parked as a latency-only/contingent lever (see Inc 7).** Material corrections are flagged inline as **[v5-fix]**/**[v5]** (this round), **[v4-fix]**, **[v2-fix]**, or **[v1-fix]** (prior rounds).
 **Status:** Approved direction; per-increment specs follow. Scope items marked **(contingent: §7)** depend on an unresolved decision and must not be frozen into an `acceptance.md` until resolved.
 **Pillars:** (1) frontier retrieval quality, (2) team-shared knowledge base, (3) agent-facing tool surface.
 **Companion docs:** `docs/vecs-platform-strategy-2026-05.md` (platform strategy + SOTA), `docs/vecs-roadmap.md` (platform direction), `src/vecs/CLAUDE.md` (module context).
@@ -113,17 +113,19 @@ Severity = impact on the north star.
 
 ```
 query
+  → query transform: HyDE on NL-intent path (embed hypothetical doc; E-gated experiment) [Inc 7]
   → PRE-RETRIEVAL validity filter (metadata predicate, before fusion)        [Inc 4a]
       · facts: is_current = True                                              [the facts predicate ships with facts search in Inc 2]
       · code/docs: not superseded; valid_to unset or in the future ("expired" = valid_to in the past)
   → embed (per-collection model) + BM25 (FTS5, incl. facts sidecar [Inc 1])
   → RRF fuse with PER-COLLECTION rank lists + weights (sessions down-weighted) [Inc 1: fusion refactor]
   → kind-aware recency prior (flag, default-OFF, eval-gated, α low)           [Inc 4b]
-  → optional rerank (voyage rerank-2.5-lite, flag)                            [Inc 7]
+  → rerank: voyage rerank-2.5 FULL, default-ON, E-gated + task-conditioned instructions (B1 workflow) [Inc 7]
+  → MMR diversification (λ high — near-dup only; bundle coverage)             [Inc 7]
   → result-shaping (detail levels, get_chunk)                                 [later / Pillar 3]
 ```
 
-**[v1-fix: validity filter moved pre-fusion. v2-fix: the `is_current` facts predicate is inert in Inc 1 (facts empty/unsearched), so it ships with facts search in Inc 2 — Inc 1 builds only the FTS5 plumbing + the fusion refactor. Per-collection weighting requires restructuring `reciprocal_rank_fusion` into per-collection rank lists (today it fuses one concatenated list, `searcher.py:82-114,209`); "preserve current ranking" is NOT a meaningful baseline since current order is partly append-order.]**
+**[v1-fix: validity filter moved pre-fusion. v2-fix: the `is_current` facts predicate is inert in Inc 1 (facts empty/unsearched), so it ships with facts search in Inc 2 — Inc 1 builds only the FTS5 plumbing + the fusion refactor. Per-collection weighting requires restructuring `reciprocal_rank_fusion` into per-collection rank lists (today it fuses one concatenated list, `searcher.py:82-114,209`); "preserve current ranking" is NOT a meaningful baseline since current order is partly append-order.]** **[v5: the Inc-7 line is now a default-ON, E-gated quality stack (HyDE query-transform + full `rerank-2.5` + task-conditioned instructions + MMR), not an optional flag-off rerank. The query router that would gate these by query class is parked — under quality-max it is a latency-only optimization; it earns a place only if Inc-1-E shows the expensive path *regresses* a query class (then route rerank away from that class). See Inc 7.]**
 
 ### 5.2 Stores
 
@@ -188,6 +190,8 @@ Own workflow-profile feature (`docs/features/kb-freshness-hotfix/`, its own `acc
 
 Enable extraction (metered/capped, Sonnet) to **populate `-prose-facts`**; promote curated `memory/*.md` + chat triples; **semantic top-k merge gate** atop the existing exact `chain_key` machine; provenance + scope tier; wire facts into search incl. the `is_current` pre-retrieval predicate and default blend. Keep raw transcript addressable. Offline/scheduled. **Sub-features:** 2a single-machine fact bridge (populate + gate + provenance + search). Shared-tier + redaction move to Increment 5 (their consumer is the bundle). **Contingent (§7):** promotion source-of-truth; human/critic gate. **Risks:** lossy extraction (keep raw); embedding-model pinning.
 
+**[v5-fix — sessions-removed reconciliation (owner decision 2026-06-04; project memory `vecs-sessions-removed`).** vecs no longer indexes chat transcripts — the store is **code + docs + prose-facts** only, and raw `.jsonl` is a grep verification layer, not an indexed source. So Inc 2's **live extraction source is curated `memory/*.md` promotion + metered extraction over docs/code prose (the memory↔vecs inversion), NOT chat-transcript triples.** The "chat triples" clause above is defunct for Inc 2; transcript distillation stays parked with **Inc 6** (do not build the session-triple path here). Inc 2 = **2a single-machine fact bridge** over the memory-inversion source: populate `-prose-facts` (FTS5 sidecar built in Inc 1) → semantic top-k merge gate on the exact `chain_key` machine → provenance (source path/commit-SHA) + scope tier → wire into search via the `is_current` pre-retrieval predicate + per-collection blend (folds old Inc-1-D's per-collection RRF refactor if not already shipped). Metering cap (`MAX_CALLS_PER_DAY`, Sonnet extraction / Opus contradiction-judge) carries from Inc-1-A.]**
+
 ### Increment 3 — Docs & chunking completion  **[v2-fix: restored]**
 
 Owns the rest of G4 + G9. **Scope:** **per-repo `docs/` discovery** — extend the multi-path `docs_dirs` from Inc 1 to auto-discover/configure per-repo `docs/` dirs beyond in-repo `.md` (contract-first config change). Small-chunk tuning (~200–400 tok) + **parent-document / sentence-window fetch**, **gated on a measured precision→answer-quality win** (G9 is Low; build the storage machinery only if the eval shows end-to-end gain). **Depends on:** Inc 1 (docs_dirs, source-root rel_path), a **green Inc-1-E** (the chunking/parent-window win in G9 must be shown end-to-end before building the storage machinery). **[v4-fix: E is now built ahead of this, not after.]**
@@ -229,9 +233,22 @@ A **per-session distiller** (distinct from Inc-2's triple extractor) distills du
 
 **[v4-fix — session-extraction reframe deferred to here (do NOT build before Inc-1-E/A + Inc 2's gate).** The reframe's two good ideas survive: (1) **stage candidate facts to a jsonl, not the live store** (gradeable/revertible before promotion); (2) **git-anchored provenance** (commit-SHA per distilled fact). Dropped: the "piggyback ai-log for free" claim is **false** — ai-log's `_build_body_prompt` (`~/.claude/skills/ai-log/scripts/entry.py:625`) feeds `claude -p` only the first-N user prompts truncated to 200 chars (a Sonnet *retrospective*, not a triple producer over the full transcript), and coupling a team-KB deliverable to an unversioned personal hook is wrong when vecs already reads the same jsonl via `sessions_dirs`. Zero agent-felt payoff this quarter; it accumulates an ungradeable/unpriced stream before E/A exist.]**
 
-### Increment 7 — Quality layer
+### Increment 7 — Quality layer  **[v5: re-aimed at quality-max — a default-ON, E-gated stack, not a flag-off amplifier]**
 
-Anthropic **Contextual Retrieval** (≈100-token blurb per chunk → embed + FTS5, prompt-cache the doc body) + **Voyage reranker** (flag, off by default). (voyage-3.5 already in Inc 1.) Amplifier-last. **Risks:** build-time LLM per chunk (metered); reranker latency (flag).
+**Goal flip (owner 2026-06-19): quality is the dominant axis; latency is not a constraint.** So the v4 framing ("Voyage reranker flag, off by default" for latency) is superseded. Build the full quality stack and **default-ON whatever passes Inc-1-E.** Quality-max ≠ add blind — it means run every viable lever as an independent A/B arm on the golden set (Inc-1-E: 46 cases, per-query-class paired bootstrap) and **ship the union of every arm that measures ≥ baseline per query class**, default-ON the winners, drop any arm that regresses a class. Still sequenced last (amplifier position unchanged — it amplifies a curated+fresh index); only its default and breadth change.
+
+The stack — each an independent E arm:
+
+- **Voyage reranker — full `rerank-2.5` (not the lite/perf variant), default-ON** over the fused top-30-50 before truncation. Single biggest lever (Anthropic Contextual Retrieval: −49% → −67% failure-rate reduction with a reranker — the largest single jump). v4's latency flag rationale is void under quality-max. E-gate per class (a cross-encoder can rarely reorder a correct top hit down — that is the one regression to watch).
+- **Task-conditioned reranking.** Pass the B1 workflow (debug / review / implement) as the `rerank-2.5` `instructions` string — rerank toward call-sites for debug, definitions+tests for review. Free once the reranker fires; quality multiplier. Fuses Inc 7 × roadmap B1.
+- **Contextual Retrieval** — Anthropic ≈100-token blurb per chunk → embed + FTS5, prompt-cache the doc body. The other half of the −49/−67 combo. Build-time LLM per chunk (metered via Inc-1-A).
+- **voyage-context-3 contextual chunk embeddings for docs/sessions** (re-embed; +6.76% chunk / +2.40% doc over manual contextual retrieval). No contextual *code* model exists — code stays `voyage-code-3`. (Docs already on voyage-4 from Inc 1-B; context-3 is the chunk-context upgrade on top, gated on E beating the voyage-4 arm.)
+- **MMR diversification — NEW [v5].** At result assembly, penalize a candidate near-identical to one already chosen (**λ high — near-duplicates only**, so it can never drop a relevant *unique* hit), so the bundle covers more of the answer surface. Query-time, **distinct from the cut Inc-4c** (that was index-time MinHash dedup). Bundle coverage is a B1 quality axis.
+- **HyDE — NEW [v5], experiment-gated.** On the NL-intent path only: have the agent (already in the loop via MCP) generate a hypothetical code snippet that would answer the query, then embed THAT instead of the raw question — closes the NL→code vocabulary gap dense retrieval struggles with. Query-side, nothing in the store changes. Higher variance (a hallucinated hypothetical can pull retrieval toward a wrong region), so it is **strictly E-gated — keep only if golden-set delta ≥ 0 per class**; never default-ON blind.
+
+**Parked — query router [v5].** A fast/slow router (high-confidence exact-symbol → BM25-only, NL-intent → vector + rerank) is a **latency/cost** optimization. Under quality-max with latency unconstrained it adds nothing on its own — you simply run the full expensive path on every query. It becomes a *quality* lever in exactly one contingent case: if Inc-1-E shows the expensive path (rerank) **hurts** a specific query class, route rerank away from that class. Build only on that E finding, not speculatively. (If the priority ever flips back to performance, the router is the top pick — it cuts the common exact-symbol path to BM25-only, ~10-100× faster, zero Voyage call.)
+
+**Depends on:** a green Inc-1-E (the arbiter for every arm above). **Risks:** build-time LLM per chunk (Contextual Retrieval) + per-NL-query LLM call (HyDE) — both metered via Inc-1-A; context-3 re-embed cost (compute, not quality). **(voyage-3.5/voyage-4 already in Inc 1.)**
 
 ---
 
@@ -252,6 +269,7 @@ Anthropic **Contextual Retrieval** (≈100-token blurb per chunk → embed + FTS
 | Cost ceiling for fact population (gates Inc 2?) | 1/2 | open — bind a $ threshold from the Inc-1 metering report **[v2-fix]** |
 | Recency prior default-off threshold | 4b | open |
 | Transcript default-flip threshold | 6 | open |
+| Inc 7 quality-stack: per-arm E gate | 7 | open — bind a per-query-class min delta; ship the union of arms ≥ threshold, default-ON winners, drop any class-regressor; HyDE strictly experiment-gated **[v5]** |
 
 ---
 
@@ -259,7 +277,7 @@ Anthropic **Contextual Retrieval** (≈100-token blurb per chunk → embed + FTS
 
 **Resolved across review rounds (do not re-introduce):** fact store empty/disabled; index-time exact dedup corruption hazard (→ 4c with ownership model); benchmark IDs corrected (§9, all three now confirmed to resolve); the dropped "Docs & chunking" increment (restored as Inc 3); validity filter pre-retrieval; voyage-3.5 needs re-embed (not a model flip); `.md` reroute needs an explicit `-code` sweep + `index_docs` multi-source surgery; per-collection RRF is a fusion refactor; Stage-0 gated behind freshness; "4.7×"→~2× (no equal-recall claim); MinHash ≠ byte-exact zero-loss; 80/24 are our estimates; α convention; vendor blog illustrative; Git-LFS-into-repo excluded. **[v4-fix — from the 7-lens direction review:** the `prune()` orphan fix is pulled to Inc 1.5a (active "agent retrieves lies" defect, ahead of the program, not buried in 4a); Inc-1-E/A moved ahead of the bets they gate (E is the precondition for 3/4b/6/7 + the heavy half of 4a); Inc 4c demoted to cut-candidate; the searcher `-docs` gate (1.5b) + model-flip trust signal (1.5c) are live-defect hotfixes; extraction model = latest Sonnet, judge = latest Opus; the session-extraction reframe is deferred to Inc 6 (keep only stage-to-jsonl + git-provenance; "piggyback ai-log for free" is false).]**
 
-**Still not independently verified (caveats):** recency-decay magnitudes (event-log, won't transfer to code/doc — tie-breaker only); stale-code-harm pp (n=17 — direction load-bearing); extraction lossiness (version/category-sensitive; ~7 pt on PersonaMem-v2); Power-of-Noise / IGP (PDF-summarized, medium); prose-drift extraction cost **unmetered** (Inc-1 spike gates any cost claim for 2/6); monorepo scale vs the ~7M single-node ceiling **unvalidated** (gates Stage-1/2).
+**Still not independently verified (caveats):** recency-decay magnitudes (event-log, won't transfer to code/doc — tie-breaker only); stale-code-harm pp (n=17 — direction load-bearing); extraction lossiness (version/category-sensitive; ~7 pt on PersonaMem-v2); Power-of-Noise / IGP (PDF-summarized, medium); prose-drift extraction cost **unmetered** (Inc-1 spike gates any cost claim for 2/6); monorepo scale vs the ~7M single-node ceiling **unvalidated** (gates Stage-1/2). **[v5]** Inc-7 per-arm quality gains are **unverified on this corpus until Inc-1-E runs**: rerank-2.5 ≥ baseline on *every* query class (cross-encoder can rarely reorder a correct top hit down), HyDE NL→code gain (higher variance — hallucinated hypotheticals), context-3 beating the voyage-4 arm, and MMR coverage not dropping unique hits — each ships only on a green per-class E number.
 
 **Measurement plan:** stale-retrieval-rate / version-alignment (not just relevance); memory on LongMemEval + LoCoMo; chunking/transcript changes measured **end-to-end**.
 
